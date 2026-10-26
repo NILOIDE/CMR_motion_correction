@@ -1,0 +1,14 @@
+unit,subject_id,image,slice,region,as acquired,blursig=0 linescst=1 maskdilst=100 psfscst=1,blursig=6 linescst=2 maskdilst=off psfscst=3,blursig=6 linescst=1 maskdilst=off psfscst=3,blursig=12 linescst=2 maskdilst=50 psfscst=3,blursig=0 linescst=2 maskdilst=off psfscst=3
+1000071 SAX:9 (apical),1000071,SAX,9,apical,0.0449,0.0000,0.6179,0.6193,0.5991,0.6096
+1000125 SAX:1,1000125,SAX,1,,,0.0000,,,,
+1000352 SAX:10 (apical),1000352,SAX,10,apical,0.3306,0.2575,0.2964,0.2612,0.3423,0.2951
+1000191 SAX:10 (apical),1000191,SAX,10,apical,0.2227,0.2709,0.3243,0.3522,0.2741,0.3321
+1000191 SAX:0 (basal),1000191,SAX,0,basal,0.3057,0.3186,0.3211,0.3211,0.3165,0.3211
+1000125 SAX:9 (apical),1000125,SAX,9,apical,0.2754,0.3298,0.3701,0.3665,0.3651,0.3562
+1000071 SAX:8 (apical),1000071,SAX,8,apical,0.1527,0.3943,0.7714,0.7719,0.7892,0.7919
+1000109 SAX:0 (basal),1000109,SAX,0,basal,0.6173,0.6356,0.6396,0.6396,0.6516,0.6295
+1000352 SAX:9 (apical),1000352,SAX,9,apical,0.3368,0.6536,0.6573,0.6616,0.6488,0.6517
+1000109 SAX:6 (apical),1000109,SAX,6,apical,0.7099,0.6707,0.7065,0.7072,0.7328,0.7264
+1000352 SAX:1 (basal),1000352,SAX,1,basal,0.4788,0.6730,0.6747,0.6765,0.6752,0.6907
+1000109 SAX:7 (apical),1000109,SAX,7,apical,0.7459,0.7333,0.7603,0.7711,0.7685,0.6865
+1000071 SAX:2 (basal),1000071,SAX,2,basal,0.6604,0.6917,0.6950,0.6920,0.7015,0.6984

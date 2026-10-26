@@ -74,7 +74,10 @@ Interaction
                         3 SA-LA lines and its SA-SA crossing with the next slice, an LA view its
                         2 LA-LA lines. Curves: displayed grey value of both slices along the line
                         at the shown step and frame (thin: inside both images, thick: in the
-                        loss); yellow bar along the bottom: inside the LA dilated mask (either
+                        loss); y toggles raw intensities / the loss view: the raw image blurred
+                        and averaged over the PSF band across the other slice's slab with the blur
+                        and PSF scale of the shown step (from the run's run_config.json; SA-SA
+                        lines: blur only); yellow bar along the bottom: inside the LA dilated mask (either
                         LA slice of the line, at its current pose); NCC over the loss part,
                         current frame only
     Manual pose (block left of the stack): [-] / [+] shift the profile-selected slice by 1 mm along
@@ -89,6 +92,8 @@ Interaction
 from __future__ import annotations
 
 import argparse
+import json
+import math
 import re
 import sys
 from pathlib import Path
@@ -98,7 +103,7 @@ import numpy as np
 import pandas as pd
 import pyvista as pv
 from matplotlib.path import Path as PolyPath
-from scipy.ndimage import map_coordinates
+from scipy.ndimage import gaussian_filter, map_coordinates
 
 ALIGN_ROOT = Path(r"C:\Users\Nil\Documents\data\ukbb_alignment")
 VIEWS = ["SA", "LA_2Ch", "LA_3Ch", "LA_4Ch"]      # data keys: file names and CSV values
@@ -316,6 +321,8 @@ def load_images(instance_dir: Path) -> dict:
             arr = _as_4d(np.asarray(img.dataobj, dtype=np.float32))
             affine = np.asarray(img.affine, dtype=np.float64)
             seg = _load_seg(seg_path_for(instance_dir, p), arr.shape, affine, p.name)
+            zooms = img.header.get_zooms()
+            thick_hdr = float(zooms[2]) if len(zooms) > 2 else float("nan")
             nz = arr.shape[2]
             if mode == "slices" and nz != 1:
                 print(f"[warn] {p.name}: expected a single slice, found {nz}; using all",
@@ -334,6 +341,7 @@ def load_images(instance_dir: Path) -> dict:
                     "affine": A0,
                     "index": idx,
                     "file": p.name,
+                    "thick_hdr": thick_hdr,
                 })
         raw_slices.sort(key=lambda s: s["index"])
 
@@ -351,6 +359,9 @@ def load_images(instance_dir: Path) -> dict:
                 "index": s["index"],
                 "name": name,
                 "file": s["file"],
+                "raw": s["raw"],                  # NIfTI intensities: what the loss compares
+                "lo": float(lo), "hi": float(hi),  # display scaling of the view (grey = (raw - lo) / (hi - lo))
+                "thick_hdr": s["thick_hdr"],
             })
         data[view] = {"mode": mode, "slices": slices}
 
@@ -731,6 +742,7 @@ class SliceViewer:
                  show_seg: bool = True, seg_alpha: float = 0.5, start: int | None = None,
                  metric: str = "ncc", show_mask: bool = False, show_lines: bool = False,
                  show_sa_lines: bool = False, show_radius: bool = False, show_profiles: bool = True,
+                 show_psf: bool = True,
                  window_size=(1500, 1000), verbose: bool = True):
         if not runs:
             raise ValueError("no runs to show")
@@ -754,6 +766,7 @@ class SliceViewer:
         self.show_sa_lines = show_sa_lines
         self.show_radius = show_radius
         self.show_profiles = show_profiles
+        self.show_psf = show_psf                # profiles as the loss sees them (blur + PSF band) instead of raw
         self.profile_key: str | None = None     # slice whose intersections are plotted (kept across subjects)
         self.offsets: dict[tuple, np.ndarray] = {}   # manual pose offsets per slice key (reset per subject)
         self.seg_alpha = seg_alpha
@@ -850,6 +863,7 @@ class SliceViewer:
             self._teardown()
         self.offsets = {}
         self._hover = None
+        self._blur_cache = {}
         self.run_index = run_index
         self.subjects = list(subjects)
         self.subject_index = index
@@ -859,6 +873,7 @@ class SliceViewer:
         self.overlays.setdefault("sa_lines", None)
         self.overlays.setdefault("long_axis", None)
         self.title = loaded.get("title", subject)
+        self.config = loaded.get("config")
         self.run_name = loaded.get("run_name", Path(run).name)
         self.snapshots = self.history["snapshots"]
         self.n_steps = self.history["n_steps"]
@@ -1041,6 +1056,7 @@ class SliceViewer:
         pl.add_key_event("k", lambda: self._toggle_checkbox("sa_lines"))
         pl.add_key_event("u", lambda: self._toggle_checkbox("radius"))
         pl.add_key_event("p", lambda: self._toggle_checkbox("profiles"))
+        pl.add_key_event("y", lambda: self._toggle_checkbox("psf"))
         pl.add_key_event("period", lambda: self.step_profile(+1))
         pl.add_key_event("comma", lambda: self.step_profile(-1))
         pl.add_key_event("a", lambda: self._toggle_checkbox("all_sa"))
@@ -1431,6 +1447,113 @@ class SliceViewer:
             inside ^= path.contains_points(vox)
         return inside
 
+    # --- profiles as the loss sees them -----------------------------------------------
+    def _loss_state(self, step: int) -> tuple[float, float]:
+        """(PSF scale, in-plane blur sigma in mm) the optimizer used at `step` (motion_gradient.align)."""
+        cfg = self.config or {}
+        steps = max(1, int(cfg.get("steps", 1)))
+        psf_s0 = 1.0 if cfg.get("no_psf") else float(cfg.get("psf_scale_start", 1.0) or 1.0)
+        psf_steps = int(round(float(cfg.get("psf_anneal_frac", 0.6)) * steps)) if psf_s0 > 1.0 else 0
+        scale = psf_s0 + (1.0 - psf_s0) * step / psf_steps if step < psf_steps else 1.0
+        b0 = float(cfg.get("blur_sigma", 0.0) or 0.0)
+        b_steps = int(round(float(cfg.get("blur_frac", 0.6)) * steps)) if b0 > 0 else 0
+        sigma = b0 * max(0.0, 1.0 - step / b_steps) if step < b_steps else 0.0
+        return scale, sigma
+
+    def _band(self, scale: float) -> tuple[np.ndarray, np.ndarray]:
+        """PSF band offsets u (units of the other slice's thickness) and weights at PSF scale `scale`
+        (motion_gradient.LineSampler: slice_profile / band_weights)."""
+        cfg = self.config or {}
+        n_band = 1 if cfg.get("no_psf") else int(cfg.get("n_band", 1))
+        model, tbw = cfg.get("psf_model", "pulse"), float(cfg.get("psf_tbw", 2.5))
+        smax = max(1.0, 1.0 if cfg.get("no_psf") else float(cfg.get("psf_scale_start", 1.0) or 1.0))
+        if model == "gaussian":
+            sig, support = 1.0 / 2.3548, 2.0 / 2.3548
+        elif model == "rect":
+            sig, support = 0.0, 0.5
+        else:
+            sig = 1.0 / tbw / 2.5631
+            support = 0.5 + 2.5 * sig
+        K = max(1, int(math.ceil(max(1, n_band) * smax))) if n_band > 1 else 1
+        if K == 1:
+            return np.zeros(1), np.ones(1)
+        u = np.linspace(-support * smax, support * smax, K)
+        x = u / scale
+        if model == "gaussian":
+            w = np.exp(-0.5 * (x / sig) ** 2)
+        elif model == "rect":
+            w = (np.abs(x) <= 0.5).astype(float)
+        else:
+            from scipy.special import erf
+            sq = sig * math.sqrt(2.0)
+            w = 0.5 * (erf((x + 0.5) / sq) - erf((x - 0.5) / sq))
+        return u, w / w.sum()
+
+    def _thickness(self, e: dict) -> float:
+        cfg = self.config or {}
+        if e["view"] == "SA":
+            return float(cfg.get("sax_thickness", 8.0))
+        t = cfg.get("lax_thickness")
+        return float(t) if t else float(e["slice"]["thick_hdr"])
+
+    def _blurred(self, e: dict, sigma: float) -> np.ndarray:
+        """Raw intensities of the current frame, in-plane Gaussian blurred with sigma mm (as LineSampler.set_blur)."""
+        key = (e["name"], self.frame, round(sigma, 4))
+        out = self._blur_cache.get(key)
+        if out is None:
+            raw = e["slice"]["raw"][:, :, self.frame].astype(np.float32)
+            if sigma > 1e-6:
+                A = e["slice"]["affine"]
+                sp = (np.linalg.norm(A[:3, 0]), np.linalg.norm(A[:3, 1]))
+                raw = gaussian_filter(raw, (max(sigma / sp[0], 1e-3), max(sigma / sp[1], 1e-3)), mode="nearest",
+                                      truncate=3.0)
+            if len(self._blur_cache) > 64:
+                self._blur_cache.clear()
+            self._blur_cache[key] = out = raw
+        return out
+
+    def _loss_profile(self, e: dict, other: dict, snap: dict, pts: np.ndarray, sigma: float, scale: float,
+                      band: bool) -> np.ndarray:
+        """Slice e's profile along the line as the loss samples it: blurred raw image, averaged over the PSF band
+        across `other`'s slab (offsets along the in-plane direction of e that crosses other, u T / sin(theta)),
+        mapped to the view's display scale (0-255, unclipped)."""
+        A = self._affine_for(e, snap)
+        img = self._blurred(e, sigma)
+        Ai = np.linalg.inv(A)
+        u, w = self._band(scale) if band else (np.zeros(1), np.ones(1))
+        if len(u) > 1:
+            Ao = self._affine_for(other, snap)
+            n_e = np.cross(A[:3, 0], A[:3, 1]); n_e /= np.linalg.norm(n_e)
+            n_o = np.cross(Ao[:3, 0], Ao[:3, 1]); n_o /= np.linalg.norm(n_o)
+            m = n_o - (n_o @ n_e) * n_e
+            sin = max(np.linalg.norm(m), 1e-3)
+            m /= sin
+            step = self._thickness(other) / sin
+        else:
+            m, step = np.zeros(3), 0.0
+        prof = np.zeros(len(pts))
+        for uk, wk in zip(u, w):
+            P = pts + uk * step * m
+            vox = (Ai @ np.column_stack([P, np.ones(len(P))]).T)[:2]
+            prof += wk * map_coordinates(img, vox, order=1, mode="constant", cval=0.0)   # zeros padding, as grid_sample
+        inside = np.isfinite(self._sample(e, snap, pts))
+        lo, hi = e["slice"]["lo"], e["slice"]["hi"]
+        return np.where(inside, (prof - lo) / (hi - lo) * 255.0, np.nan)
+
+    def _profile_values(self, e: dict, it: dict, snap: dict, pts: np.ndarray) -> tuple[np.ndarray, np.ndarray, str]:
+        if not (self.show_psf and self.config is not None):
+            return self._sample(e, snap, pts), self._sample(it["other"], snap, pts), ""
+        scale, sigma = self._loss_state(snap["step"])
+        band = not it.get("sa_sa", False)                 # SA-SA lines are sampled on the line, no band
+        ya = self._loss_profile(e, it["other"], snap, pts, sigma, scale, band)
+        yb = self._loss_profile(it["other"], e, snap, pts, sigma, scale, band)
+        return ya, yb, (f"  psf\u00d7{scale:.1f}" if band else "") + f"  blur {sigma:.1f}"
+
+    def _on_psf_toggle(self, value: bool):
+        self.show_psf = bool(value)
+        self._update_profiles()
+        self.pl.render()
+
     def _profile_items(self, snap: dict) -> list[dict]:
         """The intersections of the picked slice: (other slice name, start, unit dir, t_img, t_used)."""
         e = self._entry_by_name().get(self.profile_key)
@@ -1457,7 +1580,7 @@ class SliceViewer:
             names = {x["key"][1]: x for x in self.entries if x["view"] == "SA"}
             nb = sl + 1 if sl + 1 in names else sl - 1
             if nb in names:
-                item = dict(other=names[nb], x0=None)
+                item = dict(other=names[nb], x0=None, sa_sa=True)
                 segs = self._sa_segments(snap)
                 pairs = segs.get("img_pairs", np.zeros((0, 2), int))
                 hit = np.flatnonzero(((pairs == sl).any(1)) & ((pairs == nb).any(1))) if len(pairs) else []
@@ -1497,15 +1620,15 @@ class SliceViewer:
                 continue
             t = np.arange(it["t_img"][0], it["t_img"][1] + 1e-6, PROFILE_STEP_MM)
             pts = it["x0"] + t[:, None] * it["d"]
-            ya, yb = self._sample(e, snap, pts), self._sample(it["other"], snap, pts)
+            ya, yb, mode_txt = self._profile_values(e, it, snap, pts)
             used = (t >= it["t_used"][0]) & (t <= it["t_used"][1]) if np.isfinite(it["t_used"]).all() \
                 else np.zeros(len(t), bool)
             ok = used & np.isfinite(ya) & np.isfinite(yb)
             if ok.sum() > 2 and ya[ok].std() > 0 and yb[ok].std() > 0:
                 ncc = float(np.corrcoef(ya[ok], yb[ok])[0, 1])
-                ch.title = f"{names}   NCC {ncc:.2f}"
+                ch.title = f"{names}   NCC {ncc:.2f}{mode_txt}"
             else:
-                ch.title = f"{names}   (no loss points)"
+                ch.title = f"{names}   (no loss points){mode_txt}"
             for side, y in (("a", ya), ("b", yb)):
                 pl_[side + "_img"].update(t, y)
                 pl_[side + "_used"].update(t, np.where(used, y, np.nan))
@@ -1866,6 +1989,8 @@ class SliceViewer:
         if self._radius_items:
             add_row("LA radius on SA  [u]", self._on_radius_toggle, self.show_radius, "radius")
         add_row("Intersection profiles  [p]", self._on_profiles_toggle, self.show_profiles, "profiles")
+        if self.config is not None:
+            add_row("  as in the loss (blur, PSF)  [y]", self._on_psf_toggle, self.show_psf, "psf")
         y -= 8
         if "SA" in self.data:
             add_row("All SA  [a]", lambda v: self._set_group("SA", v), True, "all_sa")
@@ -2136,7 +2261,11 @@ def load_subject_run(run_dir: Path, subject: str, instance: int | None = None) -
                 if A is not None and not np.allclose(A, s["affine"], atol=5e-3):
                     print(f"[warn] {s['file']}: NIfTI affine differs from the history's best pose "
                           f"(max |diff| {np.abs(A - s['affine']).max():.3f})", file=sys.stderr)
-    return {"data": data, "history": history, "overlays": overlays,
+    cfg_path = run_dir / "overall_metrics" / "run_config.json"
+    config = json.loads(cfg_path.read_text()) if cfg_path.exists() else None
+    if config is None:
+        print(f"[warn] {cfg_path} missing: profiles can only show raw intensities", file=sys.stderr)
+    return {"data": data, "history": history, "overlays": overlays, "config": config,
             "title": f"UKBB {subject}" + (f" / Instance_{instance}" if instance is not None else ""), "run_name": run_dir.name}
 
 
@@ -2165,6 +2294,8 @@ def parse_args(argv=None):
     ap.add_argument("--sa-lines", action="store_true",
                     help="start with the SA-SA sampling lines (metrics/sa_lines.csv) shown")
     ap.add_argument("--no-profiles", action="store_true", help="start with the intersection profile charts hidden")
+    ap.add_argument("--raw-profiles", action="store_true",
+                    help="start with the profiles showing raw intensities instead of the loss view (blur + PSF band)")
     ap.add_argument("--radius", action="store_true",
                     help="start with the long-axis radius of the SA-SA supervision (metrics/long_axis.csv) shown")
     ap.add_argument("--no-seg", action="store_true", help="start with segmentation overlay off")
@@ -2221,6 +2352,7 @@ def main(argv=None):
         frame=args.frame, show_seg=not args.no_seg, seg_alpha=args.seg_alpha, start=start,
         metric=args.metric, show_mask=args.mask, show_lines=args.lines, show_sa_lines=args.sa_lines,
         show_radius=args.radius, show_profiles=not args.no_profiles,
+        show_psf=not args.raw_profiles,
     )
     if args.screenshot is not None:
         viewer.show(screenshot=str(args.screenshot), auto_close=True)

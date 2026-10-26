@@ -1,0 +1,189 @@
+### trans=3  rounds=2 steps=200
+config {'trans': '3', 'rot': '3', 'rounds': '2', 'steps': '200'}  (11.7 s for 2 runs)  perturbed ['SAX:3', 'SAX:5', 'SAX:7', 'LAX_4Ch:0']: |rot|=3.0 deg, |trans|=3.0 mm
+[raw ] perturbed planes residual: trans 3.00/3.00 mm  tilt 2.22/2.91 deg  in-plane rot 2.70/2.81 deg (mean/max)
+[raw ] other planes residual:     trans 0.00/0.00 mm  tilt 0.00/0.00 deg  in-plane rot 0.00/0.00 deg (mean/max)
+        SAX:3      trans 3.00 mm  tilt 1.49 deg  in-plane 2.81 deg
+        SAX:5      trans 3.00 mm  tilt 2.91 deg  in-plane 2.66 deg
+        SAX:7      trans 3.00 mm  tilt 2.21 deg  in-plane 2.52 deg
+        LAX_4Ch:0  trans 3.00 mm  tilt 2.28 deg  in-plane 2.79 deg
+[grid] perturbed planes residual: trans 1.73/3.58 mm  tilt 2.19/2.72 deg  in-plane rot 2.63/2.77 deg (mean/max)
+[grid] other planes residual:     trans 0.36/0.65 mm  tilt 0.62/0.64 deg  in-plane rot 0.28/0.60 deg (mean/max)
+        SAX:3      trans 3.58 mm  tilt 1.10 deg  in-plane 2.63 deg
+        SAX:5      trans 0.65 mm  tilt 2.72 deg  in-plane 2.77 deg
+        SAX:7      trans 1.22 mm  tilt 2.67 deg  in-plane 2.64 deg
+        LAX_4Ch:0  trans 1.46 mm  tilt 2.27 deg  in-plane 2.47 deg
+[ref ] perturbed planes residual: trans 1.50/2.20 mm  tilt 2.06/2.86 deg  in-plane rot 2.31/2.57 deg (mean/max)
+[ref ] other planes residual:     trans 0.44/0.71 mm  tilt 0.66/1.17 deg  in-plane rot 0.34/0.67 deg (mean/max)
+        SAX:3      trans 2.20 mm  tilt 1.17 deg  in-plane 2.37 deg
+        SAX:5      trans 1.00 mm  tilt 2.03 deg  in-plane 1.96 deg
+        SAX:7      trans 1.73 mm  tilt 2.86 deg  in-plane 2.57 deg
+        LAX_4Ch:0  trans 1.09 mm  tilt 2.19 deg  in-plane 2.36 deg
+NCC: baseline best=0.919 ref=0.936 | perturbed best=0.909 ref=0.937
+### trans=3  rounds=0 steps=200
+config {'trans': '3', 'rot': '3', 'rounds': '0', 'steps': '200'}  (10.7 s for 2 runs)  perturbed ['SAX:3', 'SAX:5', 'SAX:7', 'LAX_4Ch:0']: |rot|=3.0 deg, |trans|=3.0 mm
+[raw ] perturbed planes residual: trans 3.00/3.00 mm  tilt 2.22/2.91 deg  in-plane rot 2.70/2.81 deg (mean/max)
+[raw ] other planes residual:     trans 0.00/0.00 mm  tilt 0.00/0.00 deg  in-plane rot 0.00/0.00 deg (mean/max)
+        SAX:3      trans 3.00 mm  tilt 1.49 deg  in-plane 2.81 deg
+        SAX:5      trans 3.00 mm  tilt 2.91 deg  in-plane 2.66 deg
+        SAX:7      trans 3.00 mm  tilt 2.21 deg  in-plane 2.52 deg
+        LAX_4Ch:0  trans 3.00 mm  tilt 2.28 deg  in-plane 2.79 deg
+[grid] perturbed planes residual: trans 3.00/3.00 mm  tilt 2.22/2.91 deg  in-plane rot 2.70/2.81 deg (mean/max)
+[grid] other planes residual:     trans 0.00/0.00 mm  tilt 0.00/0.00 deg  in-plane rot 0.00/0.00 deg (mean/max)
+        SAX:3      trans 3.00 mm  tilt 1.49 deg  in-plane 2.81 deg
+        SAX:5      trans 3.00 mm  tilt 2.91 deg  in-plane 2.66 deg
+        SAX:7      trans 3.00 mm  tilt 2.21 deg  in-plane 2.52 deg
+        LAX_4Ch:0  trans 3.00 mm  tilt 2.28 deg  in-plane 2.79 deg
+[ref ] perturbed planes residual: trans 1.28/1.76 mm  tilt 2.17/3.02 deg  in-plane rot 2.14/2.36 deg (mean/max)
+[ref ] other planes residual:     trans 0.48/0.76 mm  tilt 0.72/0.96 deg  in-plane rot 0.39/0.86 deg (mean/max)
+        SAX:3      trans 1.76 mm  tilt 1.55 deg  in-plane 1.95 deg
+        SAX:5      trans 1.09 mm  tilt 1.95 deg  in-plane 2.04 deg
+        SAX:7      trans 0.87 mm  tilt 3.02 deg  in-plane 2.36 deg
+        LAX_4Ch:0  trans 1.39 mm  tilt 2.15 deg  in-plane 2.19 deg
+NCC: baseline best=0.903 ref=0.934 | perturbed best=0.861 ref=0.935
+### trans=3  rounds=0 steps=600
+config {'trans': '3', 'rot': '3', 'rounds': '0', 'steps': '600'}  (24.6 s for 2 runs)  perturbed ['SAX:3', 'SAX:5', 'SAX:7', 'LAX_4Ch:0']: |rot|=3.0 deg, |trans|=3.0 mm
+[raw ] perturbed planes residual: trans 3.00/3.00 mm  tilt 2.22/2.91 deg  in-plane rot 2.70/2.81 deg (mean/max)
+[raw ] other planes residual:     trans 0.00/0.00 mm  tilt 0.00/0.00 deg  in-plane rot 0.00/0.00 deg (mean/max)
+        SAX:3      trans 3.00 mm  tilt 1.49 deg  in-plane 2.81 deg
+        SAX:5      trans 3.00 mm  tilt 2.91 deg  in-plane 2.66 deg
+        SAX:7      trans 3.00 mm  tilt 2.21 deg  in-plane 2.52 deg
+        LAX_4Ch:0  trans 3.00 mm  tilt 2.28 deg  in-plane 2.79 deg
+[grid] perturbed planes residual: trans 3.00/3.00 mm  tilt 2.22/2.91 deg  in-plane rot 2.70/2.81 deg (mean/max)
+[grid] other planes residual:     trans 0.00/0.00 mm  tilt 0.00/0.00 deg  in-plane rot 0.00/0.00 deg (mean/max)
+        SAX:3      trans 3.00 mm  tilt 1.49 deg  in-plane 2.81 deg
+        SAX:5      trans 3.00 mm  tilt 2.91 deg  in-plane 2.66 deg
+        SAX:7      trans 3.00 mm  tilt 2.21 deg  in-plane 2.52 deg
+        LAX_4Ch:0  trans 3.00 mm  tilt 2.28 deg  in-plane 2.79 deg
+[ref ] perturbed planes residual: trans 1.02/2.14 mm  tilt 1.58/2.94 deg  in-plane rot 1.47/2.64 deg (mean/max)
+[ref ] other planes residual:     trans 0.45/0.81 mm  tilt 0.54/1.22 deg  in-plane rot 0.39/0.81 deg (mean/max)
+        SAX:3      trans 0.65 mm  tilt 0.72 deg  in-plane 0.80 deg
+        SAX:5      trans 0.73 mm  tilt 1.35 deg  in-plane 1.09 deg
+        SAX:7      trans 2.14 mm  tilt 2.94 deg  in-plane 2.64 deg
+        LAX_4Ch:0  trans 0.54 mm  tilt 1.30 deg  in-plane 1.33 deg
+NCC: baseline best=0.903 ref=0.940 | perturbed best=0.861 ref=0.942
+### trans=8  rounds=2 steps=200
+config {'trans': '8', 'rot': '3', 'rounds': '2', 'steps': '200'}  (11.5 s for 2 runs)  perturbed ['SAX:3', 'SAX:5', 'SAX:7', 'LAX_4Ch:0']: |rot|=3.0 deg, |trans|=8.0 mm
+[raw ] perturbed planes residual: trans 8.00/8.00 mm  tilt 2.22/2.91 deg  in-plane rot 2.70/2.81 deg (mean/max)
+[raw ] other planes residual:     trans 0.00/0.00 mm  tilt 0.00/0.00 deg  in-plane rot 0.00/0.00 deg (mean/max)
+        SAX:3      trans 8.00 mm  tilt 1.49 deg  in-plane 2.81 deg
+        SAX:5      trans 8.00 mm  tilt 2.91 deg  in-plane 2.66 deg
+        SAX:7      trans 8.00 mm  tilt 2.21 deg  in-plane 2.52 deg
+        LAX_4Ch:0  trans 8.00 mm  tilt 2.28 deg  in-plane 2.79 deg
+[grid] perturbed planes residual: trans 7.38/18.03 mm  tilt 2.28/3.08 deg  in-plane rot 2.69/3.12 deg (mean/max)
+[grid] other planes residual:     trans 1.16/1.63 mm  tilt 1.01/1.12 deg  in-plane rot 0.75/1.17 deg (mean/max)
+        SAX:3      trans 7.46 mm  tilt 1.23 deg  in-plane 2.33 deg
+        SAX:5      trans 1.64 mm  tilt 2.44 deg  in-plane 2.75 deg
+        SAX:7      trans 18.03 mm  tilt 3.08 deg  in-plane 3.12 deg
+        LAX_4Ch:0  trans 2.41 mm  tilt 2.38 deg  in-plane 2.56 deg
+[ref ] perturbed planes residual: trans 6.46/21.22 mm  tilt 2.34/3.90 deg  in-plane rot 2.73/4.53 deg (mean/max)
+[ref ] other planes residual:     trans 0.60/0.96 mm  tilt 0.97/1.26 deg  in-plane rot 0.45/0.94 deg (mean/max)
+        SAX:3      trans 2.53 mm  tilt 1.24 deg  in-plane 2.54 deg
+        SAX:5      trans 0.90 mm  tilt 1.82 deg  in-plane 1.57 deg
+        SAX:7      trans 21.22 mm  tilt 3.90 deg  in-plane 4.53 deg
+        LAX_4Ch:0  trans 1.17 mm  tilt 2.41 deg  in-plane 2.29 deg
+NCC: baseline best=0.919 ref=0.936 | perturbed best=0.892 ref=0.928
+### trans=8  rounds=0 steps=200
+config {'trans': '8', 'rot': '3', 'rounds': '0', 'steps': '200'}  (10.5 s for 2 runs)  perturbed ['SAX:3', 'SAX:5', 'SAX:7', 'LAX_4Ch:0']: |rot|=3.0 deg, |trans|=8.0 mm
+[raw ] perturbed planes residual: trans 8.00/8.00 mm  tilt 2.22/2.91 deg  in-plane rot 2.70/2.81 deg (mean/max)
+[raw ] other planes residual:     trans 0.00/0.00 mm  tilt 0.00/0.00 deg  in-plane rot 0.00/0.00 deg (mean/max)
+        SAX:3      trans 8.00 mm  tilt 1.49 deg  in-plane 2.81 deg
+        SAX:5      trans 8.00 mm  tilt 2.91 deg  in-plane 2.66 deg
+        SAX:7      trans 8.00 mm  tilt 2.21 deg  in-plane 2.52 deg
+        LAX_4Ch:0  trans 8.00 mm  tilt 2.28 deg  in-plane 2.79 deg
+[grid] perturbed planes residual: trans 8.00/8.00 mm  tilt 2.22/2.91 deg  in-plane rot 2.70/2.81 deg (mean/max)
+[grid] other planes residual:     trans 0.00/0.00 mm  tilt 0.00/0.00 deg  in-plane rot 0.00/0.00 deg (mean/max)
+        SAX:3      trans 8.00 mm  tilt 1.49 deg  in-plane 2.81 deg
+        SAX:5      trans 8.00 mm  tilt 2.91 deg  in-plane 2.66 deg
+        SAX:7      trans 8.00 mm  tilt 2.21 deg  in-plane 2.52 deg
+        LAX_4Ch:0  trans 8.00 mm  tilt 2.28 deg  in-plane 2.79 deg
+[ref ] perturbed planes residual: trans 2.41/4.38 mm  tilt 2.16/2.59 deg  in-plane rot 2.72/3.07 deg (mean/max)
+[ref ] other planes residual:     trans 1.02/1.81 mm  tilt 1.27/1.56 deg  in-plane rot 0.75/1.33 deg (mean/max)
+        SAX:3      trans 3.10 mm  tilt 1.83 deg  in-plane 1.85 deg
+        SAX:5      trans 1.14 mm  tilt 1.88 deg  in-plane 2.92 deg
+        SAX:7      trans 1.02 mm  tilt 2.59 deg  in-plane 3.07 deg
+        LAX_4Ch:0  trans 4.38 mm  tilt 2.33 deg  in-plane 3.03 deg
+NCC: baseline best=0.903 ref=0.934 | perturbed best=0.725 ref=0.926
+### trans=8  rounds=0 steps=600
+config {'trans': '8', 'rot': '3', 'rounds': '0', 'steps': '600'}  (22.9 s for 2 runs)  perturbed ['SAX:3', 'SAX:5', 'SAX:7', 'LAX_4Ch:0']: |rot|=3.0 deg, |trans|=8.0 mm
+[raw ] perturbed planes residual: trans 8.00/8.00 mm  tilt 2.22/2.91 deg  in-plane rot 2.70/2.81 deg (mean/max)
+[raw ] other planes residual:     trans 0.00/0.00 mm  tilt 0.00/0.00 deg  in-plane rot 0.00/0.00 deg (mean/max)
+        SAX:3      trans 8.00 mm  tilt 1.49 deg  in-plane 2.81 deg
+        SAX:5      trans 8.00 mm  tilt 2.91 deg  in-plane 2.66 deg
+        SAX:7      trans 8.00 mm  tilt 2.21 deg  in-plane 2.52 deg
+        LAX_4Ch:0  trans 8.00 mm  tilt 2.28 deg  in-plane 2.79 deg
+[grid] perturbed planes residual: trans 8.00/8.00 mm  tilt 2.22/2.91 deg  in-plane rot 2.70/2.81 deg (mean/max)
+[grid] other planes residual:     trans 0.00/0.00 mm  tilt 0.00/0.00 deg  in-plane rot 0.00/0.00 deg (mean/max)
+        SAX:3      trans 8.00 mm  tilt 1.49 deg  in-plane 2.81 deg
+        SAX:5      trans 8.00 mm  tilt 2.91 deg  in-plane 2.66 deg
+        SAX:7      trans 8.00 mm  tilt 2.21 deg  in-plane 2.52 deg
+        LAX_4Ch:0  trans 8.00 mm  tilt 2.28 deg  in-plane 2.79 deg
+[ref ] perturbed planes residual: trans 1.18/2.28 mm  tilt 2.04/3.10 deg  in-plane rot 1.82/2.98 deg (mean/max)
+[ref ] other planes residual:     trans 0.72/1.00 mm  tilt 1.08/2.16 deg  in-plane rot 0.62/1.21 deg (mean/max)
+        SAX:3      trans 0.91 mm  tilt 0.95 deg  in-plane 0.78 deg
+        SAX:5      trans 0.27 mm  tilt 2.22 deg  in-plane 1.58 deg
+        SAX:7      trans 2.28 mm  tilt 3.10 deg  in-plane 2.98 deg
+        LAX_4Ch:0  trans 1.25 mm  tilt 1.88 deg  in-plane 1.96 deg
+NCC: baseline best=0.903 ref=0.940 | perturbed best=0.725 ref=0.943
+### trans=15  rounds=2 steps=200
+config {'trans': '15', 'rot': '3', 'rounds': '2', 'steps': '200'}  (10.2 s for 2 runs)  perturbed ['SAX:3', 'SAX:5', 'SAX:7', 'LAX_4Ch:0']: |rot|=3.0 deg, |trans|=15.0 mm
+[raw ] perturbed planes residual: trans 15.00/15.00 mm  tilt 2.22/2.91 deg  in-plane rot 2.70/2.81 deg (mean/max)
+[raw ] other planes residual:     trans 0.00/0.00 mm  tilt 0.00/0.00 deg  in-plane rot 0.00/0.00 deg (mean/max)
+        SAX:3      trans 15.00 mm  tilt 1.49 deg  in-plane 2.81 deg
+        SAX:5      trans 15.00 mm  tilt 2.91 deg  in-plane 2.66 deg
+        SAX:7      trans 15.00 mm  tilt 2.21 deg  in-plane 2.52 deg
+        LAX_4Ch:0  trans 15.00 mm  tilt 2.28 deg  in-plane 2.79 deg
+[grid] perturbed planes residual: trans 9.70/19.46 mm  tilt 2.32/3.01 deg  in-plane rot 2.78/3.32 deg (mean/max)
+[grid] other planes residual:     trans 1.25/1.80 mm  tilt 0.95/1.19 deg  in-plane rot 0.94/1.21 deg (mean/max)
+        SAX:3      trans 13.79 mm  tilt 1.28 deg  in-plane 2.17 deg
+        SAX:5      trans 2.44 mm  tilt 2.43 deg  in-plane 2.84 deg
+        SAX:7      trans 19.46 mm  tilt 3.01 deg  in-plane 3.32 deg
+        LAX_4Ch:0  trans 3.12 mm  tilt 2.56 deg  in-plane 2.78 deg
+[ref ] perturbed planes residual: trans 7.63/20.07 mm  tilt 1.94/2.48 deg  in-plane rot 2.62/3.58 deg (mean/max)
+[ref ] other planes residual:     trans 0.80/1.47 mm  tilt 1.08/1.53 deg  in-plane rot 0.74/1.32 deg (mean/max)
+        SAX:3      trans 6.30 mm  tilt 1.52 deg  in-plane 3.58 deg
+        SAX:5      trans 1.37 mm  tilt 2.07 deg  in-plane 2.07 deg
+        SAX:7      trans 20.07 mm  tilt 2.48 deg  in-plane 2.88 deg
+        LAX_4Ch:0  trans 2.78 mm  tilt 1.71 deg  in-plane 1.93 deg
+NCC: baseline best=0.919 ref=0.936 | perturbed best=0.867 ref=0.917
+### trans=15  rounds=0 steps=200
+config {'trans': '15', 'rot': '3', 'rounds': '0', 'steps': '200'}  (9.9 s for 2 runs)  perturbed ['SAX:3', 'SAX:5', 'SAX:7', 'LAX_4Ch:0']: |rot|=3.0 deg, |trans|=15.0 mm
+[raw ] perturbed planes residual: trans 15.00/15.00 mm  tilt 2.22/2.91 deg  in-plane rot 2.70/2.81 deg (mean/max)
+[raw ] other planes residual:     trans 0.00/0.00 mm  tilt 0.00/0.00 deg  in-plane rot 0.00/0.00 deg (mean/max)
+        SAX:3      trans 15.00 mm  tilt 1.49 deg  in-plane 2.81 deg
+        SAX:5      trans 15.00 mm  tilt 2.91 deg  in-plane 2.66 deg
+        SAX:7      trans 15.00 mm  tilt 2.21 deg  in-plane 2.52 deg
+        LAX_4Ch:0  trans 15.00 mm  tilt 2.28 deg  in-plane 2.79 deg
+[grid] perturbed planes residual: trans 15.00/15.00 mm  tilt 2.22/2.91 deg  in-plane rot 2.70/2.81 deg (mean/max)
+[grid] other planes residual:     trans 0.00/0.00 mm  tilt 0.00/0.00 deg  in-plane rot 0.00/0.00 deg (mean/max)
+        SAX:3      trans 15.00 mm  tilt 1.49 deg  in-plane 2.81 deg
+        SAX:5      trans 15.00 mm  tilt 2.91 deg  in-plane 2.66 deg
+        SAX:7      trans 15.00 mm  tilt 2.21 deg  in-plane 2.52 deg
+        LAX_4Ch:0  trans 15.00 mm  tilt 2.28 deg  in-plane 2.79 deg
+[ref ] perturbed planes residual: trans 13.41/18.42 mm  tilt 2.36/3.31 deg  in-plane rot 2.06/3.03 deg (mean/max)
+[ref ] other planes residual:     trans 2.54/6.21 mm  tilt 2.57/4.14 deg  in-plane rot 1.46/2.85 deg (mean/max)
+        SAX:3      trans 8.66 mm  tilt 2.45 deg  in-plane 1.72 deg
+        SAX:5      trans 18.42 mm  tilt 1.46 deg  in-plane 1.23 deg
+        SAX:7      trans 17.39 mm  tilt 3.31 deg  in-plane 3.03 deg
+        LAX_4Ch:0  trans 9.15 mm  tilt 2.22 deg  in-plane 2.27 deg
+NCC: baseline best=0.903 ref=0.934 | perturbed best=0.638 ref=0.810
+### trans=15  rounds=0 steps=600
+config {'trans': '15', 'rot': '3', 'rounds': '0', 'steps': '600'}  (23.1 s for 2 runs)  perturbed ['SAX:3', 'SAX:5', 'SAX:7', 'LAX_4Ch:0']: |rot|=3.0 deg, |trans|=15.0 mm
+[raw ] perturbed planes residual: trans 15.00/15.00 mm  tilt 2.22/2.91 deg  in-plane rot 2.70/2.81 deg (mean/max)
+[raw ] other planes residual:     trans 0.00/0.00 mm  tilt 0.00/0.00 deg  in-plane rot 0.00/0.00 deg (mean/max)
+        SAX:3      trans 15.00 mm  tilt 1.49 deg  in-plane 2.81 deg
+        SAX:5      trans 15.00 mm  tilt 2.91 deg  in-plane 2.66 deg
+        SAX:7      trans 15.00 mm  tilt 2.21 deg  in-plane 2.52 deg
+        LAX_4Ch:0  trans 15.00 mm  tilt 2.28 deg  in-plane 2.79 deg
+[grid] perturbed planes residual: trans 15.00/15.00 mm  tilt 2.22/2.91 deg  in-plane rot 2.70/2.81 deg (mean/max)
+[grid] other planes residual:     trans 0.00/0.00 mm  tilt 0.00/0.00 deg  in-plane rot 0.00/0.00 deg (mean/max)
+        SAX:3      trans 15.00 mm  tilt 1.49 deg  in-plane 2.81 deg
+        SAX:5      trans 15.00 mm  tilt 2.91 deg  in-plane 2.66 deg
+        SAX:7      trans 15.00 mm  tilt 2.21 deg  in-plane 2.52 deg
+        LAX_4Ch:0  trans 15.00 mm  tilt 2.28 deg  in-plane 2.79 deg
+[ref ] perturbed planes residual: trans 12.21/22.10 mm  tilt 2.70/4.68 deg  in-plane rot 2.35/4.84 deg (mean/max)
+[ref ] other planes residual:     trans 1.49/2.76 mm  tilt 2.10/4.08 deg  in-plane rot 1.33/2.20 deg (mean/max)
+        SAX:3      trans 2.57 mm  tilt 2.19 deg  in-plane 1.87 deg
+        SAX:5      trans 21.99 mm  tilt 3.39 deg  in-plane 2.49 deg
+        SAX:7      trans 22.10 mm  tilt 4.68 deg  in-plane 4.84 deg
+        LAX_4Ch:0  trans 2.20 mm  tilt 0.54 deg  in-plane 0.19 deg
+NCC: baseline best=0.903 ref=0.940 | perturbed best=0.638 ref=0.885

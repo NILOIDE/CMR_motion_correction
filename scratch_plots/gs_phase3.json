@@ -1,0 +1,546 @@
+[
+ {
+  "name": "p3_s200lin20_blur3_psf2_pfr0.4",
+  "args": {
+   "lr-schedule": "linear",
+   "lr": 0.2,
+   "rot-lr": 0.04,
+   "lr-end": 0.0,
+   "rot-lr-end": 0.0,
+   "steps": 200,
+   "blur-sigma": 3,
+   "psf-scale-start": 2.0,
+   "psf-anneal-frac": 0.4
+  }
+ },
+ {
+  "name": "p3_s200lin20_blur6_psf2_pfr0.4",
+  "args": {
+   "lr-schedule": "linear",
+   "lr": 0.2,
+   "rot-lr": 0.04,
+   "lr-end": 0.0,
+   "rot-lr-end": 0.0,
+   "steps": 200,
+   "blur-sigma": 6,
+   "psf-scale-start": 2.0,
+   "psf-anneal-frac": 0.4
+  }
+ },
+ {
+  "name": "p3_s200lin20_blur9_psf2_pfr0.4",
+  "args": {
+   "lr-schedule": "linear",
+   "lr": 0.2,
+   "rot-lr": 0.04,
+   "lr-end": 0.0,
+   "rot-lr-end": 0.0,
+   "steps": 200,
+   "blur-sigma": 9,
+   "psf-scale-start": 2.0,
+   "psf-anneal-frac": 0.4
+  }
+ },
+ {
+  "name": "p3_s200lin20_blur3_psf2_pfr0.6",
+  "args": {
+   "lr-schedule": "linear",
+   "lr": 0.2,
+   "rot-lr": 0.04,
+   "lr-end": 0.0,
+   "rot-lr-end": 0.0,
+   "steps": 200,
+   "blur-sigma": 3,
+   "psf-scale-start": 2.0,
+   "psf-anneal-frac": 0.6
+  }
+ },
+ {
+  "name": "p3_s200lin20_blur6_psf2_pfr0.6",
+  "args": {
+   "lr-schedule": "linear",
+   "lr": 0.2,
+   "rot-lr": 0.04,
+   "lr-end": 0.0,
+   "rot-lr-end": 0.0,
+   "steps": 200,
+   "blur-sigma": 6,
+   "psf-scale-start": 2.0,
+   "psf-anneal-frac": 0.6
+  }
+ },
+ {
+  "name": "p3_s200lin20_blur9_psf2_pfr0.6",
+  "args": {
+   "lr-schedule": "linear",
+   "lr": 0.2,
+   "rot-lr": 0.04,
+   "lr-end": 0.0,
+   "rot-lr-end": 0.0,
+   "steps": 200,
+   "blur-sigma": 9,
+   "psf-scale-start": 2.0,
+   "psf-anneal-frac": 0.6
+  }
+ },
+ {
+  "name": "p3_s200lin20_blur3_psf2_pfr0.8",
+  "args": {
+   "lr-schedule": "linear",
+   "lr": 0.2,
+   "rot-lr": 0.04,
+   "lr-end": 0.0,
+   "rot-lr-end": 0.0,
+   "steps": 200,
+   "blur-sigma": 3,
+   "psf-scale-start": 2.0,
+   "psf-anneal-frac": 0.8
+  }
+ },
+ {
+  "name": "p3_s200lin20_blur6_psf2_pfr0.8",
+  "args": {
+   "lr-schedule": "linear",
+   "lr": 0.2,
+   "rot-lr": 0.04,
+   "lr-end": 0.0,
+   "rot-lr-end": 0.0,
+   "steps": 200,
+   "blur-sigma": 6,
+   "psf-scale-start": 2.0,
+   "psf-anneal-frac": 0.8
+  }
+ },
+ {
+  "name": "p3_s200lin20_blur9_psf2_pfr0.8",
+  "args": {
+   "lr-schedule": "linear",
+   "lr": 0.2,
+   "rot-lr": 0.04,
+   "lr-end": 0.0,
+   "rot-lr-end": 0.0,
+   "steps": 200,
+   "blur-sigma": 9,
+   "psf-scale-start": 2.0,
+   "psf-anneal-frac": 0.8
+  }
+ },
+ {
+  "name": "p3_s200lin20_blur3_psf3_pfr0.4",
+  "args": {
+   "lr-schedule": "linear",
+   "lr": 0.2,
+   "rot-lr": 0.04,
+   "lr-end": 0.0,
+   "rot-lr-end": 0.0,
+   "steps": 200,
+   "blur-sigma": 3,
+   "psf-scale-start": 3.0,
+   "psf-anneal-frac": 0.4
+  }
+ },
+ {
+  "name": "p3_s200lin20_blur6_psf3_pfr0.4",
+  "args": {
+   "lr-schedule": "linear",
+   "lr": 0.2,
+   "rot-lr": 0.04,
+   "lr-end": 0.0,
+   "rot-lr-end": 0.0,
+   "steps": 200,
+   "blur-sigma": 6,
+   "psf-scale-start": 3.0,
+   "psf-anneal-frac": 0.4
+  }
+ },
+ {
+  "name": "p3_s200lin20_blur9_psf3_pfr0.4",
+  "args": {
+   "lr-schedule": "linear",
+   "lr": 0.2,
+   "rot-lr": 0.04,
+   "lr-end": 0.0,
+   "rot-lr-end": 0.0,
+   "steps": 200,
+   "blur-sigma": 9,
+   "psf-scale-start": 3.0,
+   "psf-anneal-frac": 0.4
+  }
+ },
+ {
+  "name": "p3_s200lin20_blur3_psf3_pfr0.6",
+  "args": {
+   "lr-schedule": "linear",
+   "lr": 0.2,
+   "rot-lr": 0.04,
+   "lr-end": 0.0,
+   "rot-lr-end": 0.0,
+   "steps": 200,
+   "blur-sigma": 3,
+   "psf-scale-start": 3.0,
+   "psf-anneal-frac": 0.6
+  }
+ },
+ {
+  "name": "p3_s200lin20_blur6_psf3_pfr0.6",
+  "args": {
+   "lr-schedule": "linear",
+   "lr": 0.2,
+   "rot-lr": 0.04,
+   "lr-end": 0.0,
+   "rot-lr-end": 0.0,
+   "steps": 200,
+   "blur-sigma": 6,
+   "psf-scale-start": 3.0,
+   "psf-anneal-frac": 0.6
+  }
+ },
+ {
+  "name": "p3_s200lin20_blur9_psf3_pfr0.6",
+  "args": {
+   "lr-schedule": "linear",
+   "lr": 0.2,
+   "rot-lr": 0.04,
+   "lr-end": 0.0,
+   "rot-lr-end": 0.0,
+   "steps": 200,
+   "blur-sigma": 9,
+   "psf-scale-start": 3.0,
+   "psf-anneal-frac": 0.6
+  }
+ },
+ {
+  "name": "p3_s200lin20_blur3_psf3_pfr0.8",
+  "args": {
+   "lr-schedule": "linear",
+   "lr": 0.2,
+   "rot-lr": 0.04,
+   "lr-end": 0.0,
+   "rot-lr-end": 0.0,
+   "steps": 200,
+   "blur-sigma": 3,
+   "psf-scale-start": 3.0,
+   "psf-anneal-frac": 0.8
+  }
+ },
+ {
+  "name": "p3_s200lin20_blur6_psf3_pfr0.8",
+  "args": {
+   "lr-schedule": "linear",
+   "lr": 0.2,
+   "rot-lr": 0.04,
+   "lr-end": 0.0,
+   "rot-lr-end": 0.0,
+   "steps": 200,
+   "blur-sigma": 6,
+   "psf-scale-start": 3.0,
+   "psf-anneal-frac": 0.8
+  }
+ },
+ {
+  "name": "p3_s200lin20_blur9_psf3_pfr0.8",
+  "args": {
+   "lr-schedule": "linear",
+   "lr": 0.2,
+   "rot-lr": 0.04,
+   "lr-end": 0.0,
+   "rot-lr-end": 0.0,
+   "steps": 200,
+   "blur-sigma": 9,
+   "psf-scale-start": 3.0,
+   "psf-anneal-frac": 0.8
+  }
+ },
+ {
+  "name": "p3_s200lin20_blur3_psf4_pfr0.4",
+  "args": {
+   "lr-schedule": "linear",
+   "lr": 0.2,
+   "rot-lr": 0.04,
+   "lr-end": 0.0,
+   "rot-lr-end": 0.0,
+   "steps": 200,
+   "blur-sigma": 3,
+   "psf-scale-start": 4.0,
+   "psf-anneal-frac": 0.4
+  }
+ },
+ {
+  "name": "p3_s200lin20_blur6_psf4_pfr0.4",
+  "args": {
+   "lr-schedule": "linear",
+   "lr": 0.2,
+   "rot-lr": 0.04,
+   "lr-end": 0.0,
+   "rot-lr-end": 0.0,
+   "steps": 200,
+   "blur-sigma": 6,
+   "psf-scale-start": 4.0,
+   "psf-anneal-frac": 0.4
+  }
+ },
+ {
+  "name": "p3_s200lin20_blur9_psf4_pfr0.4",
+  "args": {
+   "lr-schedule": "linear",
+   "lr": 0.2,
+   "rot-lr": 0.04,
+   "lr-end": 0.0,
+   "rot-lr-end": 0.0,
+   "steps": 200,
+   "blur-sigma": 9,
+   "psf-scale-start": 4.0,
+   "psf-anneal-frac": 0.4
+  }
+ },
+ {
+  "name": "p3_s200lin20_blur3_psf4_pfr0.6",
+  "args": {
+   "lr-schedule": "linear",
+   "lr": 0.2,
+   "rot-lr": 0.04,
+   "lr-end": 0.0,
+   "rot-lr-end": 0.0,
+   "steps": 200,
+   "blur-sigma": 3,
+   "psf-scale-start": 4.0,
+   "psf-anneal-frac": 0.6
+  }
+ },
+ {
+  "name": "p3_s200lin20_blur6_psf4_pfr0.6",
+  "args": {
+   "lr-schedule": "linear",
+   "lr": 0.2,
+   "rot-lr": 0.04,
+   "lr-end": 0.0,
+   "rot-lr-end": 0.0,
+   "steps": 200,
+   "blur-sigma": 6,
+   "psf-scale-start": 4.0,
+   "psf-anneal-frac": 0.6
+  }
+ },
+ {
+  "name": "p3_s200lin20_blur9_psf4_pfr0.6",
+  "args": {
+   "lr-schedule": "linear",
+   "lr": 0.2,
+   "rot-lr": 0.04,
+   "lr-end": 0.0,
+   "rot-lr-end": 0.0,
+   "steps": 200,
+   "blur-sigma": 9,
+   "psf-scale-start": 4.0,
+   "psf-anneal-frac": 0.6
+  }
+ },
+ {
+  "name": "p3_s200lin20_blur3_psf4_pfr0.8",
+  "args": {
+   "lr-schedule": "linear",
+   "lr": 0.2,
+   "rot-lr": 0.04,
+   "lr-end": 0.0,
+   "rot-lr-end": 0.0,
+   "steps": 200,
+   "blur-sigma": 3,
+   "psf-scale-start": 4.0,
+   "psf-anneal-frac": 0.8
+  }
+ },
+ {
+  "name": "p3_s200lin20_blur6_psf4_pfr0.8",
+  "args": {
+   "lr-schedule": "linear",
+   "lr": 0.2,
+   "rot-lr": 0.04,
+   "lr-end": 0.0,
+   "rot-lr-end": 0.0,
+   "steps": 200,
+   "blur-sigma": 6,
+   "psf-scale-start": 4.0,
+   "psf-anneal-frac": 0.8
+  }
+ },
+ {
+  "name": "p3_s200lin20_blur9_psf4_pfr0.8",
+  "args": {
+   "lr-schedule": "linear",
+   "lr": 0.2,
+   "rot-lr": 0.04,
+   "lr-end": 0.0,
+   "rot-lr-end": 0.0,
+   "steps": 200,
+   "blur-sigma": 9,
+   "psf-scale-start": 4.0,
+   "psf-anneal-frac": 0.8
+  }
+ },
+ {
+  "name": "p3_seed1_b6psf3_s200lin20",
+  "args": {
+   "lr-schedule": "linear",
+   "lr": 0.2,
+   "rot-lr": 0.04,
+   "lr-end": 0.0,
+   "rot-lr-end": 0.0,
+   "steps": 200,
+   "blur-sigma": 6,
+   "psf-scale-start": 3.0,
+   "seed": 1
+  }
+ },
+ {
+  "name": "p3_seed2_b6psf3_s200lin20",
+  "args": {
+   "lr-schedule": "linear",
+   "lr": 0.2,
+   "rot-lr": 0.04,
+   "lr-end": 0.0,
+   "rot-lr-end": 0.0,
+   "steps": 200,
+   "blur-sigma": 6,
+   "psf-scale-start": 3.0,
+   "seed": 2
+  }
+ },
+ {
+  "name": "p3_seed3_b6psf3_s200lin20",
+  "args": {
+   "lr-schedule": "linear",
+   "lr": 0.2,
+   "rot-lr": 0.04,
+   "lr-end": 0.0,
+   "rot-lr-end": 0.0,
+   "steps": 200,
+   "blur-sigma": 6,
+   "psf-scale-start": 3.0,
+   "seed": 3
+  }
+ },
+ {
+  "name": "p3_seed1_b6psf3_s300c05",
+  "args": {
+   "lr-schedule": "constant",
+   "lr": 0.05,
+   "rot-lr": 0.01,
+   "steps": 300,
+   "blur-sigma": 6,
+   "psf-scale-start": 3.0,
+   "seed": 1
+  }
+ },
+ {
+  "name": "p3_seed2_b6psf3_s300c05",
+  "args": {
+   "lr-schedule": "constant",
+   "lr": 0.05,
+   "rot-lr": 0.01,
+   "steps": 300,
+   "blur-sigma": 6,
+   "psf-scale-start": 3.0,
+   "seed": 2
+  }
+ },
+ {
+  "name": "p3_seed3_b6psf3_s300c05",
+  "args": {
+   "lr-schedule": "constant",
+   "lr": 0.05,
+   "rot-lr": 0.01,
+   "steps": 300,
+   "blur-sigma": 6,
+   "psf-scale-start": 3.0,
+   "seed": 3
+  }
+ },
+ {
+  "name": "p3_seed1_b6psf3_s600c05",
+  "args": {
+   "lr-schedule": "constant",
+   "lr": 0.05,
+   "rot-lr": 0.01,
+   "steps": 600,
+   "blur-sigma": 6,
+   "psf-scale-start": 3.0,
+   "seed": 1
+  }
+ },
+ {
+  "name": "p3_seed2_b6psf3_s600c05",
+  "args": {
+   "lr-schedule": "constant",
+   "lr": 0.05,
+   "rot-lr": 0.01,
+   "steps": 600,
+   "blur-sigma": 6,
+   "psf-scale-start": 3.0,
+   "seed": 2
+  }
+ },
+ {
+  "name": "p3_seed3_b6psf3_s600c05",
+  "args": {
+   "lr-schedule": "constant",
+   "lr": 0.05,
+   "rot-lr": 0.01,
+   "steps": 600,
+   "blur-sigma": 6,
+   "psf-scale-start": 3.0,
+   "seed": 3
+  }
+ },
+ {
+  "name": "p3_minline20_b6psf3_s200lin20",
+  "args": {
+   "lr-schedule": "linear",
+   "lr": 0.2,
+   "rot-lr": 0.04,
+   "lr-end": 0.0,
+   "rot-lr-end": 0.0,
+   "steps": 200,
+   "blur-sigma": 6,
+   "psf-scale-start": 3.0,
+   "min-line-mm": 20
+  }
+ },
+ {
+  "name": "p3_minline40_b6psf3_s200lin20",
+  "args": {
+   "lr-schedule": "linear",
+   "lr": 0.2,
+   "rot-lr": 0.04,
+   "lr-end": 0.0,
+   "rot-lr-end": 0.0,
+   "steps": 200,
+   "blur-sigma": 6,
+   "psf-scale-start": 3.0,
+   "min-line-mm": 40
+  }
+ },
+ {
+  "name": "p3_minline20_b6psf3_s600c05",
+  "args": {
+   "lr-schedule": "constant",
+   "lr": 0.05,
+   "rot-lr": 0.01,
+   "steps": 600,
+   "blur-sigma": 6,
+   "psf-scale-start": 3.0,
+   "min-line-mm": 20
+  }
+ },
+ {
+  "name": "p3_minline40_b6psf3_s600c05",
+  "args": {
+   "lr-schedule": "constant",
+   "lr": 0.05,
+   "rot-lr": 0.01,
+   "steps": 600,
+   "blur-sigma": 6,
+   "psf-scale-start": 3.0,
+   "min-line-mm": 40
+  }
+ }
+]

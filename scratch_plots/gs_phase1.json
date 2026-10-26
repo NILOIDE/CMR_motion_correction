@@ -1,0 +1,434 @@
+[
+ {
+  "name": "p1_blur0_maskoff_line1_psf1",
+  "args": {
+   "blur-sigma": 0,
+   "mask-dilation-start-mm": null,
+   "line-scale-start": 1.0,
+   "psf-scale-start": 1.0
+  }
+ },
+ {
+  "name": "p1_blur0_maskoff_line1_psf3",
+  "args": {
+   "blur-sigma": 0,
+   "mask-dilation-start-mm": null,
+   "line-scale-start": 1.0,
+   "psf-scale-start": 3.0
+  }
+ },
+ {
+  "name": "p1_blur0_maskoff_line2_psf1",
+  "args": {
+   "blur-sigma": 0,
+   "mask-dilation-start-mm": null,
+   "line-scale-start": 2.0,
+   "psf-scale-start": 1.0
+  }
+ },
+ {
+  "name": "p1_blur0_maskoff_line2_psf3",
+  "args": {
+   "blur-sigma": 0,
+   "mask-dilation-start-mm": null,
+   "line-scale-start": 2.0,
+   "psf-scale-start": 3.0
+  }
+ },
+ {
+  "name": "p1_blur0_mask50_line1_psf1",
+  "args": {
+   "blur-sigma": 0,
+   "mask-dilation-start-mm": 50,
+   "line-scale-start": 1.0,
+   "psf-scale-start": 1.0
+  }
+ },
+ {
+  "name": "p1_blur0_mask50_line1_psf3",
+  "args": {
+   "blur-sigma": 0,
+   "mask-dilation-start-mm": 50,
+   "line-scale-start": 1.0,
+   "psf-scale-start": 3.0
+  }
+ },
+ {
+  "name": "p1_blur0_mask50_line2_psf1",
+  "args": {
+   "blur-sigma": 0,
+   "mask-dilation-start-mm": 50,
+   "line-scale-start": 2.0,
+   "psf-scale-start": 1.0
+  }
+ },
+ {
+  "name": "p1_blur0_mask50_line2_psf3",
+  "args": {
+   "blur-sigma": 0,
+   "mask-dilation-start-mm": 50,
+   "line-scale-start": 2.0,
+   "psf-scale-start": 3.0
+  }
+ },
+ {
+  "name": "p1_blur0_mask100_line1_psf1",
+  "args": {
+   "blur-sigma": 0,
+   "mask-dilation-start-mm": 100,
+   "line-scale-start": 1.0,
+   "psf-scale-start": 1.0
+  }
+ },
+ {
+  "name": "p1_blur0_mask100_line1_psf3",
+  "args": {
+   "blur-sigma": 0,
+   "mask-dilation-start-mm": 100,
+   "line-scale-start": 1.0,
+   "psf-scale-start": 3.0
+  }
+ },
+ {
+  "name": "p1_blur0_mask100_line2_psf1",
+  "args": {
+   "blur-sigma": 0,
+   "mask-dilation-start-mm": 100,
+   "line-scale-start": 2.0,
+   "psf-scale-start": 1.0
+  }
+ },
+ {
+  "name": "p1_blur0_mask100_line2_psf3",
+  "args": {
+   "blur-sigma": 0,
+   "mask-dilation-start-mm": 100,
+   "line-scale-start": 2.0,
+   "psf-scale-start": 3.0
+  }
+ },
+ {
+  "name": "p1_blur6_maskoff_line1_psf1",
+  "args": {
+   "blur-sigma": 6,
+   "mask-dilation-start-mm": null,
+   "line-scale-start": 1.0,
+   "psf-scale-start": 1.0
+  }
+ },
+ {
+  "name": "p1_blur6_maskoff_line1_psf3",
+  "args": {
+   "blur-sigma": 6,
+   "mask-dilation-start-mm": null,
+   "line-scale-start": 1.0,
+   "psf-scale-start": 3.0
+  }
+ },
+ {
+  "name": "p1_blur6_maskoff_line2_psf1",
+  "args": {
+   "blur-sigma": 6,
+   "mask-dilation-start-mm": null,
+   "line-scale-start": 2.0,
+   "psf-scale-start": 1.0
+  }
+ },
+ {
+  "name": "p1_blur6_maskoff_line2_psf3",
+  "args": {
+   "blur-sigma": 6,
+   "mask-dilation-start-mm": null,
+   "line-scale-start": 2.0,
+   "psf-scale-start": 3.0
+  }
+ },
+ {
+  "name": "p1_blur6_mask50_line1_psf1",
+  "args": {
+   "blur-sigma": 6,
+   "mask-dilation-start-mm": 50,
+   "line-scale-start": 1.0,
+   "psf-scale-start": 1.0
+  }
+ },
+ {
+  "name": "p1_blur6_mask50_line1_psf3",
+  "args": {
+   "blur-sigma": 6,
+   "mask-dilation-start-mm": 50,
+   "line-scale-start": 1.0,
+   "psf-scale-start": 3.0
+  }
+ },
+ {
+  "name": "p1_blur6_mask50_line2_psf1",
+  "args": {
+   "blur-sigma": 6,
+   "mask-dilation-start-mm": 50,
+   "line-scale-start": 2.0,
+   "psf-scale-start": 1.0
+  }
+ },
+ {
+  "name": "p1_blur6_mask50_line2_psf3",
+  "args": {
+   "blur-sigma": 6,
+   "mask-dilation-start-mm": 50,
+   "line-scale-start": 2.0,
+   "psf-scale-start": 3.0
+  }
+ },
+ {
+  "name": "p1_blur6_mask100_line1_psf1",
+  "args": {
+   "blur-sigma": 6,
+   "mask-dilation-start-mm": 100,
+   "line-scale-start": 1.0,
+   "psf-scale-start": 1.0
+  }
+ },
+ {
+  "name": "p1_blur6_mask100_line1_psf3",
+  "args": {
+   "blur-sigma": 6,
+   "mask-dilation-start-mm": 100,
+   "line-scale-start": 1.0,
+   "psf-scale-start": 3.0
+  }
+ },
+ {
+  "name": "p1_blur6_mask100_line2_psf1",
+  "args": {
+   "blur-sigma": 6,
+   "mask-dilation-start-mm": 100,
+   "line-scale-start": 2.0,
+   "psf-scale-start": 1.0
+  }
+ },
+ {
+  "name": "p1_blur6_mask100_line2_psf3",
+  "args": {
+   "blur-sigma": 6,
+   "mask-dilation-start-mm": 100,
+   "line-scale-start": 2.0,
+   "psf-scale-start": 3.0
+  }
+ },
+ {
+  "name": "p1_blur12_maskoff_line1_psf1",
+  "args": {
+   "blur-sigma": 12,
+   "mask-dilation-start-mm": null,
+   "line-scale-start": 1.0,
+   "psf-scale-start": 1.0
+  }
+ },
+ {
+  "name": "p1_blur12_maskoff_line1_psf3",
+  "args": {
+   "blur-sigma": 12,
+   "mask-dilation-start-mm": null,
+   "line-scale-start": 1.0,
+   "psf-scale-start": 3.0
+  }
+ },
+ {
+  "name": "p1_blur12_maskoff_line2_psf1",
+  "args": {
+   "blur-sigma": 12,
+   "mask-dilation-start-mm": null,
+   "line-scale-start": 2.0,
+   "psf-scale-start": 1.0
+  }
+ },
+ {
+  "name": "p1_blur12_maskoff_line2_psf3",
+  "args": {
+   "blur-sigma": 12,
+   "mask-dilation-start-mm": null,
+   "line-scale-start": 2.0,
+   "psf-scale-start": 3.0
+  }
+ },
+ {
+  "name": "p1_blur12_mask50_line1_psf1",
+  "args": {
+   "blur-sigma": 12,
+   "mask-dilation-start-mm": 50,
+   "line-scale-start": 1.0,
+   "psf-scale-start": 1.0
+  }
+ },
+ {
+  "name": "p1_blur12_mask50_line1_psf3",
+  "args": {
+   "blur-sigma": 12,
+   "mask-dilation-start-mm": 50,
+   "line-scale-start": 1.0,
+   "psf-scale-start": 3.0
+  }
+ },
+ {
+  "name": "p1_blur12_mask50_line2_psf1",
+  "args": {
+   "blur-sigma": 12,
+   "mask-dilation-start-mm": 50,
+   "line-scale-start": 2.0,
+   "psf-scale-start": 1.0
+  }
+ },
+ {
+  "name": "p1_blur12_mask50_line2_psf3",
+  "args": {
+   "blur-sigma": 12,
+   "mask-dilation-start-mm": 50,
+   "line-scale-start": 2.0,
+   "psf-scale-start": 3.0
+  }
+ },
+ {
+  "name": "p1_blur12_mask100_line1_psf1",
+  "args": {
+   "blur-sigma": 12,
+   "mask-dilation-start-mm": 100,
+   "line-scale-start": 1.0,
+   "psf-scale-start": 1.0
+  }
+ },
+ {
+  "name": "p1_blur12_mask100_line1_psf3",
+  "args": {
+   "blur-sigma": 12,
+   "mask-dilation-start-mm": 100,
+   "line-scale-start": 1.0,
+   "psf-scale-start": 3.0
+  }
+ },
+ {
+  "name": "p1_blur12_mask100_line2_psf1",
+  "args": {
+   "blur-sigma": 12,
+   "mask-dilation-start-mm": 100,
+   "line-scale-start": 2.0,
+   "psf-scale-start": 1.0
+  }
+ },
+ {
+  "name": "p1_blur12_mask100_line2_psf3",
+  "args": {
+   "blur-sigma": 12,
+   "mask-dilation-start-mm": 100,
+   "line-scale-start": 2.0,
+   "psf-scale-start": 3.0
+  }
+ },
+ {
+  "name": "p1_blur18_maskoff_line1_psf1",
+  "args": {
+   "blur-sigma": 18,
+   "mask-dilation-start-mm": null,
+   "line-scale-start": 1.0,
+   "psf-scale-start": 1.0
+  }
+ },
+ {
+  "name": "p1_blur18_maskoff_line1_psf3",
+  "args": {
+   "blur-sigma": 18,
+   "mask-dilation-start-mm": null,
+   "line-scale-start": 1.0,
+   "psf-scale-start": 3.0
+  }
+ },
+ {
+  "name": "p1_blur18_maskoff_line2_psf1",
+  "args": {
+   "blur-sigma": 18,
+   "mask-dilation-start-mm": null,
+   "line-scale-start": 2.0,
+   "psf-scale-start": 1.0
+  }
+ },
+ {
+  "name": "p1_blur18_maskoff_line2_psf3",
+  "args": {
+   "blur-sigma": 18,
+   "mask-dilation-start-mm": null,
+   "line-scale-start": 2.0,
+   "psf-scale-start": 3.0
+  }
+ },
+ {
+  "name": "p1_blur18_mask50_line1_psf1",
+  "args": {
+   "blur-sigma": 18,
+   "mask-dilation-start-mm": 50,
+   "line-scale-start": 1.0,
+   "psf-scale-start": 1.0
+  }
+ },
+ {
+  "name": "p1_blur18_mask50_line1_psf3",
+  "args": {
+   "blur-sigma": 18,
+   "mask-dilation-start-mm": 50,
+   "line-scale-start": 1.0,
+   "psf-scale-start": 3.0
+  }
+ },
+ {
+  "name": "p1_blur18_mask50_line2_psf1",
+  "args": {
+   "blur-sigma": 18,
+   "mask-dilation-start-mm": 50,
+   "line-scale-start": 2.0,
+   "psf-scale-start": 1.0
+  }
+ },
+ {
+  "name": "p1_blur18_mask50_line2_psf3",
+  "args": {
+   "blur-sigma": 18,
+   "mask-dilation-start-mm": 50,
+   "line-scale-start": 2.0,
+   "psf-scale-start": 3.0
+  }
+ },
+ {
+  "name": "p1_blur18_mask100_line1_psf1",
+  "args": {
+   "blur-sigma": 18,
+   "mask-dilation-start-mm": 100,
+   "line-scale-start": 1.0,
+   "psf-scale-start": 1.0
+  }
+ },
+ {
+  "name": "p1_blur18_mask100_line1_psf3",
+  "args": {
+   "blur-sigma": 18,
+   "mask-dilation-start-mm": 100,
+   "line-scale-start": 1.0,
+   "psf-scale-start": 3.0
+  }
+ },
+ {
+  "name": "p1_blur18_mask100_line2_psf1",
+  "args": {
+   "blur-sigma": 18,
+   "mask-dilation-start-mm": 100,
+   "line-scale-start": 2.0,
+   "psf-scale-start": 1.0
+  }
+ },
+ {
+  "name": "p1_blur18_mask100_line2_psf3",
+  "args": {
+   "blur-sigma": 18,
+   "mask-dilation-start-mm": 100,
+   "line-scale-start": 2.0,
+   "psf-scale-start": 3.0
+  }
+ }
+]

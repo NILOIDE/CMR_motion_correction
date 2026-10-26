@@ -1,0 +1,1 @@
+[{"name": "p0_smoke", "args": {"steps": 30, "blur-sigma": 18, "mask-dilation-start-mm": 100, "line-scale-start": 2, "psf-scale-start": 3}}]
