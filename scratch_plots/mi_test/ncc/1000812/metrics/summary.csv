@@ -1,0 +1,2 @@
+subject_id,status,n_lax_views,sax_n_slices,sax_n_eval,sax_shift_mean_mm,sax_shift_rms_mm,sax_shift_max_mm,sax_shift_jitter_mm,sax_dz_rms_mm,sax_rot_inplane_rms_deg,sax_tilt_rms_deg,lax_shift_mean_mm,lax_shift_max_mm,ncc_zero_mean,ncc_mean,ncc_gain_mean,mi_zero_mean,mi_mean,mi_gain_mean,seg_dice_zero_mean,seg_dice_mean,steps,seconds,timestamp
+1000812,ok,3,13,13,6.7205,7.3634,12.2749,4.6070,5.9453,1.9680,9.8467,2.5490,4.3862,0.7113,0.9181,0.2068,0.1726,0.2509,0.0782,0.6699,0.8515,600,15.1900,2026-10-23T18:03:35
