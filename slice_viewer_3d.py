@@ -67,6 +67,21 @@ Interaction
                         step through the runs of the same directory (--align-root, or the
                         parent of --run-dir), newest first; the current subject is kept when
                         the other run has it, else the same position in its subject list
+    p / , / .           intersection intensity profiles (right): toggle / previous / next slice;
+                        hovering a chart marks that position on the line in 3D (red tick in both
+                        slices) and shows both grey values in the chart title;
+                        the small radio next to each slice row picks it. An SA slice shows its
+                        3 SA-LA lines and its SA-SA crossing with the next slice, an LA view its
+                        2 LA-LA lines. Curves: displayed grey value of both slices along the line
+                        at the shown step and frame (thin: inside both images, thick: in the
+                        loss); yellow bar along the bottom: inside the LA dilated mask (either
+                        LA slice of the line, at its current pose); NCC over the loss part,
+                        current frame only
+    Manual pose (block left of the stack): [-] / [+] shift the profile-selected slice by 1 mm along
+                        its own u / v / normal axes or rotate it by 1 deg about them (about the slice
+                        centre), on top of the shown step's pose; lines, contours and profiles follow
+                        (outline colours stay the logged metrics). "reset all slices" clears every
+                        offset; offsets are also cleared when switching subject / run
     r                   reset camera
     q                   quit
 """
@@ -82,6 +97,8 @@ import nibabel as nib
 import numpy as np
 import pandas as pd
 import pyvista as pv
+from matplotlib.path import Path as PolyPath
+from scipy.ndimage import map_coordinates
 
 ALIGN_ROOT = Path(r"C:\Users\Nil\Documents\data\ukbb_alignment")
 VIEWS = ["SA", "LA_2Ch", "LA_3Ch", "LA_4Ch"]      # data keys: file names and CSV values
@@ -117,6 +134,7 @@ def read_csv(path: Path) -> pd.DataFrame:
     """pd.read_csv with view names, line kinds and column names converted to SA / LA."""
     df = pd.read_csv(path)
     df.columns = [from_disk(c) for c in df.columns]
+    df = df.rename(columns=lambda c: "n" + c if c == "mi" or c.startswith("mi_") else c)   # runs before mi -> nmi
     for c in df.columns:
         if not pd.api.types.is_numeric_dtype(df[c]):     # text columns (object or string dtype)
             df[c] = df[c].map(lambda v: from_disk(v) if isinstance(v, str) else v)
@@ -147,7 +165,7 @@ SEG_COLORS = {
 OUTLINE_METRICS = {
     "ncc": dict(label="NCC", col="ncc", higher_better=True, fmt="{:.3f}",
                 bounds=(-1.0, 1.0), slider_fmt="%.2f"),
-    "nmi": dict(label="NMI", col="mi", higher_better=True, fmt="{:.3f}",
+    "nmi": dict(label="NMI", col="nmi", higher_better=True, fmt="{:.3f}",
                 bounds=(0.0, 1.0), slider_fmt="%.2f"),
     "dice": dict(label="Dice", col="seg_dice", higher_better=True, fmt="{:.3f}",
                  bounds=(0.0, 1.0), slider_fmt="%.2f"),
@@ -183,6 +201,26 @@ MASK_CONTOUR_WIDTH = 2
 LINE_COLORS = {"SA-LA": (79, 195, 247), "LA-LA": (255, 183, 77)}   # SA-LA / LA-LA, as in mask_overlay.png
 LINE_USED_WIDTH = 4     # part of the line that is sampled in the loss
 LINE_IMG_WIDTH = 1      # part inside both images (thin, faint)
+
+# Intersection intensity profiles: small charts on the right, one per intersection of the
+# slice picked with the radio buttons next to the slice list (SA slice: its 3 SA-LA lines and
+# its SA-SA crossing with the next slice; LA view: its 2 LA-LA lines)
+PROFILE_SLOTS = 4
+PROFILE_X, PROFILE_W = 0.735, 0.25
+PROFILE_Y0, PROFILE_H, PROFILE_PITCH = 0.405, 0.083, 0.088
+PROFILE_COLORS = ("#e0e0e0", "#ffb74d")    # picked slice, the other slice of the line
+PROFILE_STEP_MM = 0.5
+PROFILE_RADIO_X = 215                      # radio column right of the slice rows
+PROFILE_MASK_Y = 10                        # height (grey units) of the in-mask bar along the chart bottom
+HOVER_COLOR = "#ff1744"                    # hover cursor in the charts and its tick marks in 3D
+HOVER_TICK_MM = 12.0                       # length of the tick across the line, in each slice
+HOVER_WIDTH = 4
+
+# Manual pose controls for the profile-selected slice (applied on top of the shown step's pose)
+MOVE_PARAMS = [("shift u", "mm"), ("shift v", "mm"), ("shift n", "mm"),
+               ("rot u", "deg"), ("rot v", "deg"), ("rot n", "deg")]
+MOVE_STEP = (1.0, 1.0)                     # mm per click, degrees per click
+MOVE_X, MOVE_TOP = 272, 430                # block position (pixels from the bottom left)
 
 # Panel layout (pixels from the bottom-left corner of the window)
 PANEL_X_BOX = 12
@@ -341,7 +379,7 @@ def load_history(metrics_dir: Path) -> dict:
     with snapshots ordered by step (the "best" entry sorts after a regular
     snapshot of the same step).  Each snap is
         {"step": int, "fraction": float, "is_best": bool,
-         "affines": {(image, slice): 4x4}, "metrics": {(image, slice): {ncc, mi, seg_dice, hd_mm}},
+         "affines": {(image, slice): 4x4}, "metrics": {(image, slice): {ncc, nmi, seg_dice, hd_mm}},
          "summary": {column: value} | None}
     """
     path = metrics_dir / HISTORY_CSV
@@ -367,7 +405,7 @@ def load_history(metrics_dir: Path) -> dict:
             A[:3, :] = np.array([getattr(r, c) for c in AFFINE_COLUMNS], dtype=np.float64).reshape(3, 4)
             key = (str(r.image), int(r.slice))
             affines[key] = A
-            metrics[key] = {m: float(getattr(r, m)) for m in ("ncc", "mi", "seg_dice", "hd_mm") if m in df.columns}
+            metrics[key] = {m: float(getattr(r, m)) for m in ("ncc", "nmi", "seg_dice", "hd_mm") if m in df.columns}
         snapshots.append({
             "step": step,
             "fraction": float(g["fraction"].iloc[0]),
@@ -595,6 +633,55 @@ def checkbox_texture(rgb01, size: int = 20, border: int = 1, bg: str = "#303030"
 BURN_OFFSET_MM = 0.25    # burned-in lines: one trace this far in front of and one behind the slice
 
 
+def rotvec_matrix(rv: np.ndarray) -> np.ndarray:
+    """Rotation matrix of a rotation vector (radians)."""
+    th = float(np.linalg.norm(rv))
+    if th < 1e-12:
+        return np.eye(3)
+    k = rv / th
+    K = np.array([[0, -k[2], k[1]], [k[2], 0, -k[0]], [-k[1], k[0], 0]])
+    return np.eye(3) + np.sin(th) * K + (1 - np.cos(th)) * K @ K
+
+
+def apply_offset(A: np.ndarray, offset: np.ndarray, centre_ijk: np.ndarray) -> np.ndarray:
+    """Slice affine moved by a manual offset (shift u, v, n in mm; rotation about u, v, n in degrees),
+    all along the slice's own axes at pose A; rotations about the slice centre."""
+    u, v = A[:3, 0] / np.linalg.norm(A[:3, 0]), A[:3, 1] / np.linalg.norm(A[:3, 1])
+    n = np.cross(u, v)
+    c = (A @ np.append(centre_ijk, 1.0))[:3]
+    R = rotvec_matrix(np.deg2rad(offset[3] * u + offset[4] * v + offset[5] * n))
+    out = A.copy()
+    out[:3, :3] = R @ A[:3, :3]
+    out[:3, 3] = R @ (A[:3, 3] - c) + c + offset[0] * u + offset[1] * v + offset[2] * n
+    return out
+
+
+def crossing_segment(Aa, shape_a, Ab, shape_b):
+    """Intersection line of two slices clipped to the part inside both images:
+    (x0, unit d, t_lo, t_hi) with points x0 + t d, or None (parallel / no overlap)."""
+    na = np.cross(Aa[:3, 0], Aa[:3, 1]); na /= np.linalg.norm(na)
+    nb = np.cross(Ab[:3, 0], Ab[:3, 1]); nb /= np.linalg.norm(nb)
+    d = np.cross(na, nb)
+    nd = np.linalg.norm(d)
+    if nd < 1e-6:
+        return None
+    d /= nd
+    x0 = np.linalg.solve(np.stack([na, nb, d]), np.array([na @ Aa[:3, 3], nb @ Ab[:3, 3], d @ Ab[:3, 3]]))
+    lo, hi = -np.inf, np.inf
+    for A, shape in ((Aa, shape_a), (Ab, shape_b)):
+        Ai = np.linalg.inv(A)
+        p0, dv = (Ai @ np.append(x0, 1.0))[:2], (Ai[:3, :3] @ d)[:2]     # voxel (i, j) = p0 + t dv
+        for ax in range(2):
+            bmax = shape[ax] - 1
+            if abs(dv[ax]) < 1e-12:
+                if not 0 <= p0[ax] <= bmax:
+                    return None
+                continue
+            ta, tb = (0 - p0[ax]) / dv[ax], (bmax - p0[ax]) / dv[ax]
+            lo, hi = max(lo, min(ta, tb)), min(hi, max(ta, tb))
+    return (x0, d, lo, hi) if hi > lo else None
+
+
 def burn_points(seg: np.ndarray, affine: np.ndarray) -> np.ndarray:
     """Segments (K, 2, 3) projected exactly into the slice plane of `affine`, then duplicated
     +-BURN_OFFSET_MM along its normal so they show from both sides -> (4K, 3) points
@@ -643,7 +730,7 @@ class SliceViewer:
                  subject: str | None = None, subject_index: int = 0, frame: int = 0,
                  show_seg: bool = True, seg_alpha: float = 0.5, start: int | None = None,
                  metric: str = "ncc", show_mask: bool = False, show_lines: bool = False,
-                 show_sa_lines: bool = False, show_radius: bool = False,
+                 show_sa_lines: bool = False, show_radius: bool = False, show_profiles: bool = True,
                  window_size=(1500, 1000), verbose: bool = True):
         if not runs:
             raise ValueError("no runs to show")
@@ -666,6 +753,9 @@ class SliceViewer:
         self.show_lines = show_lines
         self.show_sa_lines = show_sa_lines
         self.show_radius = show_radius
+        self.show_profiles = show_profiles
+        self.profile_key: str | None = None     # slice whose intersections are plotted (kept across subjects)
+        self.offsets: dict[tuple, np.ndarray] = {}   # manual pose offsets per slice key (reset per subject)
         self.seg_alpha = seg_alpha
         self.verbose = verbose
         self._first_start = start           # only the first subject honours --start
@@ -692,6 +782,7 @@ class SliceViewer:
         self._radius_items: list[dict] = []
         self._widgets: dict[str, object] = {}
         self._radios: dict[str, object] = {}
+        self._profile_radios: dict[str, object] = {}
         self._row_text: dict[str, object] = {}
         self._tex_cache: dict[str, tuple] = {}
         self._range_sliders: dict[str, object] = {}
@@ -714,7 +805,7 @@ class SliceViewer:
         """Remove every actor and widget of the current subject (the navigation UI stays)."""
         pl = self.pl
         wh = getattr(pl, "widgets", pl)          # pyvista >= 0.45 keeps the widget lists here
-        for w in list(self._widgets.values()) + list(self._radios.values()) + \
+        for w in list(self._widgets.values()) + list(self._radios.values()) + list(self._profile_radios.values()) + \
                 list(self._range_sliders.values()) + [self._frame_slider, self._hist_slider]:
             if w is None:
                 continue
@@ -725,6 +816,7 @@ class SliceViewer:
         rd = getattr(wh, "radio_button_widget_dict", None)
         if isinstance(rd, dict):
             rd.pop("outline_metric", None)
+            rd.pop("profile", None)
         rt = getattr(wh, "radio_button_title_dict", None)
         if isinstance(rt, dict):
             rt.pop("outline_metric", None)
@@ -756,6 +848,8 @@ class SliceViewer:
             return False
         if self._built:
             self._teardown()
+        self.offsets = {}
+        self._hover = None
         self.run_index = run_index
         self.subjects = list(subjects)
         self.subject_index = index
@@ -790,12 +884,17 @@ class SliceViewer:
 
         self._build_slices()
         self._build_overlays()
+        names = [e["name"] for e in self.entries]
+        if self.profile_key not in names:
+            sa = [n for n, e in zip(names, self.entries) if e["view"] == "SA"]
+            self.profile_key = sa[len(sa) // 2] if sa else (names[0] if names else None)
         self._build_ui()
         self._configure_metric()
         self._apply_snapshot()
         self._apply_visibility()
         self._set_initial_camera()
         self._update_nav_text()
+        self._update_move_text()
         self._built = True
         self.pl.render()
         return True
@@ -853,6 +952,78 @@ class SliceViewer:
         momentary("previous run (newer)  {", "prev_run", lambda: self.next_run(-1), ry - 2 * ROW_PITCH)
         self._panel_top = y                           # per-subject rows start at the top
 
+        # Manual pose block (acts on the profile-selected slice): per parameter  [-] [+] value
+        self._move_text = pl.add_text("", position=(MOVE_X, MOVE_TOP + 2), font_size=9, color="#ffa726")
+        self._move_values = []
+        my = MOVE_TOP
+        for k, (name, unit) in enumerate(MOVE_PARAMS):
+            my -= 24
+            pl.add_text(name, position=(MOVE_X, my + 3), font_size=8, color="#bbbbbb")
+            for j, (sign, glyph) in enumerate(((-1, "-"), (+1, "+"))):
+                bx = MOVE_X + 56 + 24 * j
+                holder = {}
+
+                def _cb(_state, h=holder, k=k, sign=sign):
+                    h["w"].GetRepresentation().SetState(0)
+                    self.move_selected(k, sign)
+                holder["w"] = pl.add_checkbox_button_widget(
+                    _cb, value=False, position=(bx, my), size=18, border_size=1,
+                    color_on="#ffa726", color_off="#4a4a4a", background_color="#303030")
+                pl.add_text(glyph, position=(bx + 5, my + 1), font_size=9, color="white")
+                self._nav_widgets[f"move{k}{glyph}"] = holder["w"]
+            self._move_values.append(pl.add_text("", position=(MOVE_X + 108, my + 3), font_size=8,
+                                                 color="white"))
+        my -= 28
+        momentary_x = MOVE_X
+        holder = {}
+
+        def _reset(_state, h=holder):
+            h["w"].GetRepresentation().SetState(0)
+            self.reset_offsets()
+        holder["w"] = pl.add_checkbox_button_widget(
+            _reset, value=False, position=(momentary_x, my), size=18, border_size=1,
+            color_on="#ffa726", color_off="#4a4a4a", background_color="#303030")
+        pl.add_text("reset all slices", position=(momentary_x + 26, my + 2), font_size=8, color="white")
+        self._nav_widgets["move_reset"] = holder["w"]
+
+        # intersection intensity charts (persistent; filled per subject / step / frame)
+        self._profile_charts = []
+        for k in range(PROFILE_SLOTS):
+            ch = pv.Chart2D(size=(PROFILE_W, PROFILE_H),
+                            loc=(PROFILE_X, PROFILE_Y0 + (PROFILE_SLOTS - 1 - k) * PROFILE_PITCH),
+                            x_label="", y_label="", grid=False)
+            ch.background_color = (0.10, 0.10, 0.10, 0.85)
+            ch.border_color = (0.35, 0.35, 0.35)
+            ch.legend_visible = False
+            tp = ch.GetTitleProperties()
+            tp.SetFontSize(11); tp.SetColor(0.85, 0.85, 0.85); tp.BoldOff()
+            for ax in (ch.x_axis, ch.y_axis):
+                ax.tick_label_size = 9
+                ax.GetLabelProperties().SetColor(0.65, 0.65, 0.65)
+                ax.pen.color = (0.4, 0.4, 0.4)
+            ch.y_axis.tick_locations = (0, 128, 255)
+            ch.y_axis.tick_labels = ("0", "128", "255")
+            x0 = np.array([0.0, 1.0])
+            plots = {}
+            for side, col in zip(("a", "b"), PROFILE_COLORS):
+                plots[side + "_img"] = ch.line(x0, x0 * 0, color=col, width=1.0)
+                plots[side + "_used"] = ch.line(x0, x0 * 0, color=col, width=2.5)
+            plots["mask"] = ch.line(x0, x0 * np.nan, color=MASK_CONTOUR_COLOR, width=2.0)
+            plots["cursor"] = ch.line(np.array([0.0, 0.0]), np.array([0.0, 255.0]), color=HOVER_COLOR, width=1.5)
+            plots["cursor"].visible = False
+            ch.y_range = [0, 255]
+            ch.visible = False
+            pl.add_chart(ch)
+            self._profile_charts.append({"chart": ch, "plots": plots, "item": None})
+
+        # hover: a tick across the intersection line at the hovered position, burned into both slices
+        self._hover = None                                   # (chart slot, t along the line) or None
+        self._hover_mesh = pv.PolyData(np.zeros((8, 3)), lines=burn_cells(2))
+        self._hover_actor = pl.add_mesh(self._hover_mesh, color=HOVER_COLOR, line_width=HOVER_WIDTH,
+                                        lighting=False, name="profile_hover")
+        self._hover_actor.SetVisibility(False)
+        pl.iren.add_observer("MouseMoveEvent", self._on_mouse_move)
+
         # orientation axes to the right of the navigation block, left of the sliders
         pl.add_axes(xlabel="X (mm)", ylabel="Y (mm)", zlabel="Z (mm)", viewport=(0.15, 0.0, 0.29, 0.2))
 
@@ -869,6 +1040,9 @@ class SliceViewer:
         pl.add_key_event("i", lambda: self._toggle_checkbox("lines"))
         pl.add_key_event("k", lambda: self._toggle_checkbox("sa_lines"))
         pl.add_key_event("u", lambda: self._toggle_checkbox("radius"))
+        pl.add_key_event("p", lambda: self._toggle_checkbox("profiles"))
+        pl.add_key_event("period", lambda: self.step_profile(+1))
+        pl.add_key_event("comma", lambda: self.step_profile(-1))
         pl.add_key_event("a", lambda: self._toggle_checkbox("all_sa"))
         pl.add_key_event("l", lambda: self._toggle_checkbox("all_la"))
         # the cine is periodic: stepping past either end wraps around
@@ -1033,7 +1207,7 @@ class SliceViewer:
         """Move contours and lines to the planes' poses at the current snapshot."""
         snap = self.snapshots[self.snap_index]
         for m in self._mask_items:
-            A = snap["affines"].get(m["key"], self._base_affine(m["key"]))
+            A = self._pose(m["key"], snap)
             if A is not None:
                 m["mesh"].points = voxel_to_world(A, m["ijk"])
         self._apply_sa_lines(snap)
@@ -1044,8 +1218,8 @@ class SliceViewer:
         n = li["n"]
         x0, d = li["x0"].copy(), li["d"].copy()                # acquired geometry (fallback)
         for i in range(n):
-            Aa = snap["affines"].get(li["keys_a"][i])
-            Ab = snap["affines"].get(li["keys_b"][i])
+            Aa = self._pose(li["keys_a"][i], snap)
+            Ab = self._pose(li["keys_b"][i], snap)
             if Aa is None or Ab is None or not np.isfinite(li["centre_b"][i]).all():
                 continue
             na = np.cross(Aa[:3, 0], Aa[:3, 1]); na /= np.linalg.norm(na)
@@ -1059,6 +1233,7 @@ class SliceViewer:
             rhs = np.array([na @ Aa[:3, 3], nb @ Ab[:3, 3], di @ cb])
             x0[i] = np.linalg.solve(np.stack([na, nb, di]), rhs)
             d[i] = di
+        li["cur_x0"], li["cur_d"] = x0, d
         for name in ("used", "img"):
             t = li["t_" + name]                                 # (N, 2)
             seg = np.stack([x0 + t[:, :1] * d, x0 + t[:, 1:] * d], axis=1)   # (N, 2, 3)
@@ -1072,7 +1247,7 @@ class SliceViewer:
         si = self._sa_line_items
         if si is None:
             return
-        segs = self.overlays["sa_lines"].get((snap["step"], bool(snap["is_best"])), {})
+        segs = self._sa_segments(snap)
         for item in si["per_slice"]:
             sl = item["entry"]["key"][1]
             A = self._affine_for(item["entry"], snap)
@@ -1086,6 +1261,76 @@ class SliceViewer:
                        else pv.PolyData(np.zeros((2, 3)), lines=np.array([2, 0, 1])))   # placeholder, hidden
                 item[name + "_mesh"].copy_from(new)
         self._apply_sa_line_visibility()
+
+    def _sa_segments(self, snap: dict) -> dict:
+        """SA-SA segments of this snapshot: as stored, except pairs with a manually moved slice, whose
+        crossing is recomputed (inside both images; the loss part within the long-axis radius)."""
+        segs = (self.overlays.get("sa_lines") or {}).get((snap["step"], bool(snap["is_best"])), {})
+        moved = {k[1] for k, off in self.offsets.items() if k[0] == "SA" and np.any(off)}
+        if not moved:
+            return segs
+        sa = {e["key"][1]: e for e in self.entries if e["view"] == "SA"}
+        axis = (self.overlays.get("long_axis") or {}).get((snap["step"], bool(snap["is_best"])))
+        out = {}
+        for name in ("img", "used"):
+            e, pr = segs.get(name, np.zeros((0, 2, 3))), segs.get(name + "_pairs", np.zeros((0, 2), int))
+            keep = ~np.isin(pr, list(moved)).any(1) if len(pr) else np.zeros(0, bool)
+            out[name], out[name + "_pairs"] = list(e[keep]), list(pr[keep])
+        for z in sorted(sa):
+            if z + 1 not in sa or not ({z, z + 1} & moved):
+                continue
+            ea, eb = sa[z], sa[z + 1]
+            cs = crossing_segment(self._pose(ea["key"], snap), ea["slice"]["grey"].shape,
+                                  self._pose(eb["key"], snap), eb["slice"]["grey"].shape)
+            if cs is None:
+                continue
+            x0, d, lo, hi = cs
+            out["img"].append(np.stack([x0 + lo * d, x0 + hi * d])); out["img_pairs"].append([z, z + 1])
+            if axis is not None:                         # within the radius: |perp(x0 + t d - p)| <= r
+                p0, ell, r = axis
+                ell = ell / np.linalg.norm(ell)
+                w0 = x0 - p0
+                a_, b_ = d - (d @ ell) * ell, w0 - (w0 @ ell) * ell
+                A2, B2, C2 = a_ @ a_, 2 * a_ @ b_, b_ @ b_ - r * r
+                disc = B2 * B2 - 4 * A2 * C2
+                if A2 > 1e-12 and disc > 0:
+                    t1, t2 = (-B2 - np.sqrt(disc)) / (2 * A2), (-B2 + np.sqrt(disc)) / (2 * A2)
+                    u1, u2 = max(lo, t1), min(hi, t2)
+                    if u2 > u1:
+                        out["used"].append(np.stack([x0 + u1 * d, x0 + u2 * d])); out["used_pairs"].append([z, z + 1])
+        for name in ("img", "used"):
+            out[name] = np.array(out[name]).reshape(-1, 2, 3)
+            out[name + "_pairs"] = np.array(out[name + "_pairs"], dtype=int).reshape(-1, 2)
+        return out
+
+    def move_selected(self, param: int, sign: int):
+        """Nudge the profile-selected slice by one step of parameter `param` (see MOVE_PARAMS)."""
+        e = self._entry_by_name().get(self.profile_key)
+        if e is None:
+            return
+        off = self.offsets.setdefault(e["key"], np.zeros(6))
+        off[param] += sign * MOVE_STEP[0 if param < 3 else 1]
+        self._apply_snapshot()
+        self._update_move_text()
+        self.pl.render()
+
+    def reset_offsets(self):
+        self.offsets = {}
+        self._log("manual poses reset")
+        self._apply_snapshot()
+        self._update_move_text()
+        self.pl.render()
+
+    def _update_move_text(self):
+        if not hasattr(self, "_move_text") or not self.entries:
+            return
+        e = self._entry_by_name().get(self.profile_key)
+        off = self.offsets.get(e["key"], np.zeros(6)) if e is not None else np.zeros(6)
+        n_moved = sum(bool(np.any(o)) for o in self.offsets.values())
+        self._move_text.SetInput(f"move {label(self.profile_key) if e else '-'}"
+                                 + (f"   ({n_moved} moved)" if n_moved else ""))
+        for k, (name, unit) in enumerate(MOVE_PARAMS):
+            self._move_values[k].SetInput(f"{off[k]:+.0f} {unit}")
 
     def _apply_radius(self, snap: dict):
         """Intersect the radius cylinder around this snapshot's long axis with every SA slice at its pose:
@@ -1135,8 +1380,221 @@ class SliceViewer:
             for name in ("img", "used"):
                 item[name + "_actor"].SetVisibility(self.show_lines and item["entry"]["visible"])
 
+    # --- intersection intensity profiles ---------------------------------------
+    def set_profile(self, name: str):
+        if name not in self._entry_by_name():
+            return
+        self.profile_key = name
+        for n, w in self._profile_radios.items():
+            w.GetRepresentation().SetState(int(n == name))
+        self._log(f"profiles / move: {label(name)}")
+        self._update_move_text()
+        self._update_profiles()
+        self.pl.render()
+
+    def step_profile(self, step: int):
+        names = [e["name"] for e in self.entries]
+        if names:
+            i = names.index(self.profile_key) if self.profile_key in names else 0
+            self.set_profile(names[(i + step) % len(names)])
+
+    def _entry_by_name(self) -> dict:
+        return {e["name"]: e for e in self.entries}
+
+    def _sample(self, e: dict, snap: dict, pts: np.ndarray) -> np.ndarray:
+        """Displayed grey values (0-255) of slice `e` at world points pts (L, 3), current frame;
+        nan outside the image."""
+        A = self._affine_for(e, snap)
+        vox = (np.linalg.inv(A) @ np.column_stack([pts, np.ones(len(pts))]).T)[:3]
+        grey = e["slice"]["grey"][:, :, self.frame].astype(np.float32)
+        return map_coordinates(grey, vox[:2], order=1, mode="constant", cval=np.nan)
+
+    def _mask_paths(self) -> dict:
+        """Dilated-mask contours per LA slice key as polygons in its voxel (i, j) plane (cached per subject)."""
+        cache = getattr(self, "_mask_path_cache", None)
+        if cache is None or cache[0] is not self.overlays:
+            paths = {key: [PolyPath(c[:, :2]) for c in cs if len(c) > 2]
+                     for key, cs in (self.overlays.get("contours") or {}).items()}
+            self._mask_path_cache = cache = (self.overlays, paths)
+        return cache[1]
+
+    def _in_mask(self, e: dict, snap: dict, pts: np.ndarray) -> np.ndarray | None:
+        """Which world points lie inside slice e's dilated mask at its current pose (even-odd over its
+        contours); None if the slice has no mask."""
+        paths = self._mask_paths().get(e["key"])
+        if not paths:
+            return None
+        A = self._affine_for(e, snap)
+        vox = (np.linalg.inv(A) @ np.column_stack([pts, np.ones(len(pts))]).T)[:2].T
+        inside = np.zeros(len(pts), bool)
+        for path in paths:
+            inside ^= path.contains_points(vox)
+        return inside
+
+    def _profile_items(self, snap: dict) -> list[dict]:
+        """The intersections of the picked slice: (other slice name, start, unit dir, t_img, t_used)."""
+        e = self._entry_by_name().get(self.profile_key)
+        if e is None:
+            return []
+        out = []
+        li = self._line_items
+        if li is not None and "cur_x0" in li:
+            for i in range(li["n"]):
+                ka, kb = li["keys_a"][i], li["keys_b"][i]
+                if e["key"] not in (ka, kb):
+                    continue
+                other = kb if ka == e["key"] else ka
+                if e["view"] != "SA" and other[0] == "SA":
+                    continue                              # LA views: only their LA-LA pairs
+                oe = self._entry_by_key.get(other)
+                if oe is None:
+                    continue
+                out.append(dict(other=oe, x0=li["cur_x0"][i], d=li["cur_d"][i],
+                                t_img=li["t_img"][i], t_used=li["t_used"][i]))
+            out.sort(key=lambda r: VIEWS.index(r["other"]["view"]))
+        if e["view"] == "SA":
+            sl = e["key"][1]
+            names = {x["key"][1]: x for x in self.entries if x["view"] == "SA"}
+            nb = sl + 1 if sl + 1 in names else sl - 1
+            if nb in names:
+                item = dict(other=names[nb], x0=None)
+                segs = self._sa_segments(snap)
+                pairs = segs.get("img_pairs", np.zeros((0, 2), int))
+                hit = np.flatnonzero(((pairs == sl).any(1)) & ((pairs == nb).any(1))) if len(pairs) else []
+                if len(hit):
+                    a, b = segs["img"][hit[0]]
+                    length = float(np.linalg.norm(b - a))
+                    if length > 0:
+                        item.update(x0=a, d=(b - a) / length, t_img=np.array([0.0, length]),
+                                    t_used=np.array([np.nan, np.nan]))
+                        upairs = segs.get("used_pairs", np.zeros((0, 2), int))
+                        uh = np.flatnonzero(((upairs == sl).any(1)) & ((upairs == nb).any(1))) if len(upairs) else []
+                        if len(uh):
+                            item["t_used"] = np.sort((segs["used"][uh[0]] - a) @ item["d"])
+                out.append(item)
+        return out[:PROFILE_SLOTS]
+
+    def _update_profiles(self):
+        charts = getattr(self, "_profile_charts", [])
+        if not charts or not self.entries:
+            return
+        snap = self.snapshots[self.snap_index]
+        items = self._profile_items(snap) if self.show_profiles else []
+        e = self._entry_by_name().get(self.profile_key)
+        for k, slot in enumerate(charts):
+            ch, pl_ = slot["chart"], slot["plots"]
+            slot["item"] = None
+            if k >= len(items):
+                ch.visible = False
+                continue
+            it = items[k]
+            ch.visible = True
+            names = f"{label(e['name'])} \u00d7 {label(it['other']['name'])}"
+            if it["x0"] is None:
+                ch.title = f"{names}: no crossing"
+                for p_ in pl_.values():
+                    p_.update(np.array([0.0, 1.0]), np.array([np.nan, np.nan]))
+                continue
+            t = np.arange(it["t_img"][0], it["t_img"][1] + 1e-6, PROFILE_STEP_MM)
+            pts = it["x0"] + t[:, None] * it["d"]
+            ya, yb = self._sample(e, snap, pts), self._sample(it["other"], snap, pts)
+            used = (t >= it["t_used"][0]) & (t <= it["t_used"][1]) if np.isfinite(it["t_used"]).all() \
+                else np.zeros(len(t), bool)
+            ok = used & np.isfinite(ya) & np.isfinite(yb)
+            if ok.sum() > 2 and ya[ok].std() > 0 and yb[ok].std() > 0:
+                ncc = float(np.corrcoef(ya[ok], yb[ok])[0, 1])
+                ch.title = f"{names}   NCC {ncc:.2f}"
+            else:
+                ch.title = f"{names}   (no loss points)"
+            for side, y in (("a", ya), ("b", yb)):
+                pl_[side + "_img"].update(t, y)
+                pl_[side + "_used"].update(t, np.where(used, y, np.nan))
+            masks = [m for m in (self._in_mask(e, snap, pts), self._in_mask(it["other"], snap, pts)) if m is not None]
+            in_mask = np.logical_or.reduce(masks) if masks else np.zeros(len(t), bool)
+            pl_["mask"].update(t, np.where(in_mask, float(PROFILE_MASK_Y), np.nan))
+            ch.x_range = [float(t[0]), float(t[-1]) if len(t) > 1 else float(t[0]) + 1.0]
+            ch.y_range = [0, 255]
+            slot["item"] = dict(e=e, other=it["other"], x0=it["x0"], d=it["d"], t=t, ya=ya, yb=yb, names=names,
+                                title=ch.title)
+        self._draw_hover()
+
+    # --- hover on the profile charts -> tick marks on the line in 3D ------------------
+    def _on_mouse_move(self, *_):
+        x, y = self.pl.iren.interactor.GetEventPosition()
+        w, h = self.pl.window_size
+        hover = None
+        for k, slot in enumerate(getattr(self, "_profile_charts", [])):
+            ch, it = slot["chart"], slot["item"]
+            if it is None or not ch.visible:
+                continue
+            (cx, cy), (cw, chh) = ch.loc, ch.size
+            if not (cx * w <= x <= (cx + cw) * w and cy * h <= y <= (cy + chh) * h):
+                continue
+            p1, p2 = ch.x_axis.GetPoint1(), ch.x_axis.GetPoint2()
+            if p2[0] - p1[0] < 1 or not p1[0] <= x <= p2[0]:
+                break
+            lo, hi = ch.x_range
+            hover = (k, lo + (x - p1[0]) / (p2[0] - p1[0]) * (hi - lo))
+            break
+        if hover is None and self._hover is None:
+            return                                            # nothing changed: no render
+        self._hover = hover
+        self._draw_hover()
+        self.pl.render()
+
+    def _draw_hover(self):
+        charts = getattr(self, "_profile_charts", [])
+        for slot in charts:
+            slot["plots"]["cursor"].visible = False
+            if slot["item"] is not None:
+                slot["chart"].title = slot["item"]["title"]
+        if self._hover is None or not self.entries:
+            self._hover_actor.SetVisibility(False)
+            return
+        k, t = self._hover
+        it = charts[k]["item"] if k < len(charts) else None
+        if it is None:
+            self._hover_actor.SetVisibility(False)
+            return
+        snap = self.snapshots[self.snap_index]
+        P = it["x0"] + t * it["d"]
+        pts = []
+        for e in (it["e"], it["other"]):
+            A = self._affine_for(e, snap)
+            n = np.cross(A[:3, 0], A[:3, 1]); n /= np.linalg.norm(n)
+            across = np.cross(n, it["d"]); across /= max(np.linalg.norm(across), 1e-9)
+            tick = np.stack([P - 0.5 * HOVER_TICK_MM * across, P + 0.5 * HOVER_TICK_MM * across])[None]
+            pts.append(burn_points(tick, A))
+        self._hover_mesh.points = np.concatenate(pts)
+        self._hover_actor.SetVisibility(True)
+        cur = charts[k]["plots"]["cursor"]
+        cur.update(np.array([t, t]), np.array([0.0, 255.0]))
+        cur.visible = True
+        i = int(np.clip(np.rint((t - it["t"][0]) / PROFILE_STEP_MM), 0, len(it["t"]) - 1))
+        fmt = lambda v: "-" if not np.isfinite(v) else f"{v:.0f}"     # noqa: E731
+        charts[k]["chart"].title = f"{it['names']}   t {t:+.0f} mm: {fmt(it['ya'][i])} / {fmt(it['yb'][i])}"
+
+    def _on_profiles_toggle(self, value: bool):
+        self.show_profiles = bool(value)
+        self._update_profiles()
+        self.pl.render()
+
     def _affine_for(self, e: dict, snap: dict) -> np.ndarray:
-        return snap["affines"].get(e["key"], e["slice"]["affine"])
+        return self._pose(e["key"], snap)
+
+    def _pose(self, key: tuple, snap: dict) -> np.ndarray | None:
+        """Pose of a slice at `snap` (its NIfTI affine if the history lacks it), with the manual offset."""
+        A = snap["affines"].get(key)
+        e = self._entry_by_key.get(key)
+        if A is None:
+            if e is None:
+                return None
+            A = e["slice"]["affine"]
+        off = self.offsets.get(key)
+        if off is not None and e is not None and np.any(off):
+            nx, ny = e["slice"]["grey"].shape[:2]
+            A = apply_offset(A, off, np.array([(nx - 1) / 2.0, (ny - 1) / 2.0, 0.0]))
+        return A
 
     def _apply_snapshot(self):
         snap = self.snapshots[self.snap_index]
@@ -1150,6 +1608,7 @@ class SliceViewer:
             c = pv.Color("#ffa726" if snap["is_best"] else "white").float_rgb
             self._hist_slider.GetRepresentation().GetLabelProperty().SetColor(*c)
         self._update_header()
+        self._update_profiles()
 
     # --- outline colour by metric --------------------------------------------
     def _metric_value(self, e: dict, snap: dict) -> float:
@@ -1296,6 +1755,7 @@ class SliceViewer:
         for e in self.entries:
             e["mesh"].cell_data["rgb"] = self._colors(e["slice"])
         self._update_header()
+        self._update_profiles()
         self.pl.render()
 
     def _apply_visibility(self):
@@ -1405,13 +1865,19 @@ class SliceViewer:
             add_row("SA-SA sampling lines  [k]", self._on_sa_lines_toggle, self.show_sa_lines, "sa_lines")
         if self._radius_items:
             add_row("LA radius on SA  [u]", self._on_radius_toggle, self.show_radius, "radius")
+        add_row("Intersection profiles  [p]", self._on_profiles_toggle, self.show_profiles, "profiles")
         y -= 8
         if "SA" in self.data:
             add_row("All SA  [a]", lambda v: self._set_group("SA", v), True, "all_sa")
         if any(v.startswith("LA") for v in self.data):
             add_row("All LA  [l]", lambda v: self._set_group("LA", v), True, "all_la")
         y -= 8
+        self._text("profile", position=(PROFILE_RADIO_X - 14, y + ROW_PITCH - 4), font_size=7, color="#bbbbbb")
         for e in self.entries:
+            self._profile_radios[e["name"]] = pl.add_radio_button_widget(
+                lambda n=e["name"]: self.set_profile(n), "profile", value=(e["name"] == self.profile_key),
+                position=(PROFILE_RADIO_X, y + 3), size=14, border_size=3,
+                color_on="#ffa726", color_off="#555555", background_color="#303030")
             add_row(label(e["name"]), self._make_slice_cb(e), True, e["name"])
 
         # Outline-colour metric (radio group: exactly one active)
@@ -1596,7 +2062,7 @@ class SliceViewer:
                 val = sm.get(key)
                 return fmt.format(val) if val is not None and np.isfinite(val) else "-"
             lines = [
-                f"objective {f('objective')}   NCC {f('ncc_mean')}   NMI {f('mi_mean')}   Dice {f('seg_dice_mean')}",
+                f"objective {f('objective')}   NCC {f('ncc_mean')}   NMI {f('nmi_mean')}   Dice {f('seg_dice_mean')}",
                 f"Hausdorff mean {f('hd_mean_mm', '{:.2f}')} mm   max {f('hd_max_mm', '{:.2f}')} mm",
                 f"SA shift rms {f('sa_shift_rms_mm', '{:.2f}')} mm   jitter {f('sa_shift_jitter_mm', '{:.2f}')} mm   "
                 f"dz rms {f('sa_dz_rms_mm', '{:.2f}')} mm   tilt rms {f('sa_tilt_rms_deg', '{:.2f}')} deg",
@@ -1698,6 +2164,7 @@ def parse_args(argv=None):
     ap.add_argument("--lines", action="store_true", help="start with the intersection sampling lines shown")
     ap.add_argument("--sa-lines", action="store_true",
                     help="start with the SA-SA sampling lines (metrics/sa_lines.csv) shown")
+    ap.add_argument("--no-profiles", action="store_true", help="start with the intersection profile charts hidden")
     ap.add_argument("--radius", action="store_true",
                     help="start with the long-axis radius of the SA-SA supervision (metrics/long_axis.csv) shown")
     ap.add_argument("--no-seg", action="store_true", help="start with segmentation overlay off")
@@ -1753,7 +2220,7 @@ def main(argv=None):
         subject=args.subject, subject_index=args.subject_index,
         frame=args.frame, show_seg=not args.no_seg, seg_alpha=args.seg_alpha, start=start,
         metric=args.metric, show_mask=args.mask, show_lines=args.lines, show_sa_lines=args.sa_lines,
-        show_radius=args.radius,
+        show_radius=args.radius, show_profiles=not args.no_profiles,
     )
     if args.screenshot is not None:
         viewer.show(screenshot=str(args.screenshot), auto_close=True)

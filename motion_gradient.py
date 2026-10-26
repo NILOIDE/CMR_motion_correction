@@ -12,12 +12,13 @@ For every pair of non-parallel planes (each SAX slice vs each LAX view, and LAX 
 intersection line is computed from the NIfTI affines. Intensity profiles are sampled along the
 line from both images; each profile is averaged across a band whose width equals the *other*
 image's slice thickness, approximating that image's slice-selection point-spread function.
-Profiles are compared with normalized cross-correlation (NCC; or gradient NCC, normalized MI or
-L2 on percentile-normalized intensities, --metric), restricted to a dilated heart
+Profiles are compared with normalized cross-correlation (NCC; or gradient NCC, local NCC, normalized
+gradient agreement, normalized MI, or L1 / L2 on percentile-normalized intensities, --metric), restricted to a dilated heart
 mask derived from the LAX nnU-Net segmentations (or, with --outside-mask-weight, with the points
 outside the mask down-weighted) and averaged over several cardiac phases.
 
-A 6-DOF rigid pose per plane (rotation vector + 3D translation about the plane centre) is
+A 6-DOF rigid pose per plane (rotation vector about a pivot on the LV long axis + 3D translation of that pivot,
+--rotation-pivot; so rotation does not move the heart and the two are decoupled) is
 optimized jointly for all planes with Adam (or another --optimizer), starting from the acquired geometry. Intersection
 lines are recomputed from the current poses every step, so through-plane shifts and rotations
 are observable. A weak gauge penalty on the mean pose removes the global rigid-body freedom.
@@ -118,7 +119,7 @@ SUMMARY_COLUMNS = [
     "sax_dz_rms_mm", "sax_rot_inplane_rms_deg", "sax_tilt_rms_deg",
     "lax_shift_mean_mm", "lax_shift_max_mm",
     "ncc_zero_mean", "ncc_mean", "ncc_gain_mean",
-    "mi_zero_mean", "mi_mean", "mi_gain_mean",
+    "nmi_zero_mean", "nmi_mean", "nmi_gain_mean",
     "seg_dice_zero_mean", "seg_dice_mean",
     "hd_zero_mean_mm", "hd_mean_mm", "hd_zero_max_mm", "hd_max_mm",
     "sax_cross_pairs", "sax_gap_min_mm", "sax_rel_tilt_max_deg", "sax_cross_dissim_max",
@@ -127,11 +128,11 @@ SUMMARY_COLUMNS = [
 DETAIL_COLUMNS = [
     "subject_id", "image", "slice", "n_pairs", "n_points",
     "dx_mm", "dy_mm", "dz_mm", "shift_inplane_mm", "shift_mm", "rot_inplane_deg", "rot_tilt_deg",
-    "ncc_zero", "ncc", "mi_zero", "mi", "seg_dice_zero", "seg_dice", "hd_zero_mm", "hd_mm",
+    "ncc_zero", "ncc", "nmi_zero", "nmi", "seg_dice_zero", "seg_dice", "hd_zero_mm", "hd_mm",
 ]
 PAIR_COLUMNS = [
     "subject_id", "image_a", "slice_a", "image_b", "slice_b", "kind", "n_points",
-    "ncc_zero", "ncc", "mi_zero", "mi", "seg_dice_zero", "seg_dice", "hd_zero_mm", "hd_mm", "axis_dist_mm",
+    "ncc_zero", "ncc", "nmi_zero", "nmi", "seg_dice_zero", "seg_dice", "hd_zero_mm", "hd_mm", "axis_dist_mm",
     "gap_min_mm", "rel_tilt_deg",
 ]
 
@@ -154,6 +155,12 @@ class Plane:
     thickness: float
     spacing: tuple = (1.0, 1.0)      # in-plane voxel size (mm) along image axes 0 and 1
     affine: np.ndarray | None = None  # acquired 4x4 voxel -> world affine of this slice (its own NIfTI affine)
+    pivot: np.ndarray | None = None   # point (world, in the plane) the pose rotates about; None = the image centre
+
+    @property
+    def rot_centre(self) -> np.ndarray:
+        """The point the plane's pose rotation is about (see set_rotation_pivots)."""
+        return self.center if self.pivot is None else self.pivot
 
     @property
     def H(self):
@@ -279,7 +286,7 @@ def build_planes(data: dict, args, device, with_seg: bool = True) -> tuple[list[
     """(SAX planes, LAX planes) of a loaded subject, one plane per slice file. For --metric l2 the intensities are
     normalized, all SAX slices with one common scale. with_seg=False leaves the segmentations off the GPU (they are
     only needed for the Dice / Hausdorff metrics; the LAX heart masks are built from them at load time)."""
-    l2 = getattr(args, "metric", "ncc") == "l2"
+    l2 = getattr(args, "metric", "ncc") in ("l1", "l2")              # intensity-difference metrics need a common scale
     sax_ref = np.concatenate([e["arr"].ravel() for e in data["sax"]]) if l2 and data["sax"] else None
     sax_planes = []
     for e in data["sax"]:
@@ -290,7 +297,44 @@ def build_planes(data: dict, args, device, with_seg: bool = True) -> tuple[list[
     for view, d in data["lax"].items():
         arr = normalize_intensity(d["arr"]) if l2 else d["arr"]
         lax_planes += make_planes(view, arr, d["affine"], d["thickness"], d["mask"], d["seg"] if with_seg else None, device)
+    # programmatic callers without the option (older runs' configs) keep the image-centre rotation they were made with
+    set_rotation_pivots(sax_planes, lax_planes, getattr(args, "rotation_pivot", "image-centre"))
     return sax_planes, lax_planes
+
+
+def set_rotation_pivots(sax_planes: list[Plane], lax_planes: list[Plane], mode: str) -> None:
+    """Choose the point each plane's pose rotates about (Plane.pivot; the translation t then moves that point).
+
+    image-centre: the centre of the plane's pixel grid. The heart is typically 20-60 mm away from it, so a rotation
+      also displaces the heart by ~angle x that distance, which the translation has to cancel: rotation and
+      translation are entangled.
+    long-axis: a point on the LV long axis (the crossing line of the two most perpendicular LAX views, acquired
+      geometry, see long_axis_line): for a SAX slice where the axis pierces it, for a LAX view the heart centre (the
+      mean of the SAX pivots, i.e. the axis at mid-stack) projected onto the view. Rotations then turn the plane about
+      the heart, leaving it in place, and t is the heart's displacement. Falls back to image-centre without an axis.
+    """
+    for p in sax_planes + lax_planes:
+        p.pivot = None
+    if mode != "long-axis":
+        return
+    axis = long_axis_line(lax_planes)
+    if axis is None:
+        return
+    L0, ell = axis[0], axis[1] / np.linalg.norm(axis[1])
+    for p in sax_planes:
+        cos = float(ell @ p.normal)
+        if abs(cos) > 0.2:                                   # the axis pierces the slice
+            p.pivot = L0 + float((p.center - L0) @ p.normal) / cos * ell
+        else:                                                # (nearly in-plane: closest axis point, projected)
+            q = L0 + float((p.center - L0) @ ell) * ell
+            p.pivot = q - float((q - p.center) @ p.normal) * p.normal
+    if sax_planes:
+        heart = np.mean([p.pivot for p in sax_planes], 0)
+    else:                                                    # no SAX slices: the axis point closest to the views' centres
+        c = np.mean([p.center for p in lax_planes], 0)
+        heart = L0 + float((c - L0) @ ell) * ell
+    for p in lax_planes:
+        p.pivot = heart - float((heart - p.center) @ p.normal) * p.normal
 
 
 def make_planes(image: str, arr: np.ndarray, affine: np.ndarray, thickness: float,
@@ -475,6 +519,68 @@ def soft_nmi(a: torch.Tensor, b: torch.Tensor, w: torch.Tensor, bins: int = 24, 
     return 2.0 * mi / (h_a + h_b).clamp_min(eps)
 
 
+def l1_similarity(a: torch.Tensor, b: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """--metric l1: -mean |a - b| of profiles a, b (M, F, L) with point weights w (M, L), mean over frames -> (M,).
+    Only meaningful on images normalized to a common intensity scale (build_planes does this for l1)."""
+    wf = w[:, None, :]
+    return -((wf * (a - b).abs()).sum(-1) / wf.sum(-1).clamp_min(1.0)).mean(1)
+
+
+def ngf_similarity(a: torch.Tensor, b: torch.Tensor, w: torch.Tensor, grad_eps: float) -> torch.Tensor:
+    """--metric ngf (normalized gradient agreement) of profiles a, b (M, F, L) with point weights w (M, L) -> (M,).
+
+    The central-difference gradients g along the line are normalized per point, g / sqrt(g^2 + eps^2), with eps =
+    grad_eps x the standard deviation of g over the weighted points (per profile and frame, so each image's contrast
+    does not matter): edges well above eps -> +-1, flat stretches -> 0. Score sum(na nb) / sum((na^2 + nb^2) / 2) in
+    [-1, 1] (interior points, weighted where all three samples are): 1 = the same edges at the same places with the
+    same sign, 0 for edges in one image only, -1 for opposite edges. Mean over frames."""
+    wg = (w[:, :-2] * w[:, 1:-1] * w[:, 2:])[:, None, :]
+    ws = wg.sum(-1, keepdim=True).clamp_min(1e-6)
+
+    def normalize(x):
+        g = x[..., 2:] - x[..., :-2]
+        eps = grad_eps * ((wg * g * g).sum(-1, keepdim=True) / ws + 1e-12).sqrt() + 1e-6   # finite gradient at 0
+        return g / (g * g + eps * eps).sqrt()
+
+    na, nb = normalize(a), normalize(b)
+    num = (wg * na * nb).sum(-1)
+    den = (wg * 0.5 * (na * na + nb * nb)).sum(-1).clamp_min(1e-6)
+    return (num / den).mean(1)
+
+
+def lncc_similarity(a: torch.Tensor, b: torch.Tensor, w: torch.Tensor, k: int, min_std: float) -> torch.Tensor:
+    """--metric lncc (local NCC) of profiles a, b (M, F, L) with point weights w (M, L) -> (M,).
+
+    The profiles are z-scored over their weighted points, then NCC is taken in windows of k samples sliding by one
+    sample and averaged over the windows, each weighted by its weighted point count (0 below half a window) x a
+    confidence that fades out windows where the profiles hardly vary: min(1, (sd_a sd_b)^(1/2) / min_std), sd in units
+    of the profile's standard deviation over the whole line. Every stretch has to match on its own; one strong edge
+    cannot dominate. Mean over frames."""
+    k = min(k, a.shape[-1])
+    wf = w[:, None, :]
+    ws = wf.sum(-1, keepdim=True).clamp_min(1e-6)
+
+    def zscore(x):
+        mu = (wf * x).sum(-1, keepdim=True) / ws
+        return (x - mu) / (((wf * (x - mu) ** 2).sum(-1, keepdim=True) / ws + 1e-12).sqrt() + 1e-6)
+
+    def window_sum(x):
+        c = F.pad(torch.cumsum(x, -1), (1, 0))
+        return c[..., k:] - c[..., :-k]
+
+    za, zb = zscore(a), zscore(b)
+    n = window_sum(wf.expand_as(za))
+    nn_ = n.clamp_min(1e-6)
+    ma, mb = window_sum(wf * za) / nn_, window_sum(wf * zb) / nn_
+    va = (window_sum(wf * za * za) / nn_ - ma * ma).clamp_min(0.0)
+    vb = (window_sum(wf * zb * zb) / nn_ - mb * mb).clamp_min(0.0)
+    cov = window_sum(wf * za * zb) / nn_ - ma * mb
+    loc = cov / (va * vb + 1e-6).sqrt()
+    conf = ((va * vb + 1e-12).pow(0.25) / min_std).clamp(max=1.0)                 # finite gradient at 0
+    wt = n * conf * (n >= 0.5 * k).float()
+    return ((loc * wt).sum(-1) / wt.sum(-1).clamp_min(1e-6)).mean(1)
+
+
 class LineSampler:
     """Samples both images (or segmentations) of every intersection line for arbitrary rigid poses.
 
@@ -531,7 +637,8 @@ class LineSampler:
 
         f32 = dict(dtype=torch.float32, device=device)
         self.O = torch.tensor(np.stack([p.origin for p in planes]), **f32)
-        self.C = torch.tensor(np.stack([p.center for p in planes]), **f32)
+        self.C = torch.tensor(np.stack([p.rot_centre for p in planes]), **f32)     # rotation centres (in-plane)
+        self.Ctr = torch.tensor(np.stack([p.center for p in planes]), **f32)       # image centres (line anchors)
         self.Nrm = torch.tensor(np.stack([p.normal for p in planes]), **f32)
         self.thick = torch.tensor([p.thickness for p in planes], **f32)
         self.inv_rot = torch.stack([p.inv_rot for p in planes])
@@ -655,12 +762,15 @@ class LineSampler:
         Op = (R @ (self.O - self.C)[..., None])[..., 0] + self.C + t
         Np = (R @ self.Nrm[..., None])[..., 0]
         Cp = self.C + t
+        # the lines' sample positions T are measured from the point closest to plane B's *image centre* (as in
+        # intersection_line, where the masks were made), so anchor on the posed image centre, not the rotation pivot
+        Gp = (R @ (self.Ctr - self.C)[..., None])[..., 0] + Cp
 
         IA, IB = self.IA, self.IB
         na, nb = Np[IA], Np[IB]
         d = torch.cross(na, nb, dim=1)
         d = d / d.norm(dim=1, keepdim=True)
-        rhs = torch.stack([(na * Op[IA]).sum(1), (nb * Op[IB]).sum(1), (d * Cp[IB]).sum(1)], 1)
+        rhs = torch.stack([(na * Op[IA]).sum(1), (nb * Op[IB]).sum(1), (d * Gp[IB]).sum(1)], 1)
         x0 = solve3_rows(na, nb, d, rhs)
         pts = x0[:, None, :] + self.T[:, :, None] * d[:, None, :]              # (M, Lmax, 3)
 
@@ -702,7 +812,7 @@ class LineSampler:
         W = self.W if W is None else W
         return ncc(a, b, W[:, None, :], use_gradient).mean(1)                  # (M,)
 
-    def mi_lines(self, theta_deg, t, bins: int, sigma_bins: float, prof=None, W=None) -> torch.Tensor:
+    def nmi_lines(self, theta_deg, t, bins: int, sigma_bins: float, prof=None, W=None) -> torch.Tensor:
         """Normalized mutual information per line, samples pooled over frames -> (M,)."""
         a, b = prof if prof is not None else self.profiles(theta_deg, t, "img")
         w = (self.W if W is None else W)[:, None, :].expand_as(a)
@@ -715,14 +825,22 @@ class LineSampler:
         w = (self.W if W is None else W)[:, None, :]
         return -((w * (a - b) ** 2).sum(-1) / w.sum(-1).clamp_min(1.0)).mean(1)
 
-    def similarity_lines(self, theta_deg, t, args, prof=None) -> torch.Tensor:
-        """The optimized similarity per line (NCC, gradient NCC, normalized MI or negative L2), with the loss weights
-        W_loss (points outside the mask down-weighted by --outside-mask-weight; the reported metrics use the mask only)."""
-        if args.metric == "mi":
-            return self.mi_lines(theta_deg, t, args.mi_bins, args.mi_sigma, prof, self.W_loss)
+    def similarity_lines(self, theta_deg, t, args, prof=None, W=None) -> torch.Tensor:
+        """The optimized similarity per line (--metric), with the loss weights W_loss (points outside the mask
+        down-weighted by --outside-mask-weight) or the given W (e.g. self.W: the mask points only) -> (M,)."""
+        W = self.W_loss if W is None else W
+        if args.metric == "nmi":
+            return self.nmi_lines(theta_deg, t, args.nmi_bins, args.nmi_sigma, prof, W)
         if args.metric == "l2":
-            return self.l2_lines(theta_deg, t, prof, self.W_loss)
-        return self.ncc_lines(theta_deg, t, args.metric == "ncc_grad", prof, self.W_loss)
+            return self.l2_lines(theta_deg, t, prof, W)
+        if args.metric in ("ncc", "ncc_grad"):
+            return self.ncc_lines(theta_deg, t, args.metric == "ncc_grad", prof, W)
+        a, b = prof if prof is not None else self.profiles(theta_deg, t, "img")
+        if args.metric == "l1":
+            return l1_similarity(a, b, W)
+        if args.metric == "ngf":
+            return ngf_similarity(a, b, W, args.grad_eps)
+        return lncc_similarity(a, b, W, max(3, int(round(args.lncc_window_mm / args.line_step_mm))), args.lncc_min_std)
 
     def dice_lines(self, theta_deg, t, labels: list[int], labels_sax: list[int], prof=None) -> torch.Tensor:
         """Mean Dice over the counted labels (see counted_labels) along each line -> (M,).
@@ -796,7 +914,7 @@ class LineSampler:
         img = self.profiles(theta_deg, t, "img")
         seg = self.profiles(theta_deg, t, "seg") if has_seg else None
         out = dict(ncc=self.ncc_lines(theta_deg, t, args.metric == "ncc_grad", img),
-                   mi=self.mi_lines(theta_deg, t, args.mi_bins, args.mi_sigma, img),
+                   nmi=self.nmi_lines(theta_deg, t, args.nmi_bins, args.nmi_sigma, img),
                    dice=self.dice_lines(theta_deg, t, labels, labels_sax, seg) if has_seg else nan,
                    hd=self.hd_lines(theta_deg, t, labels, labels_sax, getattr(args, "hd_miss_mm", 100.0), seg) if has_seg else nan)
         return {k: v.float() for k, v in out.items()}
@@ -1119,7 +1237,7 @@ OPTIMIZERS = ("adam", "nadam", "radam", "adamax", "rmsprop", "adagrad", "sgd")
 # methods take steps of about lr per iteration whatever the gradient scale; Adagrad's steps shrink like 1/sqrt(step),
 # so it needs a larger lr; plain SGD steps are lr * gradient, and the NCC objective's gradients are small (see --lr).
 DEFAULT_LR = {"adam": (0.2, 0.04), "nadam": (0.2, 0.04), "radam": (0.2, 0.04), "adamax": (0.2, 0.04),
-              "rmsprop": (0.2, 0.04), "adagrad": (1.0, 0.2), "sgd": (20.0, 10.0)}
+              "rmsprop": (0.2, 0.04), "adagrad": (1.0, 0.2), "sgd": (60.0, 5.0)}
 
 
 def make_optimizer(param_groups: list[dict], args, device):
@@ -1375,7 +1493,9 @@ def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]
     if args.steps in snap_steps:
         snapshots.append((args.steps, theta_deg.detach().clone(), t.detach().clone()))
     with torch.no_grad():
-        if stochastic and track_from <= args.steps:        # the final parameters are also a candidate
+        # the final parameters are also a candidate; they are the only one when an annealing schedule (e.g.
+        # --psf-anneal-frac > 1) outlasts the run, as nothing was tracked then
+        if (stochastic and track_from <= args.steps) or track_from >= args.steps:
             step_buf.fill_(float(args.steps))
             track_buf.fill_(1.0)
             update_best(objective(theta_deg, t))
@@ -1400,8 +1520,8 @@ def base_affine(data: dict, plane: Plane) -> np.ndarray:
 AFFINE_COLUMNS = [f"a{r}{c}" for r in range(3) for c in range(4)]
 HISTORY_COLUMNS = (["subject_id", "step", "fraction", "is_best", "image", "slice"] + AFFINE_COLUMNS
                    + ["dx_mm", "dy_mm", "dz_mm", "rot_x_deg", "rot_y_deg", "rot_z_deg", "rot_inplane_deg", "rot_tilt_deg",
-                      "ncc", "mi", "seg_dice", "hd_mm"])
-HISTORY_STEP_COLUMNS = ["subject_id", "step", "fraction", "is_best", "objective", "ncc_mean", "mi_mean", "seg_dice_mean",
+                      "ncc", "nmi", "seg_dice", "hd_mm"])
+HISTORY_STEP_COLUMNS = ["subject_id", "step", "fraction", "is_best", "objective", "ncc_mean", "nmi_mean", "seg_dice_mean",
                         "hd_mean_mm", "hd_max_mm", "sax_shift_rms_mm", "sax_shift_jitter_mm", "sax_dz_rms_mm", "sax_tilt_rms_deg"]
 SAX_LINE_COLUMNS = ["subject_id", "step", "fraction", "is_best", "image_a", "slice_a", "image_b", "slice_b", "kind",
                     "crossing", "n_points", "supervised", "axis_dist_mm", "ncc", "dissim", "gap_min_mm", "rel_tilt_deg",
@@ -1433,9 +1553,10 @@ def build_history(sid, data, planes, n_pairs, sampler, snapshots, best_step, lax
         lm = sampler.evaluate(th, tt, args, labels, labels_sax, has_seg)
         with torch.no_grad():
             # the optimized similarity on the mask points
-            sim = lm["mi"] if args.metric == "mi" else (sampler.l2_lines(th, tt) if args.metric == "l2" else lm["ncc"])
+            sim = (lm["nmi"] if args.metric == "nmi" else lm["ncc"] if args.metric == "ncc"
+                   else sampler.similarity_lines(th, tt, args, W=sampler.W))
             objective = float(similarity_objective(sampler, th, tt, args, sim=sim))
-        per = {k: (sampler.per_plane_max if k == "hd" else sampler.per_plane)(lm[k]) for k in ("ncc", "mi", "dice", "hd")}
+        per = {k: (sampler.per_plane_max if k == "hd" else sampler.per_plane)(lm[k]) for k in ("ncc", "nmi", "dice", "hd")}
         theta = th.detach().cpu().numpy().astype(np.float64)
         t_rel = relative_translation(tt, lax_rows)
         Rs = rotation_matrices(theta)
@@ -1452,14 +1573,14 @@ def build_history(sid, data, planes, n_pairs, sampler, snapshots, best_step, lax
                                    **{c: float(A[int(c[1]), int(c[2])]) for c in AFFINE_COLUMNS},
                                    dx_mm=dx, dy_mm=dy, dz_mm=dz, rot_x_deg=float(theta[i, 0]), rot_y_deg=float(theta[i, 1]),
                                    rot_z_deg=float(theta[i, 2]), rot_inplane_deg=inplane, rot_tilt_deg=tilt,
-                                   ncc=per["ncc"][i] if n_pairs[i] else nan, mi=per["mi"][i] if n_pairs[i] else nan,
+                                   ncc=per["ncc"][i] if n_pairs[i] else nan, nmi=per["nmi"][i] if n_pairs[i] else nan,
                                    seg_dice=per["dice"][i] if n_pairs[i] else nan, hd_mm=per["hd"][i] if n_pairs[i] else nan))
         vec = np.array(sax_vec).reshape(-1, 2)
         ok = lambda x: np.asarray(x, dtype=float)[np.isfinite(np.asarray(x, dtype=float))]  # noqa: E731
         hd_lines = ok(lm["hd"].cpu().numpy())
         step_rows.append(dict(
             subject_id=sid, step=step_no, fraction=step_no / args.steps, is_best=int(is_best), objective=objective,
-            ncc_mean=float(np.nanmean(per["ncc"])), mi_mean=float(np.nanmean(per["mi"])),
+            ncc_mean=float(np.nanmean(per["ncc"])), nmi_mean=float(np.nanmean(per["nmi"])),
             seg_dice_mean=float(np.nanmean(per["dice"])) if np.isfinite(per["dice"]).any() else nan,
             hd_mean_mm=float(hd_lines.mean()) if hd_lines.size else nan, hd_max_mm=float(hd_lines.max()) if hd_lines.size else nan,
             sax_shift_rms_mm=float(np.sqrt((vec ** 2).sum(1).mean())) if len(vec) else nan,
@@ -1545,7 +1666,7 @@ def process_subject(data: dict, args, device, on_lines=None) -> tuple:
         Rs = rotation_matrices(theta)
         return None, [], [], [(p, Rs[i], t_rel[i]) for i, p in enumerate(planes)], None
 
-    metric_names = ("ncc", "mi", "dice", "hd")
+    metric_names = ("ncc", "nmi", "dice", "hd")
     plane_m = {f"{k}_{s}": [nan] * N for k in metric_names for s in ("zero", "final")}
     pairs = []
     sax_qc = dict(sax_cross_pairs=nan, sax_gap_min_mm=nan, sax_rel_tilt_max_deg=nan, sax_cross_dissim_max=nan)
@@ -1574,7 +1695,7 @@ def process_subject(data: dict, args, device, on_lines=None) -> tuple:
             pa, pb = planes[ia], planes[ib]
             pairs.append(dict(subject_id=sid, image_a=pa.image, slice_a=pa.slice_idx, image_b=pb.image, slice_b=pb.slice_idx,
                               kind="LAX-LAX" if pa.image != "SAX" and pb.image != "SAX" else "SAX-LAX", n_points=int(line.n_points),
-                              ncc_zero=float(lz["ncc"][m]), ncc=float(lf["ncc"][m]), mi_zero=float(lz["mi"][m]), mi=float(lf["mi"][m]),
+                              ncc_zero=float(lz["ncc"][m]), ncc=float(lf["ncc"][m]), nmi_zero=float(lz["nmi"][m]), nmi=float(lf["nmi"][m]),
                               seg_dice_zero=float(lz["dice"][m]), seg_dice=float(lf["dice"][m]),
                               hd_zero_mm=float(lz["hd"][m]), hd_mm=float(lf["hd"][m]), axis_dist_mm=nan,
                               gap_min_mm=nan, rel_tilt_deg=nan))
@@ -1590,7 +1711,7 @@ def process_subject(data: dict, args, device, on_lines=None) -> tuple:
             for k, (ia, ib) in enumerate(sp.pairs):
                 pairs.append(dict(subject_id=sid, image_a="SAX", slice_a=planes[ia].slice_idx, image_b="SAX", slice_b=planes[ib].slice_idx,
                                   kind="SAX-SAX", n_points=round(float(nf[k]), 2), ncc_zero=float(cz[k]) if nz[k] > 1e-3 else nan,
-                                  ncc=float(cf[k]) if nf[k] > 1e-3 else nan, mi_zero=nan, mi=nan, seg_dice_zero=nan, seg_dice=nan,
+                                  ncc=float(cf[k]) if nf[k] > 1e-3 else nan, nmi_zero=nan, nmi=nan, seg_dice_zero=nan, seg_dice=nan,
                                   hd_zero_mm=nan, hd_mm=nan, axis_dist_mm=float(df[k]),
                                   gap_min_mm=float(gap_min[k]), rel_tilt_deg=float(tilt[k])))
             crossing = gap_min < 0
@@ -1612,7 +1733,7 @@ def process_subject(data: dict, args, device, on_lines=None) -> tuple:
     for i, p in enumerate(planes):
         row = dict(subject_id=sid, image=p.image, slice=p.slice_idx, n_pairs=n_pairs[i], n_points=int(n_points[i]),
                    dx_mm=nan, dy_mm=nan, dz_mm=nan, shift_inplane_mm=nan, shift_mm=nan, rot_inplane_deg=nan,
-                   rot_tilt_deg=nan, ncc_zero=nan, ncc=nan, mi_zero=nan, mi=nan, seg_dice_zero=nan, seg_dice=nan,
+                   rot_tilt_deg=nan, ncc_zero=nan, ncc=nan, nmi_zero=nan, nmi=nan, seg_dice_zero=nan, seg_dice=nan,
                    hd_zero_mm=nan, hd_mm=nan)
         if n_pairs[i] > 0:
             tv, th = t_rel[i], theta[i]
@@ -1621,7 +1742,7 @@ def process_subject(data: dict, args, device, on_lines=None) -> tuple:
             row.update(dx_mm=dx, dy_mm=dy, dz_mm=dz, shift_inplane_mm=math.hypot(dx, dy), shift_mm=float(np.linalg.norm(tv)),
                        rot_inplane_deg=inplane, rot_tilt_deg=float(np.linalg.norm(th - inplane * p.normal)),
                        ncc_zero=plane_m["ncc_zero"][i], ncc=plane_m["ncc_final"][i],
-                       mi_zero=plane_m["mi_zero"][i], mi=plane_m["mi_final"][i],
+                       nmi_zero=plane_m["nmi_zero"][i], nmi=plane_m["nmi_final"][i],
                        seg_dice_zero=plane_m["dice_zero"][i], seg_dice=plane_m["dice_final"][i],
                        hd_zero_mm=plane_m["hd_zero"][i], hd_mm=plane_m["hd_final"][i])
         details.append(row)
@@ -1643,7 +1764,7 @@ def process_subject(data: dict, args, device, on_lines=None) -> tuple:
     mag = np.hypot(vec[:, 0], vec[:, 1])
     jit = np.hypot(*(vec - vec.mean(0)).T) if len(vec) else np.array([])
     nz, nf_ = arr(ok_rows, lambda d: d["ncc_zero"]), arr(ok_rows, lambda d: d["ncc"])
-    mz, mf = arr(ok_rows, lambda d: d["mi_zero"]), arr(ok_rows, lambda d: d["mi"])
+    mz, mf = arr(ok_rows, lambda d: d["nmi_zero"]), arr(ok_rows, lambda d: d["nmi"])
 
     summary = dict(
         subject_id=sid, status="ok", n_lax_views=len(lax_planes), sax_n_slices=len(sax_planes), sax_n_eval=len(sax_rows),
@@ -1655,7 +1776,7 @@ def process_subject(data: dict, args, device, on_lines=None) -> tuple:
         lax_shift_mean_mm=stat(np.mean, arr(lax_rows, lambda d: d["shift_inplane_mm"])),
         lax_shift_max_mm=stat(np.max, arr(lax_rows, lambda d: d["shift_inplane_mm"])),
         ncc_zero_mean=stat(np.mean, nz), ncc_mean=stat(np.mean, nf_), ncc_gain_mean=stat(np.mean, nf_ - nz),
-        mi_zero_mean=stat(np.mean, mz), mi_mean=stat(np.mean, mf), mi_gain_mean=stat(np.mean, mf - mz),
+        nmi_zero_mean=stat(np.mean, mz), nmi_mean=stat(np.mean, mf), nmi_gain_mean=stat(np.mean, mf - mz),
         seg_dice_zero_mean=stat(np.mean, arr(ok_rows, lambda d: d["seg_dice_zero"])),
         seg_dice_mean=stat(np.mean, arr(ok_rows, lambda d: d["seg_dice"])),
         hd_zero_mean_mm=stat(np.mean, arr(pairs, lambda d: d["hd_zero_mm"])), hd_mean_mm=stat(np.mean, arr(pairs, lambda d: d["hd_mm"])),
@@ -1676,10 +1797,11 @@ def empty_summary(sid: str, status: str) -> dict:
 # --------------------------------------------------------------------------------------
 
 def corrected_affine(affine: np.ndarray, plane: Plane, R: np.ndarray, t: np.ndarray) -> np.ndarray:
-    """Affine of the plane's content after applying the rigid pose (rotation about the plane centre)."""
+    """Affine of the plane's content after applying the rigid pose (rotation about its rot_centre, then t)."""
     A = np.eye(4)
     A[:3, :3] = R @ affine[:3, :3]
-    A[:3, 3] = R @ (plane.origin - plane.center) + plane.center + t
+    c = plane.rot_centre
+    A[:3, 3] = R @ (plane.origin - c) + c + t
     return A
 
 
@@ -1746,12 +1868,23 @@ SUBSETS = {
 }
 
 
+def legacy_nmi(obj):
+    """Runs from before the mi -> nmi rename: mi* columns of a DataFrame / mi* keys and --metric mi of a config dict."""
+    old = lambda k: k == "mi" or k.startswith("mi_")
+    if isinstance(obj, pd.DataFrame):
+        return obj.rename(columns=lambda c: "n" + c if old(c) else c)
+    obj = {("n" + k if old(k) else k): v for k, v in obj.items()}
+    if obj.get("metric") == "mi":
+        obj["metric"] = "nmi"
+    return obj
+
+
 def load_results(summary_path: Path, detail_path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
-    summ = pd.read_csv(summary_path, dtype={"subject_id": str}).drop_duplicates("subject_id", keep="last")
+    summ = legacy_nmi(pd.read_csv(summary_path, dtype={"subject_id": str})).drop_duplicates("subject_id", keep="last")
     summ = summ[summ["status"] == "ok"].reset_index(drop=True)
-    det = pd.read_csv(detail_path, dtype={"subject_id": str})
+    det = legacy_nmi(pd.read_csv(detail_path, dtype={"subject_id": str}))
     det = det.drop_duplicates(["subject_id", "image", "slice"], keep="last")
-    for col in ("mi_zero", "mi", "hd_zero_mm", "hd_mm"):  # runs from before these metrics were added
+    for col in ("nmi_zero", "nmi", "hd_zero_mm", "hd_mm"):  # runs from before these metrics were added
         if col not in det:
             det[col] = np.nan
     det = det[det["subject_id"].isin(summ["subject_id"])].reset_index(drop=True)
@@ -1768,7 +1901,7 @@ def load_pairs(pairs_path: Path, det: pd.DataFrame) -> pd.DataFrame | None:
     with the SAX slice's region attached (None if absent)."""
     if not pairs_path.exists():
         return None
-    pairs = pd.read_csv(pairs_path, dtype={"subject_id": str})
+    pairs = legacy_nmi(pd.read_csv(pairs_path, dtype={"subject_id": str}))
     pairs = pairs[pairs["kind"] != "SAX-SAX"]
     pairs = pairs.drop_duplicates(["subject_id", "image_a", "slice_a", "image_b", "slice_b"], keep="last")
     pairs = pairs[pairs["subject_id"].isin(det["subject_id"])].reset_index(drop=True)
@@ -1795,7 +1928,7 @@ def plot_pairs_figure(pairs: pd.DataFrame, label: str, out_path: Path, st=PLOT_S
     fig = Figure(figsize=(18, 4.2 * len(kinds) + 0.8), layout="constrained", facecolor=st["surface"])
     fig.get_layout_engine().set(rect=(0, 0, 1, 1 - 0.5 / (4.2 * len(kinds) + 0.8)))
     axes = np.atleast_2d(fig.subplots(len(kinds), 4))
-    panels = [("ncc_zero", "ncc", "NCC", "NCC"), ("mi_zero", "mi", "Normalized MI", "normalized MI"),
+    panels = [("ncc_zero", "ncc", "NCC", "NCC"), ("nmi_zero", "nmi", "Normalized MI", "normalized MI"),
               ("seg_dice_zero", "seg_dice", "Segmentation Dice", "Dice"),
               ("hd_zero_mm", "hd_mm", "Segmentation Hausdorff (mm)", "Hausdorff distance (mm)")]
     for r, kind in enumerate(kinds):
@@ -1846,13 +1979,13 @@ def per_subject_metrics(det: pd.DataFrame, reference: pd.DataFrame | None = None
             shift_jitter=jitter(v, ref[["dx_mm", "dy_mm"]].values if ref is not None else None),
             dz_rms=rms(g["dz_mm"].values), rot_inplane_rms=rms(g["rot_inplane_deg"].values), tilt_rms=rms(g["rot_tilt_deg"].values),
             ncc_zero=nanstat(np.mean, g["ncc_zero"]), ncc=nanstat(np.mean, g["ncc"]),
-            mi_zero=nanstat(np.mean, g["mi_zero"]), mi=nanstat(np.mean, g["mi"]),
+            nmi_zero=nanstat(np.mean, g["nmi_zero"]), nmi=nanstat(np.mean, g["nmi"]),
             seg_dice_zero=nanstat(np.mean, g["seg_dice_zero"]), seg_dice=nanstat(np.mean, g["seg_dice"]),
             hd_zero=nanstat(np.max, g["hd_zero_mm"]), hd=nanstat(np.max, g["hd_mm"]),
         )
     m = pd.DataFrame.from_dict(rows, orient="index")
     m["ncc_gain"] = m["ncc"] - m["ncc_zero"]
-    m["mi_gain"] = m["mi"] - m["mi_zero"]
+    m["nmi_gain"] = m["nmi"] - m["nmi_zero"]
     return m
 
 
@@ -1947,8 +2080,8 @@ def plot_metrics_figure(metrics: pd.DataFrame, label: str, out_path: Path, lax_m
         _hist_series(axes[0, 3], one("shift_mean"), "Mean in-plane shift (mm)")
     _hist_series(axes[1, 0], two("ncc_zero", "ncc"), "Mean NCC at slice intersections")
     _hist_series(axes[1, 1], one("ncc_gain"), "NCC gain over as-acquired")
-    _hist_series(axes[1, 2], two("mi_zero", "mi"), "Mean normalized MI at slice intersections")
-    _hist_series(axes[1, 3], one("mi_gain"), "Normalized MI gain over as-acquired")
+    _hist_series(axes[1, 2], two("nmi_zero", "nmi"), "Mean normalized MI at slice intersections")
+    _hist_series(axes[1, 3], one("nmi_gain"), "Normalized MI gain over as-acquired")
     _hist_series(axes[2, 0], one("dz_rms"), "Through-plane shift RMS (mm)")
     if _hist_series(axes[2, 1], [(metrics["rot_inplane_rms"], "in-plane", st["orange"]),
                                  (metrics["tilt_rms"], "tilt (weak)", st["yellow"])], "Rotation RMS (deg)"):
@@ -2269,7 +2402,7 @@ def save_subject_metrics(summary: dict, details: list[dict], pairs: list[dict], 
                  xlabel="translation distance (mm)")
     two = lambda col0, col1: [(pdf[col0], LABEL_RAW, st["aqua"]), (pdf[col1], LABEL_ALIGNED, st["orange"])]  # noqa: E731
     _hist_series(fig.add_subplot(gs[1, 0]), two("ncc_zero", "ncc"), f"NCC per line pair ({len(pdf)} pairs)", xlabel="NCC")
-    _hist_series(fig.add_subplot(gs[1, 1]), two("mi_zero", "mi"), "Normalized MI per line pair", xlabel="normalized MI")
+    _hist_series(fig.add_subplot(gs[1, 1]), two("nmi_zero", "nmi"), "Normalized MI per line pair", xlabel="normalized MI")
     _hist_series(fig.add_subplot(gs[1, 2]), two("seg_dice_zero", "seg_dice"), "Segmentation Dice per line pair", xlabel="Dice")
     _hist_series(fig.add_subplot(gs[1, 3]), two("hd_zero_mm", "hd_mm"), "Segmentation Hausdorff per line pair (mm)",
                  xlabel="Hausdorff distance (mm)")
@@ -2291,7 +2424,7 @@ def save_subject_metrics(summary: dict, details: list[dict], pairs: list[dict], 
         _inset_legend(ax)
     _legend(fig, fig.axes[4].get_legend_handles_labels())
     fig.suptitle(f"Subject {sid}: NCC {summary['ncc_zero_mean']:.3f} -> {summary['ncc_mean']:.3f}, "
-                 f"NMI {summary['mi_zero_mean']:.3f} -> {summary['mi_mean']:.3f}, "
+                 f"NMI {summary['nmi_zero_mean']:.3f} -> {summary['nmi_mean']:.3f}, "
                  f"Dice {summary['seg_dice_zero_mean']:.3f} -> {summary['seg_dice_mean']:.3f}, "
                  f"worst HD {summary['hd_zero_max_mm']:.1f} -> {summary['hd_max_mm']:.1f} mm, "
                  f"SAX jitter {summary['sax_shift_jitter_mm']:.2f} mm", color=st["ink"], fontsize=12, x=0.02, ha="left")
@@ -2410,7 +2543,7 @@ def main():
                          f"optimization (every {HISTORY_EVERY:g} of the run), per-subject CSVs and figures (metrics/), "
                          "cohort-wide CSVs and figures (overall_metrics/) and run_config.json. false: only the "
                          "motion-corrected NIfTIs are written and no metrics are computed (fastest).")
-    ap.add_argument("--max-subjects", type=int, default=2, help="Max number of subjects to evaluate (-1 = all)")
+    ap.add_argument("--max-subjects", type=int, default=-1, help="Max number of subjects to evaluate (-1 = all)")
     ap.add_argument("--skip-processed", action="store_true",
                     help="Skip subjects whose aligned NIfTIs are already complete in the run directory (to resume a run, "
                          "pass its directory name with --run-name; a default name is always new)")
@@ -2441,11 +2574,18 @@ def main():
     ap.add_argument("--blur-sigma", type=float, default=6.0,
                     help="Coarse-to-fine: initial in-plane Gaussian sigma (mm) of the images, decayed linearly to 0 (0 = off)")
     ap.add_argument("--blur-frac", type=float, default=0.9, help="Fraction of the steps over which the blur decays to 0")
-    ap.add_argument("--pair-keep", type=float, default=0.5,
+    ap.add_argument("--pair-keep", type=float, default=0.8,
                     help="Stochastic optimization: fraction of intersection lines kept at each step (1 = deterministic)")
     ap.add_argument("--eval-every", type=int, default=10, help="With --pair-keep < 1: evaluate the full objective every N steps to track the best pose")
     ap.add_argument("--seed", type=int, default=0, help="Seed for the line dropping")
     ap.add_argument("--dof", type=int, choices=[3, 6], default=6, help="3 = translation only, 6 = rigid (translation + rotation)")
+    ap.add_argument("--rotation-pivot", choices=["long-axis", "image-centre"], default="long-axis",
+                    help="Point each plane's pose rotates about. long-axis: on the LV long axis (the crossing line of the "
+                         "two most perpendicular LAX views) -- for a SAX slice where the axis pierces it, for a LAX view "
+                         "the heart centre projected onto it -- so rotations turn the plane about the heart and the "
+                         "translation is the heart's displacement (decoupled). image-centre: the centre of the pixel grid "
+                         "(the earlier behaviour; a rotation then also moves the heart, entangling it with the "
+                         "translation). The reported dx/dy/dz are the displacement of this point. Default: %(default)s")
     ap.add_argument("--gauge", type=float, default=1e-2, help="Penalty weight on the mean pose (removes global drift)")
     ap.add_argument("--prior", type=float, default=0.0, help="Penalty weight on rotation (deg^2) and through-plane shift (mm^2)")
     ap.add_argument("--tilt-prior", type=float, default=0.0,
@@ -2509,7 +2649,7 @@ def main():
     ap.add_argument("--sax-seg-labels", type=str, default="1,2,3", help="Labels compared along SAX-LAX intersections")
     ap.add_argument("--hd-miss-mm", type=float, default=100.0,
                     help="Hausdorff value (mm) when both planes contain a label but only one intersection profile hits it")
-    ap.add_argument("--mask-dilation-mm", type=float, default=50.0,
+    ap.add_argument("--mask-dilation-mm", type=float, default=40.0,
                     help="How far (mm) the LAX heart segmentation is grown to form the mask; only intersection-line points "
                          "inside this mask enter the loss (see --outside-mask-weight). This is also the final value when "
                          "mask annealing is on. Default: %(default)s")
@@ -2531,9 +2671,9 @@ def main():
                          "linear ramp, and the lines are rebuilt each time. Once it has finished, the final dilation is "
                          "used for the rest of the run and the best pose is chosen only from that part. "
                          "Default: %(default)s")
-    ap.add_argument("--line-step-mm", type=float, default=1.0,
+    ap.add_argument("--line-step-mm", type=float, default=1.8,
                     help="Spacing (mm) between samples along each intersection line. Default: %(default)s")
-    ap.add_argument("--line-extent-mm", type=float, default=150.0,
+    ap.add_argument("--line-extent-mm", type=float, default=160.0,
                     help="Half-length (mm) of each intersection line: samples run from -extent to +extent around a "
                          "point near the plane centre, then are clipped to the images and the mask. Default: %(default)s")
     ap.add_argument("--min-line-mm", type=float, default=40.0,
@@ -2550,7 +2690,7 @@ def main():
                          "taken across the other slice's through-plane profile (see --psf-model) and combined with the "
                          "profile as weights; the band is widened by 1/sin of the crossing angle. 1 = sample the line "
                          "only. Default: %(default)s")
-    ap.add_argument("--psf-model", choices=["pulse", "gaussian", "rect"], default="gaussian",
+    ap.add_argument("--psf-model", choices=["pulse", "gaussian", "rect"], default="pulse",
                     help="Shape of a slice's through-plane excitation profile, with FWHM = the nominal slice thickness. "
                          "'pulse': the profile of a slice-selective RF pulse of finite time-bandwidth product "
                          "(--psf-tbw) -- a rectangle of the nominal thickness with smoothed edges, sampled out to where "
@@ -2562,7 +2702,7 @@ def main():
                          "--psf-anneal-frac of the run. Unlike --blur-sigma (isotropic in-plane blur of both images), "
                          "this smooths each image only perpendicular to each intersection line. More band samples are "
                          "used so the nominal density of --n-band is kept. Default: %(default)s")
-    ap.add_argument("--psf-anneal-frac", type=float, default=0.8,
+    ap.add_argument("--psf-anneal-frac", type=float, default=0.9,
                     help="Fraction of the run over which --psf-scale-start decays to 1. Default: %(default)s")
     ap.add_argument("--no-psf", action="store_true",
                     help="Disable the PSF model: each image is sampled (bilinearly) only at the intersection-line points "
@@ -2577,12 +2717,25 @@ def main():
                          "edge sharpness: the 10-90%% transition width is about thickness / TBW. Short bSSFP pulses "
                          "(TR ~2.7 ms as in UK Biobank) have TBW of roughly 2-3; the exact vendor pulse is not "
                          "published. Default: %(default)s")
-    ap.add_argument("--metric", choices=["ncc", "ncc_grad", "mi", "l2"], default="ncc",
-                    help="Optimized similarity: NCC on intensities, NCC on their 1D gradient, normalized mutual information, "
-                         "or L2 (negative mean squared intensity difference; every image is first rescaled so its 1st/99th "
-                         "intensity percentiles map to 0/1, the SAX stack as a whole)")
-    ap.add_argument("--mi-bins", type=int, default=24, help="Histogram bins for mutual information")
-    ap.add_argument("--mi-sigma", type=float, default=1.0, help="Parzen window width for mutual information, in bins")
+    ap.add_argument("--metric", choices=["ncc", "ncc_grad", "lncc", "ngf", "nmi", "l1", "l2"], default="lncc",
+                    help="Optimized similarity along each line. ncc: normalized cross-correlation (one high-contrast edge can "
+                         "carry most of the score). ncc_grad: NCC of the profiles' 1D gradients. lncc: local NCC in windows "
+                         "of --lncc-window-mm sliding along the line, averaged (every stretch has to match on its own; "
+                         "flat windows fade out, --lncc-min-std). ngf: normalized gradient agreement -- per-point "
+                         "normalized gradients, so every edge counts about equally whatever its contrast (--grad-eps), "
+                         "in [-1, 1]. nmi: normalized mutual information. l1 / l2: negative mean absolute / squared "
+                         "intensity difference, every image first rescaled so its 1st/99th percentiles map to 0/1 (the "
+                         "SAX slices with one common scale). Default: %(default)s")
+    ap.add_argument("--lncc-window-mm", type=float, default=20.0, help="--metric lncc: window length (mm). Default: %(default)s")
+    ap.add_argument("--lncc-min-std", type=float, default=0.25,
+                    help="--metric lncc: windows whose profiles vary less than this (geometric mean of both standard "
+                         "deviations, in units of the profile's standard deviation over the line) are faded out "
+                         "(weight sd / this). Default: %(default)s")
+    ap.add_argument("--grad-eps", type=float, default=0.5,
+                    help="--metric ngf: edge threshold, in standard deviations of the profile's gradient along the line; "
+                         "gradients well above it count as full edges, those below it fade out. Default: %(default)s")
+    ap.add_argument("--nmi-bins", type=int, default=24, help="Histogram bins for mutual information")
+    ap.add_argument("--nmi-sigma", type=float, default=1.0, help="Parzen window width for mutual information, in bins")
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--workers", type=int, default=4, help="Background threads for loading and writing NIfTI files")
     args = ap.parse_args()
