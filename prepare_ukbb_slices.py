@@ -26,6 +26,10 @@ images; status is ok (all present), partial (some missing), no_images, skipped_e
 
 Subjects whose destination already holds every expected file are skipped unless --overwrite.
 
+Each subject is written into a hidden folder <dst>/.<subject> and renamed to <dst>/<subject> once complete, so
+motion_gradient.py can run on --dst at the same time: it ignores hidden folders and picks up new subjects as they
+appear.
+
 Usage: python prepare_ukbb_slices.py [--src DIR] [--dst DIR] [--max-subjects N] [--workers N] [--overwrite]
 """
 import argparse
@@ -40,6 +44,7 @@ import pandas as pd
 
 LAX_VIEWS = ("LAX_2Ch", "LAX_3Ch", "LAX_4Ch")
 SEG_DIR = "nnUNet_segs"
+TMP_PREFIX = "."                 # subjects are written as <dst>/.<subject> and renamed to <dst>/<subject> when complete
 
 
 def is_scaled(img) -> bool:
@@ -142,30 +147,37 @@ def prepare_subject(subj: Path, args) -> dict:
 def _prepare_subject(subj: Path, args, row: dict, t0: float) -> dict:
     src_inst = image_dir(subj)
     dst = args.dst / subj.name
-    (dst / SEG_DIR).mkdir(parents=True, exist_ok=True)               # created whatever is missing
     missing = [name for name, f in [("SAX", "SAX.nii.gz")] + [(v, f"{v}.nii.gz") for v in LAX_VIEWS]
                if not (src_inst / f).exists()]
     row["missing"] = "+".join(missing)
     expected = expected_outputs(src_inst, dst)
-    if not expected:
-        row["status"] = "no_images"
-        return row
-    if not args.overwrite and all(p.exists() for p in expected):
+    if expected and not args.overwrite and all(p.exists() for p in expected):
         row["status"] = "skipped_existing"
     else:
+        # written into a hidden temporary folder that is renamed into place once complete, so that a concurrently
+        # running motion_gradient.py (which ignores hidden folders) never picks up a half-written subject
+        tmp = args.dst / f"{TMP_PREFIX}{subj.name}"
+        if tmp.exists():
+            shutil.rmtree(tmp)                           # left over from an interrupted run
+        (tmp / SEG_DIR).mkdir(parents=True)              # the subject folder is created whatever is missing
         warnings = []
         if (src_inst / "SAX.nii.gz").exists():
-            warnings += split_stack(src_inst / "SAX.nii.gz", dst, is_seg=False)
+            warnings += split_stack(src_inst / "SAX.nii.gz", tmp, is_seg=False)
             seg = src_inst / SEG_DIR / "SAX_nnUNetSeg.nii.gz"
             if seg.exists():
-                warnings += split_stack(seg, dst / SEG_DIR, is_seg=True)
+                warnings += split_stack(seg, tmp / SEG_DIR, is_seg=True)
         for v in LAX_VIEWS:
-            for src, out, is_seg in ((src_inst / f"{v}.nii.gz", dst / f"{v}.nii.gz", False),
-                                     (src_inst / SEG_DIR / f"{v}_nnUNetSeg.nii.gz", dst / SEG_DIR / f"{v}_nnUNetSeg.nii.gz", True)):
+            for src, out, is_seg in ((src_inst / f"{v}.nii.gz", tmp / f"{v}.nii.gz", False),
+                                     (src_inst / SEG_DIR / f"{v}_nnUNetSeg.nii.gz", tmp / SEG_DIR / f"{v}_nnUNetSeg.nii.gz", True)):
                 if src.exists():
                     warnings += copy_lax(src, out, is_seg)
+        if dst.exists():                                 # incomplete earlier output, or --overwrite
+            shutil.rmtree(dst)
+        tmp.rename(dst)
         row["warnings"] = "; ".join(warnings)
-        if missing:
+        if not expected:
+            row["status"] = "no_images"
+        elif missing:
             row["status"] = "partial"                    # whatever is present is still written
     row["n_sax_slices"] = sum(1 for p in expected if p.parent == dst and p.name.startswith("SAX_slice"))
     row["sax_seg"] = any(p.parent.name == SEG_DIR and p.name.startswith("SAX_slice") for p in expected)

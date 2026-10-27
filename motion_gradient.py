@@ -114,7 +114,7 @@ from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
-from itertools import combinations, islice
+from itertools import combinations
 from pathlib import Path
 
 import nibabel as nib
@@ -2577,6 +2577,7 @@ def fmt_row(row: dict) -> dict:
 NAME_EXCLUDED = {"root", "out_root", "run_name", "logging", "history_every", "no_cuda_graph", "max_subjects", "skip_processed",
                  "device", "workers"}
 HISTORY_EVERY = 0.02    # with --logging: pose/metric snapshot every this fraction of the run (plus step 0 and the best pose)
+RESCAN_SECONDS = 30.0   # how often --root is rescanned for new subjects while others are still queued
 
 
 def write_run_config(out_dir: Path, args) -> None:
@@ -2904,13 +2905,26 @@ def main():
     pairs_path = overall_dir / "motion_summary_pairs.csv"
 
     device = torch.device(args.device)
-    subjects = sorted(d for d in args.root.iterdir() if d.is_dir())
-    if args.skip_processed:
-        n0 = len(subjects)
-        subjects = [s for s in subjects if not aligned_complete(s, run_dir / s.name)]
-        print(f"Skipping {n0 - len(subjects)} subjects whose aligned NIfTIs are complete")
-    if args.max_subjects >= 0:
-        subjects = subjects[:args.max_subjects]
+    seen: set[str] = set()
+    budget = args.max_subjects                            # subjects still allowed by --max-subjects (-1 = no limit)
+
+    def scan() -> list[Path]:
+        """Subject folders under --root not listed before, without those already complete (--skip-processed), within
+        --max-subjects. Hidden folders are ignored: prepare_ukbb_slices.py writes a subject as .<subject> and renames
+        it when complete, so a subject is only picked up once fully written."""
+        nonlocal budget
+        new = sorted(d for d in args.root.iterdir() if d.is_dir() and not d.name.startswith(".") and d.name not in seen)
+        seen.update(d.name for d in new)
+        if args.skip_processed:
+            n0 = len(new)
+            new = [s for s in new if not aligned_complete(s, run_dir / s.name)]
+            if n0 > len(new):
+                print(f"Skipping {n0 - len(new)} subjects whose aligned NIfTIs are complete")
+        if budget >= 0:
+            new, budget = new[:budget], budget - min(budget, len(new))
+        return new
+
+    subjects = scan()
     print(f"Aligning {len(subjects)} subjects on {device}; outputs in {run_dir}"
           + ("" if args.logging else " (aligned NIfTIs only; --logging for metrics, CSVs and figures)"))
     if not subjects:
@@ -2923,7 +2937,7 @@ def main():
     try:
         from tqdm import tqdm
     except ImportError:
-        tqdm = lambda x, **k: x  # noqa: E731
+        tqdm = lambda *a, **k: None  # noqa: E731
 
     writers = None
     if args.logging:
@@ -2933,13 +2947,36 @@ def main():
     try:
         with ThreadPoolExecutor(max_workers=args.workers) as ex:
             it = iter(subjects)
-            queue = deque((s, ex.submit(load_subject, s, args)) for s in islice(it, 2 * args.workers))
+            queue = deque()
             pbar = tqdm(total=len(subjects), unit="subj")
+            last_scan = time.time()
+
+            def top_up():
+                """Keep 2 x --workers subjects loading ahead. When the known subjects run out, rescan --root for
+                subjects written since (e.g. by a concurrently running prepare_ukbb_slices.py): at most every
+                RESCAN_SECONDS while others are still queued, always once the queue is empty."""
+                nonlocal it, last_scan
+                while len(queue) < 2 * args.workers:
+                    nxt = next(it, None)
+                    if nxt is None:
+                        if queue and time.time() - last_scan < RESCAN_SECONDS:
+                            return
+                        more = scan()
+                        last_scan = time.time()
+                        if not more:
+                            return
+                        print(f"\nFound {len(more)} new subject(s) in {args.root}", flush=True)
+                        if hasattr(pbar, "total"):
+                            pbar.total += len(more)
+                            pbar.refresh()
+                        it = iter(more)
+                        continue
+                    queue.append((nxt, ex.submit(load_subject, nxt, args)))
+
+            top_up()
             while queue:
                 subj, fut = queue.popleft()
-                nxt = next(it, None)
-                if nxt is not None:
-                    queue.append((nxt, ex.submit(load_subject, nxt, args)))
+                top_up()
                 t0 = time.time()
                 metrics_dir = run_dir / subj.name / "metrics"
                 summary, details, pairs, history = None, [], [], None
@@ -3003,6 +3040,8 @@ def main():
                         post.update(ncc=f"{summary['ncc_mean']:.2f}", jitter=f"{summary['sax_shift_jitter_mm']:.1f}")
                     pbar.set_postfix(**post)
                     pbar.update(1)
+                if not queue:                              # subjects written while this one was aligned
+                    top_up()
             for name, what, job in save_jobs:
                 try:
                     job.result()
