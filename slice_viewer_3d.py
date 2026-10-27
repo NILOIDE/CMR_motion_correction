@@ -87,7 +87,10 @@ Interaction
                         selected metric per point along the same line (NCC: z_a z_b, mean = NCC;
                         LNCC: local NCC per window; Dice: 1 same label / 0 one only; Hausdorff:
                         distance to the nearest same label in the other profile, max = HD; empty
-                        for NMI); hovering shows the value at that position
+                        for NMI); hovering shows the value at that position. Each chart keeps one
+                        y scale: the curve's min / max over all history snapshots (at the frame shown
+                        when it was built, widened if another frame goes beyond), so the metric can
+                        be watched rising or falling while scrubbing the history
     Manual pose (block bottom left): [-] / [+] shift the profile-selected slice by 1 mm along
                         its own u / v / normal axes or rotate it by 1 deg about them (about the slice
                         centre), on top of the shown step's pose; lines, contours and profiles follow
@@ -1359,10 +1362,23 @@ class SliceViewer:
         li = self._line_items
         if li is None:
             return
-        li["t_used"] = self._stage_t_used(dil)
-        n = li["n"]
+        x0, d, li["t_used"] = self._line_geometry(snap)
+        li["cur_x0"], li["cur_d"] = x0, d
+        for name in ("used", "img"):
+            t = li["t_" + name]                                 # (N, 2)
+            t = np.where(np.isfinite(t), t, li["t_img"][:, :1])  # no loss points: zero-length segment
+            seg = np.stack([x0 + t[:, :1] * d, x0 + t[:, 1:] * d], axis=1)   # (N, 2, 3)
+            for item in li["per_slice"]:
+                A = self._affine_for(item["entry"], snap)
+                item[name + "_mesh"].points = burn_points(seg[item["idx"]], A)
+
+    def _line_geometry(self, snap: dict):
+        """(x0, d, t_used) of every SA-LA / LA-LA line at `snap` (manual offsets included): the intersection
+        of its two posed planes, anchored at the moved centre of plane b, and the loss range of the
+        snapshot's mask dilation."""
+        li = self._line_items
         x0, d = li["x0"].copy(), li["d"].copy()                # acquired geometry (fallback)
-        for i in range(n):
+        for i in range(li["n"]):
             Aa = self._pose(li["keys_a"][i], snap)
             Ab = self._pose(li["keys_b"][i], snap)
             if Aa is None or Ab is None or not np.isfinite(li["centre_b"][i]).all():
@@ -1378,14 +1394,7 @@ class SliceViewer:
             rhs = np.array([na @ Aa[:3, 3], nb @ Ab[:3, 3], di @ cb])
             x0[i] = np.linalg.solve(np.stack([na, nb, di]), rhs)
             d[i] = di
-        li["cur_x0"], li["cur_d"] = x0, d
-        for name in ("used", "img"):
-            t = li["t_" + name]                                 # (N, 2)
-            t = np.where(np.isfinite(t), t, li["t_img"][:, :1])  # no loss points: zero-length segment
-            seg = np.stack([x0 + t[:, :1] * d, x0 + t[:, 1:] * d], axis=1)   # (N, 2, 3)
-            for item in li["per_slice"]:
-                A = self._affine_for(item["entry"], snap)
-                item[name + "_mesh"].points = burn_points(seg[item["idx"]], A)
+        return x0, d, self._stage_t_used(self._dilation(snap["step"]))
 
     def _apply_sa_lines(self, snap: dict):
         """Burn the stored SA-SA segments of this snapshot into both slices of their pair
@@ -1803,7 +1812,8 @@ class SliceViewer:
             return []
         out = []
         li = self._line_items
-        if li is not None and "cur_x0" in li:
+        if li is not None:
+            x0, d, t_used = self._line_geometry(snap)
             for i in range(li["n"]):
                 ka, kb = li["keys_a"][i], li["keys_b"][i]
                 if e["key"] not in (ka, kb):
@@ -1814,8 +1824,7 @@ class SliceViewer:
                 oe = self._entry_by_key.get(other)
                 if oe is None:
                     continue
-                out.append(dict(other=oe, x0=li["cur_x0"][i], d=li["cur_d"][i],
-                                t_img=li["t_img"][i], t_used=li["t_used"][i]))
+                out.append(dict(other=oe, x0=x0[i], d=d[i], t_img=li["t_img"][i], t_used=t_used[i]))
             out.sort(key=lambda r: VIEWS.index(r["other"]["view"]))
         if e["view"] == "SA":
             sl = e["key"][1]
@@ -1951,54 +1960,100 @@ class SliceViewer:
                 curve[idx] = np.fmax(curve[idx], d)
         return float(np.nanmax(curve)) if np.isfinite(curve).any() else None, curve
 
+    def _chart_data(self, snap: dict) -> list[dict]:
+        """Per chart slot at `snap` (current frame): the intersection item and, where the slices cross,
+        its profiles (t, ya, yb, used, mode_txt) and the selected metric (mname, mval, ct, curve)."""
+        e = self._entry_by_name().get(self.profile_key)
+        out = []
+        for it in self._profile_items(snap):
+            c = dict(it=it)
+            if it["x0"] is not None:
+                t = np.arange(it["t_img"][0], it["t_img"][1] + 1e-6, PROFILE_STEP_MM)
+                pts = it["x0"] + t[:, None] * it["d"]
+                ya, yb, mode_txt = self._profile_values(e, it, snap, pts)
+                used = (t >= it["t_used"][0]) & (t <= it["t_used"][1]) if np.isfinite(it["t_used"]).all() \
+                    else np.zeros(len(t), bool)
+                mname, mval, ct, curve = self._profile_metric(e, it, snap, t, ya, yb, used)
+                c.update(t=t, pts=pts, ya=ya, yb=yb, used=used, mode_txt=mode_txt, mname=mname, mval=mval,
+                         ct=ct, curve=curve)
+            out.append(c)
+        return out
+
+    def _metric_ranges(self, data: list[dict]) -> list:
+        """Per chart slot: (min, max) of the metric curve over every history snapshot, so the metric
+        charts keep one y scale while scrubbing the history; None where a slot never has a curve.
+        Computed at the frame shown when it is (re)built -- slice, metric, profile mode or manual
+        offsets changed (~0.6 s for 50 snapshots) -- and only widened afterwards when another frame's
+        curve (`data`, the shown one) leaves it, so stepping through the cine stays fast."""
+        key = (self.run_index, self.subject_index, self.profile_key, self.metric,
+               self.show_psf and self.config is not None,
+               tuple(sorted((k, tuple(np.round(v, 6))) for k, v in self.offsets.items())))
+        cache = getattr(self, "_range_cache", None)
+        if cache is None or cache[0] != key:
+            lo = np.full(PROFILE_SLOTS, np.inf)
+            hi = np.full(PROFILE_SLOTS, -np.inf)
+            for snap in self.snapshots:
+                for k, c in enumerate(self._chart_data(snap)):
+                    cv = c.get("curve")
+                    if cv is not None and np.isfinite(cv).any():
+                        lo[k] = min(lo[k], float(np.nanmin(cv)))
+                        hi[k] = max(hi[k], float(np.nanmax(cv)))
+            self._range_cache = cache = (key, lo, hi)
+        _, lo, hi = cache
+        for k, c in enumerate(data[:PROFILE_SLOTS]):
+            cv = c.get("curve")
+            if cv is not None and np.isfinite(cv).any():
+                lo[k] = min(lo[k], float(np.nanmin(cv)))
+                hi[k] = max(hi[k], float(np.nanmax(cv)))
+        return [(float(l), float(h)) if np.isfinite(l) else None for l, h in zip(lo, hi)]
+
     def _update_profiles(self):
         charts = getattr(self, "_profile_charts", [])
         if not charts or not self.entries:
             return
         snap = self.snapshots[self.snap_index]
-        items = self._profile_items(snap) if self.show_profiles or self.show_metric_profiles else []
+        data = self._chart_data(snap) if self.show_profiles or self.show_metric_profiles else []
+        ranges = self._metric_ranges(data) if data and self.show_metric_profiles else [None] * PROFILE_SLOTS
         e = self._entry_by_name().get(self.profile_key)
         for k, (slot, mslot) in enumerate(zip(charts, self._metric_charts)):
             ch, pl_ = slot["chart"], slot["plots"]
             slot["item"] = mslot["item"] = None
-            if k >= len(items):
+            if k >= len(data):
                 ch.visible = mslot["chart"].visible = False
                 continue
-            it = items[k]
+            c = data[k]
+            it = c["it"]
             ch.visible, mslot["chart"].visible = self.show_profiles, self.show_metric_profiles
-            names = f"{label(e['name'])} × {label(it['other']['name'])}"
+            names = f"{label(e['name'])} \u00d7 {label(it['other']['name'])}"
             if it["x0"] is None:
                 ch.title = f"{names}: no crossing"
                 for p_ in pl_.values():
                     p_.update(np.array([0.0, 1.0]), np.array([np.nan, np.nan]))
-                self._fill_metric_chart(mslot, f"{names}: no crossing", None, None, None)
+                self._fill_metric_chart(mslot, f"{names}: no crossing", None, None, None, None)
                 continue
-            t = np.arange(it["t_img"][0], it["t_img"][1] + 1e-6, PROFILE_STEP_MM)
-            pts = it["x0"] + t[:, None] * it["d"]
-            ya, yb, mode_txt = self._profile_values(e, it, snap, pts)
-            used = (t >= it["t_used"][0]) & (t <= it["t_used"][1]) if np.isfinite(it["t_used"]).all() \
-                else np.zeros(len(t), bool)
-            mname, mval, ct, curve = self._profile_metric(e, it, snap, t, ya, yb, used)
-            ch.title = (f"{names}   {mname} {mval:.2f}{mode_txt}" if mval is not None
-                        else f"{names}   {mname} -{mode_txt}")
+            t, ya, yb, used, mname, mval = c["t"], c["ya"], c["yb"], c["used"], c["mname"], c["mval"]
+            ch.title = (f"{names}   {mname} {mval:.2f}{c['mode_txt']}" if mval is not None
+                        else f"{names}   {mname} -{c['mode_txt']}")
             for side, y in (("a", ya), ("b", yb)):
                 pl_[side + "_img"].update(t, y)
                 pl_[side + "_used"].update(t, np.where(used, y, np.nan))
-            masks = [m for m in (self._in_mask(e, snap, pts), self._in_mask(it["other"], snap, pts)) if m is not None]
+            masks = [m for m in (self._in_mask(e, snap, c["pts"]), self._in_mask(it["other"], snap, c["pts"]))
+                     if m is not None]
             in_mask = np.logical_or.reduce(masks) if masks else np.zeros(len(t), bool)
             pl_["mask"].update(t, np.where(in_mask, float(PROFILE_MASK_Y), np.nan))
             xr = [float(t[0]), float(t[-1]) if len(t) > 1 else float(t[0]) + 1.0]
             ch.x_range = xr
             ch.y_range = [0, 255]
             item = dict(e=e, other=it["other"], x0=it["x0"], d=it["d"], t=t, ya=ya, yb=yb, names=names,
-                        title=ch.title, ct=ct, curve=curve, mname=mname)
+                        title=ch.title, ct=c["ct"], curve=c["curve"], mname=mname)
             slot["item"] = mslot["item"] = item
-            item["mtitle"], item["mrange"] = self._fill_metric_chart(mslot, f"{names}   {mname} per point", ct,
-                                                                     curve, xr)
+            item["mtitle"], item["mrange"] = self._fill_metric_chart(
+                mslot, f"{names}   {mname} per point", c["ct"], c["curve"], xr, ranges[k])
         self._draw_hover()
 
-    def _fill_metric_chart(self, mslot: dict, title: str, t, curve, xr):
-        """Draw the per-point metric curve of one intersection (empty when there is none, e.g. NMI).
+    def _fill_metric_chart(self, mslot: dict, title: str, t, curve, xr, rng):
+        """Draw the per-point metric curve of one intersection on the fixed y range `rng` (the curve's
+        min / max over the history, padded; empty chart when there is no curve, e.g. NMI).
         Returns the chart title and its y range."""
         ch, p = mslot["chart"], mslot["plots"]
         nan2 = np.array([np.nan, np.nan])
@@ -2013,29 +2068,22 @@ class SliceViewer:
             ch.y_axis.tick_labels = ("", "")
             ch.title = title
             return title, (0.0, 1.0)
-        if self.metric == "ncc":
-            m = max(1.0, float(np.nanpercentile(np.abs(curve), 98)))
-            lo, hi = -m, m
-        elif self.metric == "lncc":
-            lo, hi = -1.0, 1.0
-        elif self.metric == "dice":
-            lo, hi = -0.05, 1.05
+        dmin, dmax = rng if rng is not None else (float(np.nanmin(curve)), float(np.nanmax(curve)))
+        span = dmax - dmin
+        pad = max(0.05 * span, 0.05)
+        lo, hi = dmin - pad, dmax + pad
+        dec = 2 if span < 2 else 1 if span < 20 else 0          # tick rounding stays inside the padding
+        if dmin < 0 < dmax:                                     # 0, plus the extremes not crowding it
+            ticks = tuple(v for v in (dmin, 0.0, dmax) if v == 0.0 or abs(v) > 0.2 * span)
         else:
-            lo, hi = 0.0, max(1.0, float(np.nanmax(curve)) * 1.05)
-        if self.metric == "dice":
-            ticks = (0.0, 0.5, 1.0)
-        elif self.metric == "hd":
-            ticks = (0.0, round(hi / 2.0, 1), round(hi / 1.05, 1))
-        else:
-            r = math.floor(hi * 10 + 1e-9) / 10                # inside the range (rounding up would hide it)
-            ticks = (-r, 0.0, r)
-        fmt = "{:.0f}" if self.metric == "hd" and hi > 10 else "{:.1f}"
+            ticks = (dmin, (dmin + dmax) / 2, dmax)
+        ticks = tuple(dict.fromkeys(round(v, dec) for v in ticks))
         p["curve"].update(t, curve)
-        p["zero"].update(np.array(xr, dtype=float), np.zeros(2) if lo < 0 else nan2)   # y = 0 for NCC / LNCC
+        p["zero"].update(np.array(xr, dtype=float), np.zeros(2) if lo < 0 < hi else nan2)
         ch.x_range = xr
         ch.y_range = [lo, hi]
         ch.y_axis.tick_locations = ticks
-        ch.y_axis.tick_labels = tuple(fmt.format(v) for v in ticks)
+        ch.y_axis.tick_labels = tuple(f"{v:.{dec}f}" for v in ticks)
         ch.title = title
         return title, (lo, hi)
 
@@ -2464,7 +2512,7 @@ class SliceViewer:
         add_row("Intersection profiles  [p]", self._on_profiles_toggle, self.show_profiles, "profiles")
         add_row("Metric profiles  [n]", self._on_metric_profiles_toggle, self.show_metric_profiles, "metric_profiles")
         if self.config is not None:
-            add_row("Profiles as in loss  [y]", self._on_psf_toggle, self.show_psf, "psf")
+            add_row("Apply PSF to profile  [y]", self._on_psf_toggle, self.show_psf, "psf")
             add_row("Image blurring  [g]", self._on_blur_toggle, self.show_blur, "blur")
         y -= 8
         if "SA" in self.data:
