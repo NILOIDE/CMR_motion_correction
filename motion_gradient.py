@@ -32,7 +32,8 @@ long axis, and --sax-sax-weight, a dissimilarity cost along their crossing line 
 cross.
 Optionally (--blur-sigma) the optimization is coarse-to-fine: the images are blurred in-plane at
 the start and the blur decays linearly to zero over the first --blur-frac of the steps; the best
-pose is only tracked on the remaining, unblurred steps. Optionally (--pair-keep < 1) each step
+pose is only tracked on the remaining, unblurred steps (--blur-frac 0: constant blur, tracked
+throughout). Optionally (--pair-keep < 1) each step
 drops a random subset of the intersection lines from the objective, which makes the optimization
 stochastic; the best pose is then tracked on the full objective evaluated every --eval-every steps.
 
@@ -43,11 +44,16 @@ Outputs go to <out-root>/<run-name>/ (default run name: the start time, then the
 so a rerun never writes into an earlier run). Always written:
   <subject>/
     SAX_slice<nn>.nii.gz, LAX_*.nii.gz, nnUNet_segs/   motion-corrected NIfTIs in the input layout: each
-                              slice's full cine as uint16 with its corrected affine; segmentations alongside.
-Only with --logging (otherwise nothing else is computed or written, which is the fastest mode):
+                              slice's full cine as uint16 with its corrected affine; segmentations alongside
+                              (not with --save-images false).
+Always:
   overall_metrics/
     run_config.json           every setting of the run
-    motion_summary.csv        one row per subject (append-only, latest row per subject wins)
+    sax_relative_motion.csv   estimated SAX motion relative to the other slices (see sax_relative_motion): one
+                              'slice' row per slice against the stack consensus, one 'pair' row per neighbouring pair
+Only with --logging (otherwise nothing else is computed or written, which is the fastest mode):
+  overall_metrics/
+    motion_summary.csv       one row per subject (append-only, latest row per subject wins)
     motion_summary_slices.csv one row per SAX slice / LAX view
     motion_summary_pairs.csv  one row per intersection-line pair (NCC, NMI, Dice, Hausdorff before/after; with
                               --sax-sax-weight also SAX-SAX rows: NCC, counting points and axis distance at the end)
@@ -57,7 +63,7 @@ Only with --logging (otherwise nothing else is computed or written, which is the
       summary.csv, slices.csv, pairs.csv  this subject's rows
       history.csv             pose snapshots every 2% of the run (step 0 = acquired geometry, and the
                               saved "best" pose with is_best=1): per plane the full 3x4 affine (a00..a23, same
-                              convention as the saved NIfTIs), the pose and NCC/NMI/Dice/Hausdorff
+                              convention as the saved NIfTIs), the pose and NCC/LNCC/NMI/Dice/Hausdorff
       history_summary.csv     the same snapshots, one row per step with the objective and subject-level metrics
       lines.csv               every intersection line entering the loss (acquired geometry): the two planes, the
                               anchor point x0 and unit direction d (world, mm) and the parameter ranges along the
@@ -93,6 +99,7 @@ rotation about in-plane axes (weakly constrained, treat with caution).
 import argparse
 import csv
 import math
+import re
 import sys
 import time
 import traceback
@@ -913,7 +920,9 @@ class LineSampler:
         nan = torch.full((self.M,), float("nan"), device=self.device)
         img = self.profiles(theta_deg, t, "img")
         seg = self.profiles(theta_deg, t, "seg") if has_seg else None
+        k_lncc = max(3, int(round(getattr(args, "lncc_window_mm", 20.0) / args.line_step_mm)))
         out = dict(ncc=self.ncc_lines(theta_deg, t, args.metric == "ncc_grad", img),
+                   lncc=lncc_similarity(img[0], img[1], self.W, k_lncc, getattr(args, "lncc_min_std", 0.25)),
                    nmi=self.nmi_lines(theta_deg, t, args.nmi_bins, args.nmi_sigma, img),
                    dice=self.dice_lines(theta_deg, t, labels, labels_sax, seg) if has_seg else nan,
                    hd=self.hd_lines(theta_deg, t, labels, labels_sax, getattr(args, "hd_miss_mm", 100.0), seg) if has_seg else nan)
@@ -1387,7 +1396,8 @@ def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]
         return start + (end - start) * min(1.0, step / max(1, args.steps - 1))        # linear start -> end
 
     blur_sigma = getattr(args, "blur_sigma", 0.0)
-    blur_steps = int(round(getattr(args, "blur_frac", 0.6) * args.steps)) if blur_sigma > 0 else 0
+    blur_const = blur_sigma > 0 and getattr(args, "blur_frac", 0.6) <= 0      # --blur-frac 0: no decay
+    blur_steps = int(round(getattr(args, "blur_frac", 0.6) * args.steps)) if blur_sigma > 0 and not blur_const else 0
     blur_quantum = 0.2                                     # mm; the blur is only recomputed when sigma moves this much
     psf_s0 = getattr(args, "psf_scale_start", 1.0)
     psf_steps = int(round(getattr(args, "psf_anneal_frac", 0.6) * args.steps)) if psf_s0 > 1.0 else 0
@@ -1468,7 +1478,7 @@ def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]
             if step in snap_steps:
                 snapshots.append((step, theta_deg.detach().clone(), t.detach().clone()))
             smp = sampler_at(step)
-            sigma = blur_sigma * max(0.0, 1.0 - step / blur_steps) if step < blur_steps else 0.0
+            sigma = blur_sigma if blur_const else blur_sigma * max(0.0, 1.0 - step / blur_steps) if step < blur_steps else 0.0
             smp.set_blur(math.ceil(sigma / blur_quantum) * blur_quantum if sigma > 0 else 0.0)
             smp.set_psf_scale(psf_s0 + (1.0 - psf_s0) * step / psf_steps if step < psf_steps else 1.0)
             lr_t.fill_(lr_at(step, args.lr, args.lr_end))
@@ -1487,18 +1497,19 @@ def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]
             else:
                 track_buf.fill_(1.0 if nominal else 0.0)
             run_step(smp)
-    for _, smp in stages:
-        smp.set_blur(0.0)
-        smp.set_psf_scale(1.0)
     if args.steps in snap_steps:
         snapshots.append((args.steps, theta_deg.detach().clone(), t.detach().clone()))
     with torch.no_grad():
-        # the final parameters are also a candidate; they are the only one when an annealing schedule (e.g.
-        # --psf-anneal-frac > 1) outlasts the run, as nothing was tracked then
+        # the final parameters are also a candidate (scored with the blur / PSF of the last step, so that a constant
+        # --blur-frac 0 blur is comparable to the tracked steps); they are the only one when an annealing schedule
+        # (e.g. --psf-anneal-frac > 1) outlasts the run, as nothing was tracked then
         if (stochastic and track_from <= args.steps) or track_from >= args.steps:
             step_buf.fill_(float(args.steps))
             track_buf.fill_(1.0)
             update_best(objective(theta_deg, t))
+    for _, smp in stages:
+        smp.set_blur(0.0)
+        smp.set_psf_scale(1.0)
     return dict(theta_deg=best_th.clone(), t=best_t.clone(), best_step=int(best_step.item()), snapshots=snapshots)
 
 
@@ -1520,8 +1531,9 @@ def base_affine(data: dict, plane: Plane) -> np.ndarray:
 AFFINE_COLUMNS = [f"a{r}{c}" for r in range(3) for c in range(4)]
 HISTORY_COLUMNS = (["subject_id", "step", "fraction", "is_best", "image", "slice"] + AFFINE_COLUMNS
                    + ["dx_mm", "dy_mm", "dz_mm", "rot_x_deg", "rot_y_deg", "rot_z_deg", "rot_inplane_deg", "rot_tilt_deg",
-                      "ncc", "nmi", "seg_dice", "hd_mm"])
-HISTORY_STEP_COLUMNS = ["subject_id", "step", "fraction", "is_best", "objective", "ncc_mean", "nmi_mean", "seg_dice_mean",
+                      "ncc", "lncc", "nmi", "seg_dice", "hd_mm"])
+HISTORY_STEP_COLUMNS = ["subject_id", "step", "fraction", "is_best", "objective", "ncc_mean", "lncc_mean", "nmi_mean",
+                        "seg_dice_mean",
                         "hd_mean_mm", "hd_max_mm", "sax_shift_rms_mm", "sax_shift_jitter_mm", "sax_dz_rms_mm", "sax_tilt_rms_deg"]
 SAX_LINE_COLUMNS = ["subject_id", "step", "fraction", "is_best", "image_a", "slice_a", "image_b", "slice_b", "kind",
                     "crossing", "n_points", "supervised", "axis_dist_mm", "ncc", "dissim", "gap_min_mm", "rel_tilt_deg",
@@ -1554,9 +1566,10 @@ def build_history(sid, data, planes, n_pairs, sampler, snapshots, best_step, lax
         with torch.no_grad():
             # the optimized similarity on the mask points
             sim = (lm["nmi"] if args.metric == "nmi" else lm["ncc"] if args.metric == "ncc"
-                   else sampler.similarity_lines(th, tt, args, W=sampler.W))
+                   else lm["lncc"] if args.metric == "lncc" else sampler.similarity_lines(th, tt, args, W=sampler.W))
             objective = float(similarity_objective(sampler, th, tt, args, sim=sim))
-        per = {k: (sampler.per_plane_max if k == "hd" else sampler.per_plane)(lm[k]) for k in ("ncc", "nmi", "dice", "hd")}
+        per = {k: (sampler.per_plane_max if k == "hd" else sampler.per_plane)(lm[k])
+               for k in ("ncc", "lncc", "nmi", "dice", "hd")}
         theta = th.detach().cpu().numpy().astype(np.float64)
         t_rel = relative_translation(tt, lax_rows)
         Rs = rotation_matrices(theta)
@@ -1573,14 +1586,16 @@ def build_history(sid, data, planes, n_pairs, sampler, snapshots, best_step, lax
                                    **{c: float(A[int(c[1]), int(c[2])]) for c in AFFINE_COLUMNS},
                                    dx_mm=dx, dy_mm=dy, dz_mm=dz, rot_x_deg=float(theta[i, 0]), rot_y_deg=float(theta[i, 1]),
                                    rot_z_deg=float(theta[i, 2]), rot_inplane_deg=inplane, rot_tilt_deg=tilt,
-                                   ncc=per["ncc"][i] if n_pairs[i] else nan, nmi=per["nmi"][i] if n_pairs[i] else nan,
+                                   ncc=per["ncc"][i] if n_pairs[i] else nan, lncc=per["lncc"][i] if n_pairs[i] else nan,
+                                   nmi=per["nmi"][i] if n_pairs[i] else nan,
                                    seg_dice=per["dice"][i] if n_pairs[i] else nan, hd_mm=per["hd"][i] if n_pairs[i] else nan))
         vec = np.array(sax_vec).reshape(-1, 2)
         ok = lambda x: np.asarray(x, dtype=float)[np.isfinite(np.asarray(x, dtype=float))]  # noqa: E731
         hd_lines = ok(lm["hd"].cpu().numpy())
         step_rows.append(dict(
             subject_id=sid, step=step_no, fraction=step_no / args.steps, is_best=int(is_best), objective=objective,
-            ncc_mean=float(np.nanmean(per["ncc"])), nmi_mean=float(np.nanmean(per["nmi"])),
+            ncc_mean=float(np.nanmean(per["ncc"])), lncc_mean=float(np.nanmean(per["lncc"])),
+            nmi_mean=float(np.nanmean(per["nmi"])),
             seg_dice_mean=float(np.nanmean(per["dice"])) if np.isfinite(per["dice"]).any() else nan,
             hd_mean_mm=float(hd_lines.mean()) if hd_lines.size else nan, hd_max_mm=float(hd_lines.max()) if hd_lines.size else nan,
             sax_shift_rms_mm=float(np.sqrt((vec ** 2).sum(1).mean())) if len(vec) else nan,
@@ -1634,7 +1649,7 @@ def process_subject(data: dict, args, device, on_lines=None) -> tuple:
 
     `on_lines(planes, lines)` is called once the intersection lines are known, before alignment.
     Without args.logging only the poses are computed: no metrics are evaluated, the segmentations stay off the GPU and
-    the summary / per-plane / per-pair rows and the history are None / empty.
+    the summary / per-pair rows and the history are None / empty (the per-plane rows only hold n_pairs).
     """
     sid = data["subject_id"]
     nan = float("nan")
@@ -1664,7 +1679,8 @@ def process_subject(data: dict, args, device, on_lines=None) -> tuple:
             theta = result["theta_deg"].cpu().numpy().astype(np.float64)
             t_rel = relative_translation(result["t"], [i for i, p in enumerate(planes) if p.image != "SAX" and n_pairs[i] > 0])
         Rs = rotation_matrices(theta)
-        return None, [], [], [(p, Rs[i], t_rel[i]) for i, p in enumerate(planes)], None
+        details = [dict(subject_id=sid, image=p.image, slice=p.slice_idx, n_pairs=n_pairs[i]) for i, p in enumerate(planes)]
+        return None, details, [], [(p, Rs[i], t_rel[i]) for i, p in enumerate(planes)], None
 
     metric_names = ("ncc", "nmi", "dice", "hd")
     plane_m = {f"{k}_{s}": [nan] * N for k in metric_names for s in ("zero", "final")}
@@ -1786,6 +1802,50 @@ def process_subject(data: dict, args, device, on_lines=None) -> tuple:
     return summary, details, pairs, poses, history
 
 
+RELMOTION_COLUMNS = ["subject_id", "kind", "slice_a", "slice_b", "n_pairs", "dx_mm", "dy_mm", "dz_mm",
+                     "shift_inplane_mm", "shift_mm", "rot_inplane_deg", "rot_tilt_deg", "rot_deg"]
+
+
+def sax_relative_motion(sid: str, poses: list, n_pairs: list[int]) -> list[dict]:
+    """Estimated SAX motion relative to the other slices (independent of any motion the whole stack shares, e.g. a
+    misplaced LAX reference). Pose i maps x -> R_i (x - c_i) + c_i + t_i (c_i: the slice's rotation centre).
+
+    kind 'slice' (slice_a): the slice against the stack consensus -- at the slice's centre, the median over all
+      evaluated slices j of the displacement pose j would give it; rotation against the median rotation.
+    kind 'pair' (slice_a, slice_b = a + 1): slice b's pose relative to slice a's, T_a^-1 T_b, at b's centre.
+    Translations are split in the frame of the slice concerned (dx, dy in-plane along its rows / columns, dz along
+    its normal); rotations into in-plane (about the normal, signed) and tilt. Slices without intersection lines
+    (pose not estimated) are left out.
+    """
+    from scipy.spatial.transform import Rotation
+    sax = sorted((p.slice_idx, p, np.asarray(R, float), np.asarray(t, float), n_pairs[i])
+                 for i, (p, R, t) in enumerate(poses) if p.image == "SAX" and n_pairs[i] > 0)
+    rows = []
+    if not sax:
+        return rows
+
+    def row(kind, a, b, p, npairs, d, R):
+        rv = np.degrees(Rotation.from_matrix(R).as_rotvec())
+        dx, dy, dz = float(d @ p.u_hat), float(d @ p.v_hat), float(d @ p.normal)
+        inplane = float(rv @ p.normal)
+        return dict(subject_id=sid, kind=kind, slice_a=a, slice_b=b, n_pairs=npairs, dx_mm=dx, dy_mm=dy, dz_mm=dz,
+                    shift_inplane_mm=math.hypot(dx, dy), shift_mm=float(np.linalg.norm(d)), rot_inplane_deg=inplane,
+                    rot_tilt_deg=float(np.linalg.norm(rv - inplane * p.normal)), rot_deg=float(np.linalg.norm(rv)))
+
+    C = [p.rot_centre.astype(float) for _, p, _, _, _ in sax]
+    rotvecs = Rotation.from_matrix(np.stack([R for _, _, R, _, _ in sax])).as_rotvec()
+    R_med = Rotation.from_rotvec(np.median(rotvecs, 0)).as_matrix()
+    for i, (z, p, R, t, npairs) in enumerate(sax):
+        pred = np.median([Rj @ (C[i] - C[j]) + C[j] + tj - C[i] for j, (_, _, Rj, tj, _) in enumerate(sax)], 0)
+        rows.append(row("slice", z, float("nan"), p, npairs, t - pred, R_med.T @ R))
+    for (za, pa, Ra, ta, _), (zb, pb, Rb, tb, nb), ca, cb in zip(sax, sax[1:], C, C[1:]):
+        if zb != za + 1:
+            continue
+        moved = Ra.T @ (Rb @ (cb - cb) + cb + tb - ca - ta) + ca          # T_a^-1 T_b applied to b's centre
+        rows.append(row("pair", za, zb, pb, nb, moved - cb, Ra.T @ Rb))
+    return rows
+
+
 def empty_summary(sid: str, status: str) -> dict:
     row = {c: float("nan") for c in SUMMARY_COLUMNS}
     row.update(subject_id=sid, status=status, n_lax_views=0, sax_n_slices=0, sax_n_eval=0, n_line_pairs=0, steps=0)
@@ -1805,15 +1865,25 @@ def corrected_affine(affine: np.ndarray, plane: Plane, R: np.ndarray, t: np.ndar
     return A
 
 
-def write_nifti(vol: np.ndarray, affine: np.ndarray, header: nib.Nifti1Header, path: Path, dtype) -> None:
+def write_nifti(vol: np.ndarray, affine: np.ndarray, header: nib.Nifti1Header, path: Path, dtype,
+                descrip: str | None = None) -> None:
     if np.issubdtype(dtype, np.unsignedinteger):
         vol = np.clip(np.rint(vol), 0, np.iinfo(dtype).max)
     img = nib.Nifti1Image(np.ascontiguousarray(vol).astype(dtype), affine, header=header)
     img.set_data_dtype(dtype)
     img.header.set_slope_inter(None, None)
+    if descrip is not None:
+        img.header["descrip"] = descrip.encode()[:79]
     img.set_qform(affine, code=1)
     img.set_sform(affine, code=1)
     nib.save(img, str(path))
+
+
+def uint8_clip_value(path) -> float | None:
+    """Clip value of an image saved with --image-dtype uint8 (original intensity = value * clip / 255), else None."""
+    d = nib.load(str(path)).header["descrip"].item().decode(errors="ignore")
+    m = re.search(r"uint8 clip=([0-9.eE+-]+)", d)
+    return float(m.group(1)) if m else None
 
 
 def aligned_complete(subj_in: Path, subj_out: Path) -> bool:
@@ -1835,13 +1905,23 @@ def save_aligned(data: dict, poses: list[tuple[Plane, np.ndarray, np.ndarray]], 
     (SAX_slice<nn>.nii.gz, LAX_*.nii.gz, nnUNet_segs/<stem>_nnUNetSeg.nii.gz)."""
     out = run_dir / data["subject_id"]
     (out / SEG_DIR).mkdir(parents=True, exist_ok=True)
+    dtype, scale, descrip = np.uint16, 1.0, None
+    if getattr(args, "image_dtype", "uint16") == "uint8":
+        # one scale per subject (SAX and LAX share it): clip at --uint8-percentile of all its slices and frames
+        vols = [data["full"][p.key][0] for p, _, _ in poses if p.key in data["full"]]
+        clip = float(np.percentile(np.concatenate([np.asarray(v, np.float32).ravel() for v in vols]),
+                                   args.uint8_percentile)) if vols else 0.0
+        dtype, scale = np.uint8, 255.0 / max(clip, 1e-6)
+        # header descrip: original intensity = value * clip / 255 (below the clip); read with uint8_clip_value()
+        descrip = f"uint8 clip={clip:.6g} pct={args.uint8_percentile:g} orig=v*clip/255"
     for plane, R, t in poses:
         if plane.key not in data["full"]:
             continue
         arr, affine, header = data["full"][plane.key]
         A = corrected_affine(affine, plane, R, t)
         stem = f"SAX_slice{plane.slice_idx:02d}" if plane.image == "SAX" else plane.image
-        write_nifti(arr, A, header, out / f"{stem}.nii.gz", np.uint16)
+        write_nifti(arr if dtype is np.uint16 else np.asarray(arr, np.float32) * scale, A, header,
+                    out / f"{stem}.nii.gz", dtype, descrip)   # uint8: clipped to [0, 255] in write_nifti
         if plane.key in data["full_seg"]:
             seg, seg_header = data["full_seg"][plane.key]
             write_nifti(seg, A, seg_header, out / SEG_DIR / f"{stem}_nnUNetSeg.nii.gz", np.uint8)
@@ -2531,6 +2611,7 @@ def str2bool(s: str) -> bool:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    # ###################    DATA INPUT AND OUTPUT PARAMS    #############################
     ap.add_argument("--root", type=Path, default=Path(r"C:\Users\Nil\Documents\data\ukbb_slices"),
                     help="Directory containing one folder per subject with single-slice NIfTIs (see prepare_ukbb_slices.py)")
     ap.add_argument("--out-root", type=Path, default=Path(r"C:\Users\Nil\Documents\data\ukbb_alignment"), help="Parent of the run directory")
@@ -2538,16 +2619,31 @@ def main():
                     help="Run directory name, used as given (pass an existing run's name to add to or resume it, e.g. with "
                          "--skip-processed). Default: the start time followed by the settings given on the command line, "
                          "e.g. 20261025-143012_steps1000-lr25-optimizersgd-..., so every run gets a new directory")
-    ap.add_argument("--logging", type=str2bool, default=True, metavar="BOOL",
-                    help="true (default): write everything besides the aligned NIfTIs: the pose/metric history during "
-                         f"optimization (every {HISTORY_EVERY:g} of the run), per-subject CSVs and figures (metrics/), "
-                         "cohort-wide CSVs and figures (overall_metrics/) and run_config.json. false: only the "
-                         "motion-corrected NIfTIs are written and no metrics are computed (fastest).")
     ap.add_argument("--max-subjects", type=int, default=-1, help="Max number of subjects to evaluate (-1 = all)")
     ap.add_argument("--skip-processed", action="store_true",
                     help="Skip subjects whose aligned NIfTIs are already complete in the run directory (to resume a run, "
                          "pass its directory name with --run-name; a default name is always new)")
     ap.add_argument("--n-frames", type=int, default=10, help="Number of cardiac phases (evenly spaced) to use")
+    ap.add_argument("--logging", type=str2bool, default=True, metavar="BOOL",
+                    help="true (default): write everything besides the aligned NIfTIs: the pose/metric history during "
+                         f"optimization (every {HISTORY_EVERY:g} of the run), per-subject CSVs and figures (metrics/), "
+                         "cohort-wide CSVs and figures (overall_metrics/) and run_config.json. false: only the "
+                         "motion-corrected NIfTIs are written and no metrics are computed (fastest). "
+                         "overall_metrics/sax_relative_motion.csv and run_config.json are written either way.")
+    ap.add_argument("--save-images", type=str2bool, default=True, metavar="BOOL",
+                    help="false: do not write the motion-corrected NIfTIs (e.g. to only estimate the motion of a cohort "
+                         "with --logging false: then just sax_relative_motion.csv is written)")
+    ap.add_argument("--image-dtype", choices=["uint16", "uint8"], default="uint16",
+                    help="Data type of the saved images. uint16: the acquired intensities unchanged. uint8: ~30%% less disk "
+                         "space per subject (measured: 29 -> 21 MB for one subject incl. segmentations; not half, as the "
+                         "NIfTIs are gzip-compressed and the segmentations are unchanged); per subject, intensities are clipped at --uint8-percentile of all its SAX and LAX "
+                         "slices and frames and scaled to [0, 255] (one scale for the whole subject, so SAX and LAX "
+                         "contrast stay comparable). Segmentations are always uint8 labels")
+    ap.add_argument("--uint8-percentile", type=float, default=99.9,
+                    help="Clip percentile for --image-dtype uint8. On this cohort the max is ~1.25x the 99.9th "
+                         "percentile (a few bright pixels), so 99.9 clips 0.1%% of the voxels")
+
+    # ###################    OPTIMIZER PARAMS    #########################################
     ap.add_argument("--steps", type=int, default=600, help="Optimizer steps")
     ap.add_argument("--optimizer", choices=OPTIMIZERS, default="sgd",
                     help="adam: the default. nadam: Adam with Nesterov momentum (looks ahead, often a little faster). "
@@ -2571,13 +2667,12 @@ def main():
                     help="linear: decay each learning rate linearly from its start value to its end value; constant: no decay")
     ap.add_argument("--lr-end", type=float, default=0.0, help="Final translation learning rate for the linear schedule")
     ap.add_argument("--rot-lr-end", type=float, default=0.0, help="Final rotation learning rate for the linear schedule")
-    ap.add_argument("--blur-sigma", type=float, default=6.0,
-                    help="Coarse-to-fine: initial in-plane Gaussian sigma (mm) of the images, decayed linearly to 0 (0 = off)")
-    ap.add_argument("--blur-frac", type=float, default=0.9, help="Fraction of the steps over which the blur decays to 0")
     ap.add_argument("--pair-keep", type=float, default=0.8,
                     help="Stochastic optimization: fraction of intersection lines kept at each step (1 = deterministic)")
     ap.add_argument("--eval-every", type=int, default=10, help="With --pair-keep < 1: evaluate the full objective every N steps to track the best pose")
     ap.add_argument("--seed", type=int, default=0, help="Seed for the line dropping")
+
+    # ###################    POSE MODEL PARAMS    ########################################
     ap.add_argument("--dof", type=int, choices=[3, 6], default=6, help="3 = translation only, 6 = rigid (translation + rotation)")
     ap.add_argument("--rotation-pivot", choices=["long-axis", "image-centre"], default="long-axis",
                     help="Point each plane's pose rotates about. long-axis: on the LV long axis (the crossing line of the "
@@ -2586,6 +2681,105 @@ def main():
                          "translation is the heart's displacement (decoupled). image-centre: the centre of the pixel grid "
                          "(the earlier behaviour; a rotation then also moves the heart, entangling it with the "
                          "translation). The reported dx/dy/dz are the displacement of this point. Default: %(default)s")
+
+    # ###################    SIMILARITY METRIC PARAMS    #################################
+    ap.add_argument("--metric", choices=["ncc", "ncc_grad", "lncc", "ngf", "nmi", "l1", "l2"], default="lncc",
+                    help="Optimized similarity along each line. ncc: normalized cross-correlation (one high-contrast edge can "
+                         "carry most of the score). ncc_grad: NCC of the profiles' 1D gradients. lncc: local NCC in windows "
+                         "of --lncc-window-mm sliding along the line, averaged (every stretch has to match on its own; "
+                         "flat windows fade out, --lncc-min-std). ngf: normalized gradient agreement -- per-point "
+                         "normalized gradients, so every edge counts about equally whatever its contrast (--grad-eps), "
+                         "in [-1, 1]. nmi: normalized mutual information. l1 / l2: negative mean absolute / squared "
+                         "intensity difference, every image first rescaled so its 1st/99th percentiles map to 0/1 (the "
+                         "SAX slices with one common scale). Default: %(default)s")
+    ap.add_argument("--lncc-window-mm", type=float, default=20.0, help="--metric lncc: window length (mm). Default: %(default)s")
+    ap.add_argument("--lncc-min-std", type=float, default=0.25,
+                    help="--metric lncc: windows whose profiles vary less than this (geometric mean of both standard "
+                         "deviations, in units of the profile's standard deviation over the line) are faded out "
+                         "(weight sd / this). Default: %(default)s")
+    ap.add_argument("--grad-eps", type=float, default=0.5,
+                    help="--metric ngf: edge threshold, in standard deviations of the profile's gradient along the line; "
+                         "gradients well above it count as full edges, those below it fade out. Default: %(default)s")
+    ap.add_argument("--nmi-bins", type=int, default=24, help="Histogram bins for mutual information")
+    ap.add_argument("--nmi-sigma", type=float, default=1.0, help="Parzen window width for mutual information, in bins")
+
+    # ###################    COARSE-TO-FINE (BLUR) PARAMS    #############################
+    ap.add_argument("--blur-sigma", type=float, default=6.0,
+                    help="Coarse-to-fine: initial in-plane Gaussian sigma (mm) of the images, decayed linearly to 0 (0 = off)")
+    ap.add_argument("--blur-frac", type=float, default=1.5,
+                    help="Fraction of the steps over which the blur decays to 0 (> 1: it never reaches 0); 0 = no decay, "
+                         "the blur stays at --blur-sigma for the whole run")
+
+    # ###################    INTERSECTION LINE AND MASK PARAMS    ########################
+    ap.add_argument("--line-step-mm", type=float, default=1.8,
+                    help="Spacing (mm) between samples along each intersection line. Default: %(default)s")
+    ap.add_argument("--line-extent-mm", type=float, default=160.0,
+                    help="Half-length (mm) of each intersection line: samples run from -extent to +extent around a "
+                         "point near the plane centre, then are clipped to the images and the mask. Default: %(default)s")
+    ap.add_argument("--min-line-mm", type=float, default=40.0,
+                    help="An intersection line is dropped if fewer than this many mm of it lie inside both images and "
+                         "the mask. Default: %(default)s")
+    ap.add_argument("--mask-dilation-mm", type=float, default=40.0,
+                    help="How far (mm) the LAX heart segmentation is grown to form the mask; only intersection-line points "
+                         "inside this mask enter the loss (see --outside-mask-weight). This is also the final value when "
+                         "mask annealing is on. Default: %(default)s")
+    ap.add_argument("--outside-mask-weight", type=float, default=0.0,
+                    help="Loss weight of intersection-line points outside the dilated mask (points inside it weigh 1). "
+                         "0 = they are excluded (default); e.g. 0.1 = the lines run through the whole image overlap and "
+                         "the points outside the mask count 10x less. Which lines are kept (--min-line-mm), the line "
+                         "weights and all reported metrics still use the mask points only. Default: %(default)s")
+    ap.add_argument("--mask-dilation-start-mm", type=float, default=80,
+                    help="Mask annealing (off unless given). The dilation (mm) used at the start of the run; it then "
+                         "shrinks linearly to --mask-dilation-mm over the first --mask-anneal-frac of the run. "
+                         "Example: '--mask-dilation-start-mm 40 --mask-dilation-mm 25' starts with a 40 mm mask and "
+                         "ends at 25 mm.")
+    ap.add_argument("--mask-anneal-frac", type=float, default=0.8,
+                    help="Fraction of the run (0-1) over which the mask dilation goes from --mask-dilation-start-mm to "
+                         "--mask-dilation-mm. Default: %(default)s")
+    ap.add_argument("--anneal-stages", type=int, default=6,
+                    help="Mask annealing does not change every step: the dilation advances this many times along its "
+                         "linear ramp, and the lines are rebuilt each time. Once it has finished, the final dilation is "
+                         "used for the rest of the run and the best pose is chosen only from that part. "
+                         "Default: %(default)s")
+
+    # ###################    SLICE PROFILE (PSF) PARAMS    ###############################
+    ap.add_argument("--sax-thickness", type=float, default=8.0,
+                    help="SAX slice thickness in mm. The NIfTI header only stores the slice spacing (10 mm = 8 mm slice "
+                         "+ 2 mm gap in the UK Biobank protocol). Default: %(default)s")
+    ap.add_argument("--lax-thickness", type=float, default=6.0,
+                    help="LAX slice thickness in mm (UK Biobank protocol: 6 mm; the header's 7.5 mm is the spacing). "
+                         "Default: %(default)s")
+    ap.add_argument("--n-band", type=int, default=8,
+                    help="PSF approximation: when sampling one image along an intersection line, this many points are "
+                         "taken across the other slice's through-plane profile (see --psf-model) and combined with the "
+                         "profile as weights; the band is widened by 1/sin of the crossing angle. 1 = sample the line "
+                         "only. Default: %(default)s")
+    ap.add_argument("--psf-model", choices=["pulse", "gaussian", "rect"], default="pulse",
+                    help="Shape of a slice's through-plane excitation profile, with FWHM = the nominal slice thickness. "
+                         "'pulse': the profile of a slice-selective RF pulse of finite time-bandwidth product "
+                         "(--psf-tbw) -- a rectangle of the nominal thickness with smoothed edges, sampled out to where "
+                         "the profile vanishes; 'gaussian': a Gaussian (sampled to +-2 sigma); 'rect': an ideal box. "
+                         "Default: %(default)s")
+    ap.add_argument("--psf-tbw", type=float, default=2.5,
+                    help="Time-bandwidth product of the slice-selective RF pulse for --psf-model pulse. It sets the "
+                         "edge sharpness: the 10-90%% transition width is about thickness / TBW. Short bSSFP pulses "
+                         "(TR ~2.7 ms as in UK Biobank) have TBW of roughly 2-3; the exact vendor pulse is not "
+                         "published. Default: %(default)s")
+    ap.add_argument("--psf-scale-start", type=float, default=3.0,
+                    help="PSF annealing (off at 1). The PSF band (through-plane slice profile, see --psf-model) starts "
+                         "this many times wider than physical and shrinks linearly to the physical width over the first "
+                         "--psf-anneal-frac of the run. Unlike --blur-sigma (isotropic in-plane blur of both images), "
+                         "this smooths each image only perpendicular to each intersection line. More band samples are "
+                         "used so the nominal density of --n-band is kept. Default: %(default)s")
+    ap.add_argument("--psf-anneal-frac", type=float, default=0.9,
+                    help="Fraction of the run over which --psf-scale-start decays to 1. Default: %(default)s")
+    ap.add_argument("--no-psf", action="store_true",
+                    help="Disable the PSF model: each image is sampled (bilinearly) only at the intersection-line points "
+                         "themselves, i.e. its raw intensities, with no band across the other slice's profile. Overrides "
+                         "--n-band (set to 1) and --psf-scale-start (set to 1, no PSF annealing); --psf-model and "
+                         "--psf-tbw have no effect. In-plane --blur-sigma annealing still applies if set.")
+
+    # ###################    POSE REGULARIZATION PARAMS    ###############################
     ap.add_argument("--gauge", type=float, default=1e-2, help="Penalty weight on the mean pose (removes global drift)")
     ap.add_argument("--prior", type=float, default=0.0, help="Penalty weight on rotation (deg^2) and through-plane shift (mm^2)")
     ap.add_argument("--tilt-prior", type=float, default=0.0,
@@ -2600,6 +2794,8 @@ def main():
     ap.add_argument("--tilt-hinge-deg", type=float, default=5.0,
                     help="Tilt (deg) allowed without cost: the relative tilt of adjacent SAX slices for --tilt-hinge-reg, "
                          "and each plane's own tilt for --tilt-prior. Default: %(default)s")
+
+    # ###################    SAX STACK REGULARIZATION PARAMS    ##########################
     ap.add_argument("--spacing-reg", type=float, default=0.0,
                     help="Penalty weight on (distance - --sax-spacing-mm)^2 (mm^2) of adjacent SAX slices, the distance "
                          "between their centres measured along their mean normal, in the acquired stacking direction; "
@@ -2615,6 +2811,8 @@ def main():
                     help="Penalty weight on the relative in-plane rotation (about the normal) of adjacent SAX slices "
                          "(~deg^2), so a rotated slice pulls its neighbours' rotation along. The relative tilt is "
                          "--tilt-hinge-reg. Mean over adjacent pairs (0 = off)")
+
+    # ###################    SAX-SAX INTERACTION PARAMS    ###############################
     ap.add_argument("--sax-gap-reg", type=float, default=0.0,
                     help="Barrier keeping adjacent SAX slices from approaching or crossing each other inside the heart: "
                          "on a disk of --sax-gap-radius-mm around the LV long axis (the crossing line of the two most "
@@ -2645,99 +2843,19 @@ def main():
                          "gaussian: its sigma (mm); "
                          "threshold: the radius (mm) around the long axis. Also "
                          "the extent of the 'used' part of the lines in sax_lines.csv. Default: %(default)s")
+
+    # ###################    EVALUATION METRIC PARAMS (REPORTING ONLY)    ################
     ap.add_argument("--seg-labels", type=str, default="1,2,3,4,5", help="Labels compared along LAX-LAX intersections")
     ap.add_argument("--sax-seg-labels", type=str, default="1,2,3", help="Labels compared along SAX-LAX intersections")
     ap.add_argument("--hd-miss-mm", type=float, default=100.0,
                     help="Hausdorff value (mm) when both planes contain a label but only one intersection profile hits it")
-    ap.add_argument("--mask-dilation-mm", type=float, default=40.0,
-                    help="How far (mm) the LAX heart segmentation is grown to form the mask; only intersection-line points "
-                         "inside this mask enter the loss (see --outside-mask-weight). This is also the final value when "
-                         "mask annealing is on. Default: %(default)s")
-    ap.add_argument("--outside-mask-weight", type=float, default=0.0,
-                    help="Loss weight of intersection-line points outside the dilated mask (points inside it weigh 1). "
-                         "0 = they are excluded (default); e.g. 0.1 = the lines run through the whole image overlap and "
-                         "the points outside the mask count 10x less. Which lines are kept (--min-line-mm), the line "
-                         "weights and all reported metrics still use the mask points only. Default: %(default)s")
-    ap.add_argument("--mask-dilation-start-mm", type=float, default=None,
-                    help="Mask annealing (off unless given). The dilation (mm) used at the start of the run; it then "
-                         "shrinks linearly to --mask-dilation-mm over the first --mask-anneal-frac of the run. "
-                         "Example: '--mask-dilation-start-mm 40 --mask-dilation-mm 25' starts with a 40 mm mask and "
-                         "ends at 25 mm.")
-    ap.add_argument("--mask-anneal-frac", type=float, default=0.8,
-                    help="Fraction of the run (0-1) over which the mask dilation goes from --mask-dilation-start-mm to "
-                         "--mask-dilation-mm. Default: %(default)s")
-    ap.add_argument("--anneal-stages", type=int, default=6,
-                    help="Mask annealing does not change every step: the dilation advances this many times along its "
-                         "linear ramp, and the lines are rebuilt each time. Once it has finished, the final dilation is "
-                         "used for the rest of the run and the best pose is chosen only from that part. "
-                         "Default: %(default)s")
-    ap.add_argument("--line-step-mm", type=float, default=1.8,
-                    help="Spacing (mm) between samples along each intersection line. Default: %(default)s")
-    ap.add_argument("--line-extent-mm", type=float, default=160.0,
-                    help="Half-length (mm) of each intersection line: samples run from -extent to +extent around a "
-                         "point near the plane centre, then are clipped to the images and the mask. Default: %(default)s")
-    ap.add_argument("--min-line-mm", type=float, default=40.0,
-                    help="An intersection line is dropped if fewer than this many mm of it lie inside both images and "
-                         "the mask. Default: %(default)s")
-    ap.add_argument("--sax-thickness", type=float, default=8.0,
-                    help="SAX slice thickness in mm. The NIfTI header only stores the slice spacing (10 mm = 8 mm slice "
-                         "+ 2 mm gap in the UK Biobank protocol). Default: %(default)s")
-    ap.add_argument("--lax-thickness", type=float, default=6.0,
-                    help="LAX slice thickness in mm (UK Biobank protocol: 6 mm; the header's 7.5 mm is the spacing). "
-                         "Default: %(default)s")
-    ap.add_argument("--n-band", type=int, default=8,
-                    help="PSF approximation: when sampling one image along an intersection line, this many points are "
-                         "taken across the other slice's through-plane profile (see --psf-model) and combined with the "
-                         "profile as weights; the band is widened by 1/sin of the crossing angle. 1 = sample the line "
-                         "only. Default: %(default)s")
-    ap.add_argument("--psf-model", choices=["pulse", "gaussian", "rect"], default="pulse",
-                    help="Shape of a slice's through-plane excitation profile, with FWHM = the nominal slice thickness. "
-                         "'pulse': the profile of a slice-selective RF pulse of finite time-bandwidth product "
-                         "(--psf-tbw) -- a rectangle of the nominal thickness with smoothed edges, sampled out to where "
-                         "the profile vanishes; 'gaussian': a Gaussian (sampled to +-2 sigma); 'rect': an ideal box. "
-                         "Default: %(default)s")
-    ap.add_argument("--psf-scale-start", type=float, default=3.0,
-                    help="PSF annealing (off at 1). The PSF band (through-plane slice profile, see --psf-model) starts "
-                         "this many times wider than physical and shrinks linearly to the physical width over the first "
-                         "--psf-anneal-frac of the run. Unlike --blur-sigma (isotropic in-plane blur of both images), "
-                         "this smooths each image only perpendicular to each intersection line. More band samples are "
-                         "used so the nominal density of --n-band is kept. Default: %(default)s")
-    ap.add_argument("--psf-anneal-frac", type=float, default=0.9,
-                    help="Fraction of the run over which --psf-scale-start decays to 1. Default: %(default)s")
-    ap.add_argument("--no-psf", action="store_true",
-                    help="Disable the PSF model: each image is sampled (bilinearly) only at the intersection-line points "
-                         "themselves, i.e. its raw intensities, with no band across the other slice's profile. Overrides "
-                         "--n-band (set to 1) and --psf-scale-start (set to 1, no PSF annealing); --psf-model and "
-                         "--psf-tbw have no effect. In-plane --blur-sigma annealing still applies if set.")
+
+    # ###################    HARDWARE PARAMS    ##########################################
+    ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
+    ap.add_argument("--workers", type=int, default=4, help="Background threads for loading and writing NIfTI files")
     ap.add_argument("--no-cuda-graph", action="store_true",
                     help="Run each optimization step eagerly instead of replaying a captured CUDA graph (same result, "
                          "slower; for debugging)")
-    ap.add_argument("--psf-tbw", type=float, default=2.5,
-                    help="Time-bandwidth product of the slice-selective RF pulse for --psf-model pulse. It sets the "
-                         "edge sharpness: the 10-90%% transition width is about thickness / TBW. Short bSSFP pulses "
-                         "(TR ~2.7 ms as in UK Biobank) have TBW of roughly 2-3; the exact vendor pulse is not "
-                         "published. Default: %(default)s")
-    ap.add_argument("--metric", choices=["ncc", "ncc_grad", "lncc", "ngf", "nmi", "l1", "l2"], default="lncc",
-                    help="Optimized similarity along each line. ncc: normalized cross-correlation (one high-contrast edge can "
-                         "carry most of the score). ncc_grad: NCC of the profiles' 1D gradients. lncc: local NCC in windows "
-                         "of --lncc-window-mm sliding along the line, averaged (every stretch has to match on its own; "
-                         "flat windows fade out, --lncc-min-std). ngf: normalized gradient agreement -- per-point "
-                         "normalized gradients, so every edge counts about equally whatever its contrast (--grad-eps), "
-                         "in [-1, 1]. nmi: normalized mutual information. l1 / l2: negative mean absolute / squared "
-                         "intensity difference, every image first rescaled so its 1st/99th percentiles map to 0/1 (the "
-                         "SAX slices with one common scale). Default: %(default)s")
-    ap.add_argument("--lncc-window-mm", type=float, default=20.0, help="--metric lncc: window length (mm). Default: %(default)s")
-    ap.add_argument("--lncc-min-std", type=float, default=0.25,
-                    help="--metric lncc: windows whose profiles vary less than this (geometric mean of both standard "
-                         "deviations, in units of the profile's standard deviation over the line) are faded out "
-                         "(weight sd / this). Default: %(default)s")
-    ap.add_argument("--grad-eps", type=float, default=0.5,
-                    help="--metric ngf: edge threshold, in standard deviations of the profile's gradient along the line; "
-                         "gradients well above it count as full edges, those below it fade out. Default: %(default)s")
-    ap.add_argument("--nmi-bins", type=int, default=24, help="Histogram bins for mutual information")
-    ap.add_argument("--nmi-sigma", type=float, default=1.0, help="Parzen window width for mutual information, in bins")
-    ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    ap.add_argument("--workers", type=int, default=4, help="Background threads for loading and writing NIfTI files")
     args = ap.parse_args()
     if args.no_psf:                          # one band sample at offset 0 with weight 1 = the raw line intensities
         args.n_band, args.psf_scale_start = 1, 1.0
@@ -2765,9 +2883,9 @@ def main():
     if not subjects:
         return
     run_dir.mkdir(parents=True, exist_ok=True)
-    if args.logging:
-        overall_dir.mkdir(parents=True, exist_ok=True)
-        write_run_config(overall_dir, args)
+    overall_dir.mkdir(parents=True, exist_ok=True)
+    write_run_config(overall_dir, args)
+    relmotion_f, relmotion_writer = open_csv(overall_dir / "sax_relative_motion.csv", RELMOTION_COLUMNS)
 
     try:
         from tqdm import tqdm
@@ -2809,7 +2927,11 @@ def main():
                     if status == "ok":
                         summary, details, pairs, poses, history = process_subject(
                             data, args, device, on_lines=on_lines if args.logging else None)
-                        save_jobs.append((subj.name, "aligned NIfTIs", ex.submit(save_aligned, data, poses, run_dir, args)))
+                        if args.save_images:
+                            save_jobs.append((subj.name, "aligned NIfTIs", ex.submit(save_aligned, data, poses, run_dir, args)))
+                        for row in sax_relative_motion(subj.name, poses, [d["n_pairs"] for d in details]):
+                            relmotion_writer.writerow(fmt_row(row))
+                        relmotion_f.flush()
                 except Exception as e:  # noqa: BLE001
                     traceback.print_exc()
                     status = f"error: {type(e).__name__}: {e}"[:200]
@@ -2852,6 +2974,7 @@ def main():
     finally:
         for f, _ in writers or []:
             f.close()
+        relmotion_f.close()
     if failed:
         print(f"\n{len(failed)} subject(s) not aligned: " + ", ".join(f"{s} ({st})" for s, st in failed))
     if args.logging:
@@ -2862,7 +2985,9 @@ def main():
         except Exception:  # noqa: BLE001
             print("Overall plotting failed:")
             traceback.print_exc()
-    print(f"Aligned NIfTIs under {run_dir}\\<subject>\\" + (" (and metrics\\)" if args.logging else ""))
+    if args.save_images:
+        print(f"Aligned NIfTIs under {run_dir}\\<subject>\\" + (" (and metrics\\)" if args.logging else ""))
+    print(f"SAX relative motion: {overall_dir / 'sax_relative_motion.csv'}")
 
 
 if __name__ == "__main__":
