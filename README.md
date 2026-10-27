@@ -8,6 +8,11 @@ independently, so they commonly disagree about where the heart actually is in sc
 This pipeline estimates a rigid pose correction per slice/view by comparing image intensities
 along the 3D lines where pairs of planes intersect, then writes out motion-corrected NIfTIs.
 
+#### Note: This was vibe-coded in a couple of days. All praise Claude Code. 
+
+-------------------------
+
+
 ## Pipeline
 
 ```
