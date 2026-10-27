@@ -37,6 +37,13 @@ throughout). Optionally (--pair-keep < 1) each step
 drops a random subset of the intersection lines from the objective, which makes the optimization
 stochastic; the best pose is then tracked on the full objective evaluated every --eval-every steps.
 
+Any image may be missing (see pose_model). A LAX view takes part only with a segmentation containing the heart (it
+defines the mask). The full 6-DOF pose needs SAX slices and >= 2 such LAX views; with SAX slices and a single LAX
+view, or LAX views only, every plane is crossed along a single direction and its tilt is unconstrained, so only the
+translation and the rotation about the plane's own normal are optimized (summary column pose_model: inplane). Without
+any crossing pair (SAX only, a single LAX view, ...) nothing is optimized (status not_optimized). Every image present
+is written to the output either way, unaligned ones with their acquired affine.
+
 With --logging, segmentation consistency (Dice between the two views' labels along the same lines) is
 reported before and after alignment as an independent check; it is not optimized.
 
@@ -121,7 +128,7 @@ LAX_VIEWS = ("LAX_2Ch", "LAX_3Ch", "LAX_4Ch")
 SEG_DIR = "nnUNet_segs"
 
 SUMMARY_COLUMNS = [
-    "subject_id", "status", "n_lax_views", "sax_n_slices", "sax_n_eval",
+    "subject_id", "status", "pose_model", "n_lax_views", "sax_n_slices", "sax_n_eval",
     "sax_shift_mean_mm", "sax_shift_rms_mm", "sax_shift_max_mm", "sax_shift_jitter_mm",
     "sax_dz_rms_mm", "sax_rot_inplane_rms_deg", "sax_tilt_rms_deg",
     "lax_shift_mean_mm", "lax_shift_max_mm",
@@ -222,44 +229,44 @@ def load_subject(subj_dir: Path, args) -> dict:
         <subj_dir>/SAX_slice<nn>.nii.gz, LAX_2Ch.nii.gz, LAX_3Ch.nii.gz, LAX_4Ch.nii.gz
         <subj_dir>/nnUNet_segs/<same stem>_nnUNetSeg.nii.gz
     Every SAX slice is its own (X, Y, 1, T) image with its own affine; nothing assumes a regular stack.
-    data["sax"] is a list of per-slice dicts {index, arr, affine, seg}; data["full"] / data["full_seg"] hold the
-    complete cines by plane key ("SAX:<nn>", "LAX_2Ch:0", ...) for writing the aligned images."""
+    data["sax"] is a list of per-slice dicts {index, arr, affine, seg}; data["lax"] holds the LAX views that can take
+    part in the alignment (those with a segmentation containing the heart, which defines their mask).
+    data["full"] / data["full_seg"] hold the complete cines of *every* image present by plane key ("SAX:<nn>",
+    "LAX_2Ch:0", ...) for writing the output; images that are not aligned are written with their acquired affine.
+    Any subset of the images may be missing; status is "ok", or "no_images" if there is none."""
     out = {"subject_id": subj_dir.name, "status": "ok", "sax": [], "lax": {}, "full": {}, "full_seg": {}}
-    files = sax_slice_files(subj_dir)
-    if not files:
-        out["status"] = "missing_SAX"
-        return out
-    keep = True                                                     # the full cines are written out aligned
-
-    for z, path in files.items():
+    for z, path in sax_slice_files(subj_dir).items():
         arr, aff, header = load_nifti(path)
         if arr.shape[2] != 1:
             raise ValueError(f"{path}: expected a single slice, got shape {arr.shape}")
         frames = phase_frames(arr.shape[3], args.n_frames)
         entry = dict(index=z, arr=arr[..., frames], affine=aff, seg=None)
-        if keep:
-            out["full"][f"SAX:{z}"] = (arr, aff, header)
+        out["full"][f"SAX:{z}"] = (arr, aff, header)
         seg_path = subj_dir / SEG_DIR / f"{path.name[:-len('.nii.gz')]}_nnUNetSeg.nii.gz"
         if seg_path.exists():
             seg, _, seg_header = load_nifti(seg_path, dtype=np.int16)
             if seg.shape == arr.shape:
                 entry["seg"] = seg[..., frames]
-                if keep:
-                    out["full_seg"][f"SAX:{z}"] = (seg, seg_header)
+                out["full_seg"][f"SAX:{z}"] = (seg, seg_header)
         out["sax"].append(entry)
 
     for view in LAX_VIEWS:
         img_path = subj_dir / f"{view}.nii.gz"
         seg_path = subj_dir / SEG_DIR / f"{view}_nnUNetSeg.nii.gz"
-        if not (img_path.exists() and seg_path.exists()):
+        if not img_path.exists():
             continue
         a, affine, header = load_nifti(img_path)
+        out["full"][f"{view}:0"] = (a, affine, header)
+        if not seg_path.exists():
+            continue
         seg, _, seg_header = load_nifti(seg_path, dtype=np.int16)
         if view == "LAX_2Ch":
             seg[seg == 3] = 4                                   # 2Ch has no class 3; its class 3 is class 4 elsewhere
         frames = phase_frames(a.shape[3], args.n_frames)
         zooms = header.get_zooms()
         seg_sub = seg[..., frames] if seg.shape == a.shape else None
+        if seg_sub is not None:
+            out["full_seg"][f"{view}:0"] = (seg, seg_header)
         heart = (seg > 0).any(-1)[:, :, 0]
         if not heart.any():
             continue
@@ -268,13 +275,9 @@ def load_subject(subj_dir: Path, args) -> dict:
         thickness = args.lax_thickness if args.lax_thickness else float(zooms[2])
         out["lax"][view] = dict(arr=a[..., frames], affine=affine, mask=mask, seg=seg_sub, thickness=thickness,
                                 dist=dist.astype(np.float32))      # distance to the heart (mm), for mask annealing
-        if keep:
-            out["full"][f"{view}:0"] = (a, affine, header)
-            if seg_sub is not None:
-                out["full_seg"][f"{view}:0"] = (seg, seg_header)
 
-    if not out["lax"]:
-        out["status"] = "no_lax_views"
+    if not out["full"]:
+        out["status"] = "no_images"
     return out
 
 
@@ -1307,8 +1310,26 @@ def stack_terms(theta_deg, t, C0, N0, nb_a, nb_b, target, which, tilt_deg: float
     return out
 
 
-def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]] | None = None) -> dict:
-    """Jointly optimize a 6-DOF rigid pose per plane from the acquired geometry.
+def pose_model(n_sax: int, n_lax: int, dof: int) -> str:
+    """The pose model a subject's planes support, given its number of SAX slices and of usable LAX views.
+
+    6dof: SAX slices and >= 2 LAX views; every plane is crossed by planes of two other orientations, so its tilt is
+      constrained. inplane: SAX slices and a single LAX view, or LAX views only; each plane is crossed along a single
+      direction, so tilts about it are unconstrained and rotations can run into degenerate solutions -- only
+      translation and rotation about the plane's own normal are optimized. none: no pair of planes crosses (no LAX
+      view, or one LAX view and no SAX slice); nothing is optimized. --dof 3 turns 6dof / inplane into translation.
+    """
+    if n_lax == 0 or (n_sax == 0 and n_lax < 2):
+        return "none"
+    if dof == 3:
+        return "translation"
+    return "6dof" if n_sax > 0 and n_lax >= 2 else "inplane"
+
+
+def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]] | None = None,
+          pose_model: str = "6dof") -> dict:
+    """Jointly optimize a rigid pose per plane from the acquired geometry: translation plus a 3D rotation (pose_model
+    6dof), plus a rotation about the plane's own normal only (inplane), or translation only (translation).
 
     `stages` optionally lists (start_step, sampler) for the annealed mask geometry used early in the run, ending
     with (anneal_end, final_sampler); `final_sampler` -- the nominal geometry -- is used from anneal_end on (or always,
@@ -1332,9 +1353,15 @@ def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]
         return active
 
     f32 = dict(dtype=torch.float32, device=device)
-    rotate = args.dof == 6 and args.rot_lr > 0
-    theta_deg = torch.zeros(N, 3, **f32).requires_grad_(rotate)
+    rotate = args.dof == 6 and args.rot_lr > 0 and pose_model in ("6dof", "inplane")
+    inplane = rotate and pose_model == "inplane"
+    theta_deg = torch.zeros(N, 3, **f32).requires_grad_(rotate and not inplane)
+    phi = torch.zeros(N, 1, **f32).requires_grad_(inplane)          # inplane: angle (deg) about each plane's normal
     t = torch.zeros(N, 3, **f32).requires_grad_(True)
+
+    def pose_theta():
+        """Rotation vectors (N, 3, deg) of the current parameters."""
+        return phi * final_sampler.Nrm if inplane else theta_deg
 
     # SAX stack regularizers over adjacent slices (a, b = slice z, z + 1); the plane normals and centres are the same
     # in every stage sampler
@@ -1387,7 +1414,7 @@ def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]
     # learning rates as device tensors (updated in place each step; captured graphs read them)
     lr_t = torch.tensor(float(args.lr), **f32)
     lr_r = torch.tensor(float(args.rot_lr), **f32)
-    param_groups = [{"params": [t], "lr": lr_t}] + ([{"params": [theta_deg], "lr": lr_r}] if rotate else [])
+    param_groups = [{"params": [t], "lr": lr_t}] + ([{"params": [phi if inplane else theta_deg], "lr": lr_r}] if rotate else [])
     opt = make_optimizer(param_groups, args, device)
 
     def lr_at(step, start, end):
@@ -1413,13 +1440,13 @@ def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]
     def update_best(o):
         better = (o > best_obj) & (track_buf > 0)
         best_obj.copy_(torch.where(better, o, best_obj))
-        best_th.copy_(torch.where(better, theta_deg.detach(), best_th))
+        best_th.copy_(torch.where(better, pose_theta().detach(), best_th))
         best_t.copy_(torch.where(better, t.detach(), best_t))
         best_step.copy_(torch.where(better, step_buf, best_step))
 
     def body(smp):
         opt.zero_grad(set_to_none=False)
-        obj = objective(theta_deg, t, keep_bufs[id(smp)], smp)
+        obj = objective(pose_theta(), t, keep_bufs[id(smp)], smp)
         (-obj).backward()
         update_best(obj.detach())                          # pose *before* this update, as before
         opt.step()
@@ -1476,7 +1503,7 @@ def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]
     with torch.enable_grad():
         for step in range(args.steps):
             if step in snap_steps:
-                snapshots.append((step, theta_deg.detach().clone(), t.detach().clone()))
+                snapshots.append((step, pose_theta().detach().clone(), t.detach().clone()))
             smp = sampler_at(step)
             sigma = blur_sigma if blur_const else blur_sigma * max(0.0, 1.0 - step / blur_steps) if step < blur_steps else 0.0
             smp.set_blur(math.ceil(sigma / blur_quantum) * blur_quantum if sigma > 0 else 0.0)
@@ -1492,13 +1519,13 @@ def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]
                 if nominal and (step % eval_every == 0 or step == args.steps - 1):
                     track_buf.fill_(1.0)
                     with torch.no_grad():
-                        update_best(objective(theta_deg, t))
+                        update_best(objective(pose_theta(), t))
                 track_buf.fill_(0.0)
             else:
                 track_buf.fill_(1.0 if nominal else 0.0)
             run_step(smp)
     if args.steps in snap_steps:
-        snapshots.append((args.steps, theta_deg.detach().clone(), t.detach().clone()))
+        snapshots.append((args.steps, pose_theta().detach().clone(), t.detach().clone()))
     with torch.no_grad():
         # the final parameters are also a candidate (scored with the blur / PSF of the last step, so that a constant
         # --blur-frac 0 blur is comparable to the tracked steps); they are the only one when an annealing schedule
@@ -1506,7 +1533,7 @@ def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]
         if (stochastic and track_from <= args.steps) or track_from >= args.steps:
             step_buf.fill_(float(args.steps))
             track_buf.fill_(1.0)
-            update_best(objective(theta_deg, t))
+            update_best(objective(pose_theta(), t))
     for _, smp in stages:
         smp.set_blur(0.0)
         smp.set_psf_scale(1.0)
@@ -1668,6 +1695,7 @@ def process_subject(data: dict, args, device, on_lines=None) -> tuple:
                 n_pairs[index[b.key]] += 1
     if on_lines is not None:
         on_lines(planes, lines)
+    model = pose_model(len(sax_planes), len(lax_planes), args.dof) if lines else "none"
 
     N = len(planes)
     if not log:                                      # alignment only
@@ -1675,7 +1703,8 @@ def process_subject(data: dict, args, device, on_lines=None) -> tuple:
         if lines:
             sampler = LineSampler(planes, lines, args.n_band, device, args.psf_model, args.psf_tbw, getattr(args, "psf_scale_start", 1.0))
             attach_sax_pairs(sampler, planes, sax_planes, lax_planes, args, device)
-            result = align(sampler, args, annealed_stages(data, planes, sax_planes, lax_planes, sampler, args, device))
+            result = align(sampler, args, annealed_stages(data, planes, sax_planes, lax_planes, sampler, args, device),
+                           pose_model=model)
             theta = result["theta_deg"].cpu().numpy().astype(np.float64)
             t_rel = relative_translation(result["t"], [i for i, p in enumerate(planes) if p.image != "SAX" and n_pairs[i] > 0])
         Rs = rotation_matrices(theta)
@@ -1699,7 +1728,8 @@ def process_subject(data: dict, args, device, on_lines=None) -> tuple:
         has_seg = any(p.seg is not None for p in planes)
         zeros = torch.zeros(N, 3, device=device)
         line_zero = sampler.evaluate(zeros, zeros, args, labels, labels_sax, has_seg)
-        result = align(sampler, args, annealed_stages(data, planes, sax_planes, lax_planes, sampler, args, device))
+        result = align(sampler, args, annealed_stages(data, planes, sax_planes, lax_planes, sampler, args, device),
+                       pose_model=model)
         line_final = sampler.evaluate(result["theta_deg"], result["t"], args, labels, labels_sax, has_seg)
         for stage, lm in (("zero", line_zero), ("final", line_final)):
             for k in metric_names:
@@ -1783,7 +1813,8 @@ def process_subject(data: dict, args, device, on_lines=None) -> tuple:
     mz, mf = arr(ok_rows, lambda d: d["nmi_zero"]), arr(ok_rows, lambda d: d["nmi"])
 
     summary = dict(
-        subject_id=sid, status="ok", n_lax_views=len(lax_planes), sax_n_slices=len(sax_planes), sax_n_eval=len(sax_rows),
+        subject_id=sid, status="ok" if lines else "not_optimized", pose_model=model,
+        n_lax_views=len(lax_planes), sax_n_slices=len(sax_planes), sax_n_eval=len(sax_rows),
         sax_shift_mean_mm=stat(np.mean, mag), sax_shift_rms_mm=stat(rms, mag), sax_shift_max_mm=stat(np.max, mag),
         sax_shift_jitter_mm=stat(rms, jit),
         sax_dz_rms_mm=stat(rms, arr(sax_rows, lambda d: d["dz_mm"])),
@@ -1848,7 +1879,8 @@ def sax_relative_motion(sid: str, poses: list, n_pairs: list[int]) -> list[dict]
 
 def empty_summary(sid: str, status: str) -> dict:
     row = {c: float("nan") for c in SUMMARY_COLUMNS}
-    row.update(subject_id=sid, status=status, n_lax_views=0, sax_n_slices=0, sax_n_eval=0, n_line_pairs=0, steps=0)
+    row.update(subject_id=sid, status=status, pose_model="none", n_lax_views=0, sax_n_slices=0, sax_n_eval=0,
+               n_line_pairs=0, steps=0)
     return row
 
 
@@ -1887,13 +1919,13 @@ def uint8_clip_value(path) -> float | None:
 
 
 def aligned_complete(subj_in: Path, subj_out: Path) -> bool:
-    """True when every input NIfTI that gets aligned (SAX slices, LAX views that have a segmentation, and their
-    segmentations; see load_subject) has its counterpart in the output folder, i.e. the subject was fully processed."""
+    """True when every input NIfTI that is written out (SAX slices, LAX views and their segmentations; see
+    load_subject) has its counterpart in the output folder, i.e. the subject was fully processed."""
     inputs = []
     for p in subj_in.glob("*.nii.gz"):
         stem = p.name[:-len(".nii.gz")]
         seg = subj_in / SEG_DIR / f"{stem}_nnUNetSeg.nii.gz"
-        if stem.startswith("SAX_slice") or (stem in LAX_VIEWS and seg.exists()):
+        if stem.startswith("SAX_slice") or stem in LAX_VIEWS:
             inputs.append(p.relative_to(subj_in))
             if seg.exists():
                 inputs.append(seg.relative_to(subj_in))
@@ -1901,29 +1933,30 @@ def aligned_complete(subj_in: Path, subj_out: Path) -> bool:
 
 
 def save_aligned(data: dict, poses: list[tuple[Plane, np.ndarray, np.ndarray]], run_dir: Path, args) -> None:
-    """Write every slice's full cine with its corrected affine to <run>/<subject>/, in the input layout
-    (SAX_slice<nn>.nii.gz, LAX_*.nii.gz, nnUNet_segs/<stem>_nnUNetSeg.nii.gz)."""
+    """Write every image's full cine to <run>/<subject>/, in the input layout (SAX_slice<nn>.nii.gz, LAX_*.nii.gz,
+    nnUNet_segs/<stem>_nnUNetSeg.nii.gz): with its corrected affine where `poses` holds a pose for it, otherwise
+    (not aligned: e.g. a LAX view without a segmentation, or a subject that could not be optimized) unchanged, with its
+    acquired affine, in the same format. The subject folder is created even if there is nothing to write."""
     out = run_dir / data["subject_id"]
     (out / SEG_DIR).mkdir(parents=True, exist_ok=True)
     dtype, scale, descrip = np.uint16, 1.0, None
     if getattr(args, "image_dtype", "uint16") == "uint8":
         # one scale per subject (SAX and LAX share it): clip at --uint8-percentile of all its slices and frames
-        vols = [data["full"][p.key][0] for p, _, _ in poses if p.key in data["full"]]
+        vols = [v for v, _, _ in data["full"].values()]
         clip = float(np.percentile(np.concatenate([np.asarray(v, np.float32).ravel() for v in vols]),
                                    args.uint8_percentile)) if vols else 0.0
         dtype, scale = np.uint8, 255.0 / max(clip, 1e-6)
         # header descrip: original intensity = value * clip / 255 (below the clip); read with uint8_clip_value()
         descrip = f"uint8 clip={clip:.6g} pct={args.uint8_percentile:g} orig=v*clip/255"
-    for plane, R, t in poses:
-        if plane.key not in data["full"]:
-            continue
-        arr, affine, header = data["full"][plane.key]
-        A = corrected_affine(affine, plane, R, t)
-        stem = f"SAX_slice{plane.slice_idx:02d}" if plane.image == "SAX" else plane.image
+    pose_of = {plane.key: (plane, R, t) for plane, R, t in poses}
+    for key, (arr, affine, header) in data["full"].items():
+        image, idx = key.split(":")
+        A = corrected_affine(affine, *pose_of[key]) if key in pose_of else affine
+        stem = f"SAX_slice{int(idx):02d}" if image == "SAX" else image
         write_nifti(arr if dtype is np.uint16 else np.asarray(arr, np.float32) * scale, A, header,
                     out / f"{stem}.nii.gz", dtype, descrip)   # uint8: clipped to [0, 255] in write_nifti
-        if plane.key in data["full_seg"]:
-            seg, seg_header = data["full_seg"][plane.key]
+        if key in data["full_seg"]:
+            seg, seg_header = data["full_seg"][key]
             write_nifti(seg, A, seg_header, out / SEG_DIR / f"{stem}_nnUNetSeg.nii.gz", np.uint8)
 
 
@@ -2644,7 +2677,7 @@ def main():
                          "percentile (a few bright pixels), so 99.9 clips 0.1%% of the voxels")
 
     # ###################    OPTIMIZER PARAMS    #########################################
-    ap.add_argument("--steps", type=int, default=600, help="Optimizer steps")
+    ap.add_argument("--steps", type=int, default=2000, help="Optimizer steps")
     ap.add_argument("--optimizer", choices=OPTIMIZERS, default="sgd",
                     help="adam: the default. nadam: Adam with Nesterov momentum (looks ahead, often a little faster). "
                          "radam: Adam with the variance rectified during the first steps (no warm-up needed, steadier start). "
@@ -2896,7 +2929,7 @@ def main():
     if args.logging:
         writers = [open_csv(summary_path, SUMMARY_COLUMNS), open_csv(detail_path, DETAIL_COLUMNS), open_csv(pairs_path, PAIR_COLUMNS)]
     save_jobs = deque()                                   # (subject, description, future) for background writes
-    failed = []
+    failed, unaligned = [], []
     try:
         with ThreadPoolExecutor(max_workers=args.workers) as ex:
             it = iter(subjects)
@@ -2924,18 +2957,23 @@ def main():
                 try:
                     data = fut.result()
                     status = data["status"]
+                    poses = []
                     if status == "ok":
                         summary, details, pairs, poses, history = process_subject(
                             data, args, device, on_lines=on_lines if args.logging else None)
-                        if args.save_images:
-                            save_jobs.append((subj.name, "aligned NIfTIs", ex.submit(save_aligned, data, poses, run_dir, args)))
+                        if not any(d["n_pairs"] > 0 for d in details):
+                            status = "not_optimized"                 # no crossing planes: written unaligned
                         for row in sax_relative_motion(subj.name, poses, [d["n_pairs"] for d in details]):
                             relmotion_writer.writerow(fmt_row(row))
                         relmotion_f.flush()
+                    if args.save_images:          # whatever could be loaded, aligned or not (folder created regardless)
+                        save_jobs.append((subj.name, "aligned NIfTIs", ex.submit(save_aligned, data, poses, run_dir, args)))
                 except Exception as e:  # noqa: BLE001
                     traceback.print_exc()
                     status = f"error: {type(e).__name__}: {e}"[:200]
-                if status != "ok":
+                if status in ("not_optimized", "no_images"):
+                    unaligned.append((subj.name, status))
+                elif status != "ok":
                     failed.append((subj.name, status))
                 if args.logging:
                     summary = summary if summary is not None else empty_summary(subj.name, status)
@@ -2975,8 +3013,11 @@ def main():
         for f, _ in writers or []:
             f.close()
         relmotion_f.close()
+    if unaligned:
+        print(f"\n{len(unaligned)} subject(s) without crossing planes, written unaligned: "
+              + ", ".join(f"{s} ({st})" for s, st in unaligned))
     if failed:
-        print(f"\n{len(failed)} subject(s) not aligned: " + ", ".join(f"{s} ({st})" for s, st in failed))
+        print(f"\n{len(failed)} subject(s) failed: " + ", ".join(f"{s} ({st})" for s, st in failed))
     if args.logging:
         print(f"\nSummary written to {summary_path}\nPer-slice results written to {detail_path}\nPer-pair results written to {pairs_path}")
         try:

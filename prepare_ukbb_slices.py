@@ -20,6 +20,10 @@ one) with the source's codes. Image values are copied exactly. Segmentations (SA
 as plain int16 labels without scaling: the source label files are int16 with a slope/intercept (labels stored as
 e.g. 0.9999999), which are rounded to the exact integer labels.
 
+Missing inputs (the SAX stack, any LAX view, any segmentation) are not an error: the subject folder is always created
+and whatever is present is written (the SAX stack split if present). The log's `missing` column lists the absent
+images; status is ok (all present), partial (some missing), no_images, skipped_existing or error: <message>.
+
 Subjects whose destination already holds every expected file are skipped unless --overwrite.
 
 Usage: python prepare_ukbb_slices.py [--src DIR] [--dst DIR] [--max-subjects N] [--workers N] [--overwrite]
@@ -126,9 +130,22 @@ def expected_outputs(src_inst: Path, dst: Path) -> list[Path]:
 def prepare_subject(subj: Path, args) -> dict:
     t0 = time.time()
     sid = subj.name
+    row = dict(subject_id=sid, status="ok", missing="", n_sax_slices=0, sax_seg=False, lax_views="", lax_segs="",
+               warnings="", seconds=0.0)
+    try:
+        return _prepare_subject(subj, args, row, t0)
+    except Exception as e:  # noqa: BLE001  one unreadable subject must not stop the others
+        row.update(status=f"error: {type(e).__name__}: {e}"[:200], seconds=round(time.time() - t0, 1))
+        return row
+
+
+def _prepare_subject(subj: Path, args, row: dict, t0: float) -> dict:
     src_inst = image_dir(subj)
-    dst = args.dst / sid
-    row = dict(subject_id=sid, status="ok", n_sax_slices=0, sax_seg=False, lax_views="", lax_segs="", warnings="", seconds=0.0)
+    dst = args.dst / subj.name
+    (dst / SEG_DIR).mkdir(parents=True, exist_ok=True)               # created whatever is missing
+    missing = [name for name, f in [("SAX", "SAX.nii.gz")] + [(v, f"{v}.nii.gz") for v in LAX_VIEWS]
+               if not (src_inst / f).exists()]
+    row["missing"] = "+".join(missing)
     expected = expected_outputs(src_inst, dst)
     if not expected:
         row["status"] = "no_images"
@@ -136,7 +153,6 @@ def prepare_subject(subj: Path, args) -> dict:
     if not args.overwrite and all(p.exists() for p in expected):
         row["status"] = "skipped_existing"
     else:
-        (dst / SEG_DIR).mkdir(parents=True, exist_ok=True)
         warnings = []
         if (src_inst / "SAX.nii.gz").exists():
             warnings += split_stack(src_inst / "SAX.nii.gz", dst, is_seg=False)
@@ -149,8 +165,8 @@ def prepare_subject(subj: Path, args) -> dict:
                 if src.exists():
                     warnings += copy_lax(src, out, is_seg)
         row["warnings"] = "; ".join(warnings)
-    if not (src_inst / "SAX.nii.gz").exists():
-        row["status"] = "missing_SAX"                   # LAX files (if any) are still written
+        if missing:
+            row["status"] = "partial"                    # whatever is present is still written
     row["n_sax_slices"] = sum(1 for p in expected if p.parent == dst and p.name.startswith("SAX_slice"))
     row["sax_seg"] = any(p.parent.name == SEG_DIR and p.name.startswith("SAX_slice") for p in expected)
     row["lax_views"] = "+".join(v for v in LAX_VIEWS if (dst / f"{v}.nii.gz") in expected)
@@ -178,6 +194,7 @@ def main():
         for row in ex.map(lambda s: prepare_subject(s, args), subjects):
             rows.append(row)
             note = f"  WARN {row['warnings']}" if row["warnings"] else ""
+            note += f"  missing {row['missing']}" if row["missing"] else ""
             print(f"  {row['subject_id']}: {row['status']}, {row['n_sax_slices']} SAX slices, LAX {row['lax_views'] or '-'}"
                   f" ({row['seconds']} s){note}", flush=True)
     log = pd.DataFrame(rows)
@@ -186,8 +203,10 @@ def main():
         old = pd.read_csv(log_path, dtype={"subject_id": str})
         log = pd.concat([old[~old.subject_id.isin(log.subject_id)], log]).sort_values("subject_id")
     log.to_csv(log_path, index=False)
-    print(f"\n{(log.status == 'ok').sum()} written, {(log.status == 'skipped_existing').sum()} already present, "
-          f"{(~log.status.isin(['ok', 'skipped_existing'])).sum()} without SAX/images. Log: {log_path}")
+    n = lambda status: int((log.status == status).sum())  # noqa: E731
+    n_err = int(log.status.str.startswith("error").sum())
+    print(f"\n{n('ok')} written complete, {n('partial')} written with missing views, {n('skipped_existing')} already "
+          f"present, {n('no_images')} without images, {n_err} failed. Log: {log_path}")
 
 
 if __name__ == "__main__":

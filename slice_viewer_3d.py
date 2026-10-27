@@ -20,6 +20,13 @@ The pixel data are read from the run's NIfTIs in <run>/<subject>/ (older runs: <
 (a single <SA>.nii.gz volume is also accepted; <SA> / <LA> are the alignment script's
 on-disk spellings, see ON_DISK).
 
+Any of the views may be missing. Slices that were not part of the alignment (no rows in
+history.csv, e.g. a LA view without a segmentation) are shown at their saved pose for every
+snapshot and marked "unaligned" in the slice list. The header notes a restricted pose model
+(translation + in-plane rotation only) from metrics/summary.csv; a subject that was not optimized
+(no crossing views) is shown at its acquired pose without metrics. Subject folders without
+images are skipped.
+
 Usage
 -----
     python slice_viewer_3d.py                       # most recently created run, its first subject
@@ -968,7 +975,8 @@ class SliceViewer:
         self.snapshots = self.history["snapshots"]
         self.n_steps = self.history["n_steps"]
         self.metric_range = self.history.get("metric_range", {})
-        self.has_metrics = bool(self.history.get("available", True))   # False: aligned without --logging
+        self.has_metrics = bool(self.history.get("available", True))   # False: no history.csv
+        self.not_optimized = bool(loaded.get("not_optimized", False))   # no crossing views: acquired pose
         # Colour range per metric: the subject's min/max over its history (clipped to
         # the metric's absolute bounds), adjustable with the sliders.
         self.color_range: dict[str, list[float]] = {}
@@ -1216,9 +1224,9 @@ class SliceViewer:
                 nx, ny, _ = s["grey"].shape
                 key = (view, int(s["index"]))
                 in_history = any(key in snap["affines"] for snap in self.snapshots)
-                if not in_history:
-                    print(f"[warn] {s['name']}: no rows in history.csv; its NIfTI affine is used "
-                          f"for every snapshot", file=sys.stderr)
+                if not in_history:          # e.g. a LA view without a segmentation: written unaligned
+                    print(f"[info] {s['name']}: not part of the alignment (no rows in history.csv); shown at its "
+                          f"saved (acquired) pose for every snapshot", file=sys.stderr)
                 mesh = slice_mesh(s["affine"], nx, ny)
                 mesh.cell_data["rgb"] = self._colors(s)
                 actor = self._mesh(
@@ -2212,7 +2220,7 @@ class SliceViewer:
             e["outline_mesh"].point_data["metric"][:] = val
             txt = self._row_value.get(e["name"])
             if txt is not None:
-                txt.SetInput(fmt.format(val) if np.isfinite(val) else "-")
+                txt.SetInput(fmt.format(val) if np.isfinite(val) else "-" if e["in_history"] else "unaligned")
         header = getattr(self, "_value_header", None)
         if header is not None:
             header.SetInput(OUTLINE_METRICS[self.metric]["label"] if self.has_metrics else "")
@@ -2232,6 +2240,8 @@ class SliceViewer:
         self._update_toggle_colors()
         if not self.has_metrics:
             self.outline_text.SetInput(
+                "subject not optimized (no crossing views):\n"
+                "  no metric colours; the slices show the acquired pose" if self.not_optimized else
                 "no history for this subject (aligned without --logging):\n"
                 "  no metric colours; the slices show the saved (final) pose")
             return
@@ -2302,7 +2312,8 @@ class SliceViewer:
             # no history: the metric buttons are inert (undo the radio group's own switch)
             for k, widget in self._radios.items():
                 widget.GetRepresentation().SetState(int(k == self.metric))
-            self._log("no history for this subject: metric colours unavailable")
+            self._log("subject not optimized: no metrics" if self.not_optimized
+                      else "no history for this subject: metric colours unavailable")
             self.pl.render()
             return
         if key not in OUTLINE_METRICS or key == self.metric:
@@ -2562,7 +2573,8 @@ class SliceViewer:
             interaction_event="always",   # update while dragging, not only on release
         )
         self._hist_slider.GetRepresentation().ShowSliderLabelOff()
-        self._slider_title("optimization history" if self.has_metrics else "saved pose (no history)", hx0, hy)
+        self._slider_title("optimization history" if self.has_metrics
+                           else "acquired pose (not optimized)" if self.not_optimized else "saved pose (no history)", hx0, hy)
         self._knob = {"hist": dict(x0=hx0, x1=hx1, y=hy, vmax=step_max,
                                    text=self._knob_text(hy * h + KNOB_LABEL_DY))}
         # with a single snapshot the knob simply snaps back (see _on_hist_slider)
@@ -2725,7 +2737,7 @@ class SliceViewer:
         sm = snap["summary"] or {}
         for key, spec in OUTLINE_METRICS.items():
             if not self.has_metrics:
-                value = "(no history)"
+                value = "(not optimized)" if self.not_optimized else "(no history)"
             elif spec["col"] not in self.metric_range:
                 value = "(no values)"
             else:
@@ -2745,6 +2757,24 @@ class SliceViewer:
 def _subjects_in_run(run_dir: Path) -> list[str]:
     """Viewable subjects of a run (with or without a history), alphabetical."""
     return sorted(p.name for p in run_dir.iterdir() if _is_subject_dir(p))
+
+
+# pose models of motion_gradient.pose_model that are not the full 6-DOF pose, as shown in the header
+POSE_NOTES = {"inplane": "translation + in-plane rotation only",
+              "translation": "translation only",
+              "none": "not optimized: acquired pose"}
+
+
+def load_alignment_status(metrics_dir: Path) -> tuple[str | None, str | None]:
+    """(status, pose_model) of the subject from metrics/summary.csv; None for what is not recorded (runs without
+    --logging, or from before the pose_model column)."""
+    path = metrics_dir / "summary.csv"
+    df = read_csv(path) if path.exists() and path.stat().st_size else None
+    if df is None or df.empty:
+        return None, None
+    row = df.iloc[-1]
+    get = lambda c: row[c] if c in row.index and isinstance(row[c], str) else None  # noqa: E731
+    return get("status"), get("pose_model")
 
 
 def history_from_images(data: dict) -> dict:
@@ -2777,14 +2807,20 @@ def load_subject_run(run_dir: Path, subject: str, instance: int | None = None) -
     print(f"Subject {subject}" + (f", instance {instance}" if instance is not None else ""))
     data = load_images(image_dir)
     describe_images(image_dir, data)
+    status, model = load_alignment_status(metrics_dir)
+    not_optimized = status == "not_optimized" or model == "none"
     if (metrics_dir / HISTORY_CSV).exists():
         history = load_history(metrics_dir)
         describe_history(metrics_dir, history)
     else:
         history = history_from_images(data)
-        print(f"[history] none for {subject} (aligned without --logging): showing the saved pose, no metrics")
+        why = ("not optimized (no crossing views): showing the acquired pose" if not_optimized
+               else "aligned without --logging: showing the saved pose")
+        print(f"[history] none for {subject} ({why}), no metrics")
+    if model in POSE_NOTES:
+        print(f"[pose] {POSE_NOTES[model]}")
     overlays = load_overlays(metrics_dir)
-    if metrics_dir.is_dir():
+    if metrics_dir.is_dir() and not not_optimized:          # a subject that was not optimized has no lines / masks
         describe_overlays(metrics_dir, overlays)
 
     # Sanity check: the saved NIfTI affines should equal the history's best pose.
@@ -2800,8 +2836,11 @@ def load_subject_run(run_dir: Path, subject: str, instance: int | None = None) -
     config = json.loads(cfg_path.read_text()) if cfg_path.exists() else None
     if config is None:
         print(f"[warn] {cfg_path} missing: profiles can only show raw intensities", file=sys.stderr)
-    return {"data": data, "history": history, "overlays": overlays, "config": config,
-            "title": f"UKBB {subject}" + (f" / Instance_{instance}" if instance is not None else ""), "run_name": run_dir.name}
+    title = f"UKBB {subject}" + (f" / Instance_{instance}" if instance is not None else "")
+    if model in POSE_NOTES:
+        title += f"   [{POSE_NOTES[model]}]"
+    return {"data": data, "history": history, "overlays": overlays, "config": config, "title": title,
+            "run_name": run_dir.name, "not_optimized": not_optimized}
 
 
 def parse_args(argv=None):
@@ -2858,6 +2897,8 @@ def main(argv=None):
         sys.exit(f"No aligned subject in {run_dir}")
     if args.subject is not None:
         if args.subject not in subjects:
+            if (run_dir / args.subject).is_dir():
+                sys.exit(f"Subject {args.subject} has no images in {run_dir} (it had no input images to write)")
             sys.exit(f"Subject {args.subject} has no aligned images or history in {run_dir}")
     elif not 0 <= args.subject_index < len(subjects):
         sys.exit(f"Subject index {args.subject_index} out of bounds (found {len(subjects)} subjects).")

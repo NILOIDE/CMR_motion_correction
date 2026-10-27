@@ -495,9 +495,11 @@ class GridSearcher:
                     offset=offs[k].tolist())
 
 
-def brute_force_align(final_sampler: mg.LineSampler, args, stages=None, log: list | None = None) -> dict:
+def brute_force_align(final_sampler: mg.LineSampler, args, stages=None, pose_model: str = "6dof",
+                      log: list | None = None) -> dict:
     """Stands in for motion_gradient.align (same signature and result; `stages`, the mask annealing, is unused): the
-    staged grid search of the module docstring. `log` collects one SEARCH_COLUMNS row per plane search."""
+    staged grid search of the module docstring. `log` collects one SEARCH_COLUMNS row per plane search. The grid has
+    no in-plane-only rotation, so any pose_model other than 6dof (see mg.pose_model) searches translations only."""
     planes, device = final_sampler.planes, final_sampler.device
     pair_weight = {frozenset((ia, ib)): float(n) for ia, ib, n in
                    zip(final_sampler.IA.tolist(), final_sampler.IB.tolist(), final_sampler.npts.tolist())}
@@ -507,12 +509,13 @@ def brute_force_align(final_sampler: mg.LineSampler, args, stages=None, log: lis
     views = [view_idx[v] for v in VIEW_ORDER if v in view_idx]
     sax = sorted((p.slice_idx, i) for i, p in enumerate(planes) if p.image == "SAX")
     dz = args.dz_range_mm if args.dz_range_mm is not None else args.t_range_mm
-    rot = args.rot_range_deg if args.dof == 6 else 0.0
+    rotate = args.dof == 6 and pose_model == "6dof"
+    rot = args.rot_range_deg if rotate else 0.0
     coarse = dict(coarse_t_step=args.coarse_t_step_mm, coarse_rot_step=args.coarse_rot_step_deg, blur_mm=args.coarse_blur_mm)
     full = GridSpec(args.t_range_mm, args.t_step_mm, dz, rot, args.rot_step_deg, **coarse)
     translations = GridSpec(args.t_range_mm, args.t_step_mm, dz, **coarse)
     refine = GridSpec(args.refine_t_range_mm, args.refine_t_step_mm, args.refine_t_range_mm,
-                      args.refine_rot_range_deg if args.dof == 6 else 0.0, args.refine_rot_step_deg)   # one exhaustive level
+                      args.refine_rot_range_deg if rotate else 0.0, args.refine_rot_step_deg)   # one exhaustive level
 
     def run(stage: int, m: int | None, others: list, spec: GridSpec, neighbours=()):
         if m is None:
