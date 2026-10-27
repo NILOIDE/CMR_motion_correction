@@ -81,6 +81,10 @@ like this:
   prepare_log.csv                  # one row per subject (what was written)
 ```
 
+Missing inputs (the SAX stack, any LAX view, any segmentation) are allowed: the subject folder is
+always created and whatever is present is written. `prepare_log.csv` lists what was missing per
+subject.
+
 See the module docstring for the exact source layout and `--help` for all options
 (`--max-subjects`, `--overwrite`, ...).
 
@@ -101,6 +105,20 @@ itself moves close to rigidly, but the surrounding anatomy does not), so the int
 optimization is restricted to a dilated foreground (heart) mask derived from the LAX
 segmentations, rather than the full extent of each line, to keep it from being pulled off by
 non-rigid motion further out.
+
+The pose model depends on which views a subject has (a LAX view counts only if it has a
+segmentation containing the heart):
+
+| Available views                     | Optimized                                   |
+|-------------------------------------|---------------------------------------------|
+| SAX + 2 or more LAX                 | full 6-DOF (translation + 3D rotation)      |
+| SAX + 1 LAX, or 2 or more LAX only  | translation + in-plane rotation only        |
+| SAX only, 1 LAX only, nothing       | nothing (images written unaligned)          |
+
+With fewer crossing orientations, a plane's tilt is unconstrained, and optimizing it leads to
+degenerate solutions. Every image present is always written to the output folder; images that
+could not be aligned keep their acquired affine. The `pose_model` column of the summary CSV
+records which model each subject used.
 
 ```
 python motion_gradient.py --root <slices_dir> --out-root <alignment_dir> --max-subjects -1 --logging true --optimizer sgd --momentum 0
