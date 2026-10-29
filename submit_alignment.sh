@@ -21,7 +21,7 @@ source /u/home/stol/miniconda3/etc/profile.d/conda.sh
 conda activate ugurlu
 
 # Define your absolute paths
-REPO_DIR="~/Documents/Projects/CMR_motion_correction"
+REPO_DIR="/u/home/stol/Documents/Projects/CMR_motion_correction"
 ALIGN_DIR="/vol/miltank/projects/ukbb/data/cardiac/slice_alignment"
 # moco_nifti.py reads the raw UKBB layout directly
 DATA_DIR="/vol/miltank/projects/ukbb/data/cardiac/cardiac_segmentations/projects/ugurlu_segmentations/data"
