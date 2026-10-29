@@ -23,7 +23,7 @@ conda activate ugurlu
 # Define your absolute paths
 REPO_DIR="$SLURM_SUBMIT_DIR"
 ALIGN_DIR="/vol/miltank/projects/ukbb/data/cardiac/slice_alignment"
-DATA_DIR="$ALIGN_DIR/unaligned_subjects"
+DATA_DIR="/vol/miltank/projects/ukbb/data/cardiac/cardiac_segmentations/projects/ugurlu_segmentations/data"
 OUT_ROOT="$ALIGN_DIR"
 RUN_NAME="aligned_subjects"          # outputs: $OUT_ROOT/$RUN_NAME/<subject>/
 
