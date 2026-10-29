@@ -34,6 +34,7 @@ import pandas as pd
 import torch
 
 import motion_bruteforce as bf
+import moco_nifti as mn
 import motion_gradient as mg
 
 DEFAULTS = dict(fp16=False, eval_batch=1024, top_k=8, tie_tol=1e-4, sax_overlap_weight=0.0, sax_overlap_step_mm=6.0,
@@ -53,15 +54,10 @@ def load_run(run: Path, subject: str, device, overrides: dict) -> tuple:
             setattr(args, k, v)
     if getattr(args, "no_psf", False):
         args.n_band = 1
-    data = mg.load_subject(Path(args.root) / subject, args)
+    data = mg.prepare_subject(mn.load_subject(Path(args.root) / subject, args), args)
     sax, lax = mg.build_planes(data, args, device, with_seg=False)
     planes = sax + lax
-    lines = []
-    idx = {p.key: i for i, p in enumerate(planes)}
-    for a, b in [(s, l) for s in sax for l in lax] + [(lax[i], lax[j]) for i in range(len(lax)) for j in range(i + 1, len(lax))]:
-        line = mg.intersection_line(a, b, args, device)
-        if line is not None:
-            lines.append((idx[a.key], idx[b.key], line))
+    lines = mg.build_lines(planes, args, device)
     smp = mg.LineSampler(planes, lines, args.n_band, device, args.psf_model, args.psf_tbw, 1.0)
     weights = {frozenset((ia, ib)): float(n) for ia, ib, n in zip(smp.IA.tolist(), smp.IB.tolist(), smp.npts.tolist())}
     hist = pd.read_csv(run / subject / "metrics" / "history.csv", dtype={"subject_id": str})

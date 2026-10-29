@@ -1,15 +1,26 @@
 """
-Gradient-based inter-slice motion estimation for UKBB cine MRI (SAX slices + LAX views).
+Gradient-based inter-slice motion correction of cine MRI: the motion-correction library. It is not run on its own;
+the entry points are the data loaders, which read a subject, hand it over and write the result in their own format:
+  moco_nifti.py   UK Biobank NIfTI (SAX stack and/or slices + LAX views, nnU-Net segmentations)
+  moco_dicom.py   DICOM series (any number of stacks / orientations)
 
-Input (--root, prepared by prepare_ukbb_slices.py): one folder per subject holding single-slice cines,
-  <subject>/SAX_slice00.nii.gz, SAX_slice01.nii.gz, ...   each SAX slice its own file with its own affine
-  <subject>/LAX_2Ch.nii.gz, LAX_3Ch.nii.gz, LAX_4Ch.nii.gz
-  <subject>/nnUNet_segs/<same stem>_nnUNetSeg.nii.gz
-Every slice is handled individually; no SAX volume or regular stack geometry is assumed. SAX slices are
-neighbours (for the stack regularizers) when their indices are consecutive.
+Input (from a loader, see SliceImage / Subject): a list of 2D+time cine slices, each (X, Y, T) with its own 4x4
+affine (voxel (i, j, 0) -> world mm, one world frame per subject), image (stack) name and index in its stack, slice
+thickness and an optional (X, Y, T) segmentation. Slices named "SAX" are short-axis slices (SAX regularizers, QC and
+reports). Every slice is a plane with its own pose; no regular stack geometry is assumed. Segmentations are optional:
+a non-SAX image's segmentation defines its dilated heart mask (the line points scored); without one its lines run
+over the whole overlap with the other image. They are also used for the reported Dice / Hausdorff.
+Output: per slice its corrected affine (corrected_affines), written back by the loader; metrics and figures below.
+run() is the shared run loop (subject scanning, background loading/writing, CSVs, figures).
+
+Intersection pairs (candidate_pairs): every two slices whose acquired normals differ by at least --min-pair-angle-deg,
+thinned between multi-slice stacks to partners about a slice thickness apart (--pair-spacing-mm). Nearly parallel SAX
+slices within --parallel-max-dist-mm are neighbours for the SAX-SAX crossing terms instead. The LV long axis (rotation
+pivots, SAX-SAX terms) is the crossing line of the two most perpendicular single-slice LAX views, or without such views
+the axis of the SAX stack (else of the first image found).
 
 For every pair of non-parallel planes (each SAX slice vs each LAX view, and LAX vs LAX) the 3D
-intersection line is computed from the NIfTI affines. Intensity profiles are sampled along the
+intersection line is computed from the slice affines. Intensity profiles are sampled along the
 line from both images; each profile is averaged across a band whose width equals the *other*
 image's slice thickness, approximating that image's slice-selection point-spread function.
 Profiles are compared with normalized cross-correlation (NCC; or gradient NCC, local NCC, normalized
@@ -50,9 +61,8 @@ reported before and after alignment as an independent check; it is not optimized
 Outputs go to <out-root>/<run-name>/ (default run name: the start time, then the settings given on the command line,
 so a rerun never writes into an earlier run). Always written:
   <subject>/
-    SAX_slice<nn>.nii.gz, LAX_*.nii.gz, nnUNet_segs/   motion-corrected NIfTIs in the input layout: each
-                              slice's full cine as uint16 with its corrected affine; segmentations alongside
-                              (not with --save-images false).
+    the motion-corrected images, written by the loader in its own format and layout (see moco_nifti.py,
+                              moco_dicom.py; not with --save-images false).
 Always:
   overall_metrics/
     run_config.json           every setting of the run
@@ -70,7 +80,7 @@ Only with --logging (otherwise nothing else is computed or written, which is the
       summary.csv, slices.csv, pairs.csv  this subject's rows
       history.csv             pose snapshots every 2% of the run (step 0 = acquired geometry, and the
                               saved "best" pose with is_best=1): per plane the full 3x4 affine (a00..a23, same
-                              convention as the saved NIfTIs), the pose and NCC/LNCC/NMI/Dice/Hausdorff
+                              convention as the saved images), the pose and NCC/LNCC/NMI/Dice/Hausdorff
       history_summary.csv     the same snapshots, one row per step with the objective and subject-level metrics
       lines.csv               every intersection line entering the loss (acquired geometry): the two planes, the
                               anchor point x0 and unit direction d (world, mm) and the parameter ranges along the
@@ -106,7 +116,6 @@ rotation about in-plane axes (weakly constrained, treat with caution).
 import argparse
 import csv
 import math
-import re
 import sys
 import time
 import traceback
@@ -117,15 +126,12 @@ from datetime import datetime
 from itertools import combinations
 from pathlib import Path
 
-import nibabel as nib
 import numpy as np
 import pandas as pd
 import torch
 import torch.nn.functional as F
 from scipy.ndimage import distance_transform_edt
 
-LAX_VIEWS = ("LAX_2Ch", "LAX_3Ch", "LAX_4Ch")
-SEG_DIR = "nnUNet_segs"
 
 SUMMARY_COLUMNS = [
     "subject_id", "status", "pose_model", "n_lax_views", "sax_n_slices", "sax_n_eval",
@@ -168,8 +174,9 @@ class Plane:
     normal: np.ndarray
     thickness: float
     spacing: tuple = (1.0, 1.0)      # in-plane voxel size (mm) along image axes 0 and 1
-    affine: np.ndarray | None = None  # acquired 4x4 voxel -> world affine of this slice (its own NIfTI affine)
+    affine: np.ndarray | None = None  # acquired 4x4 voxel -> world affine of this slice
     pivot: np.ndarray | None = None   # point (world, in the plane) the pose rotates about; None = the image centre
+    stack_rank: int = 0              # position of the plane's image in the order the images were found
 
     @property
     def rot_centre(self) -> np.ndarray:
@@ -196,87 +203,87 @@ class Line:
 
 
 # --------------------------------------------------------------------------------------
-# Loading
+# Input: what a data loader hands over
 # --------------------------------------------------------------------------------------
+
+@dataclass
+class SliceImage:
+    """One acquired 2D cine slice, as handed over by a data loader (moco_nifti.py, moco_dicom.py).
+
+    data[i, j, t] is the intensity of pixel (i, j) in frame t, located at world point affine @ [i, j, 0, 1] (mm, one
+    world frame for all slices of a subject; the loaders use RAS). Slices of one image (stack) share `image` and are
+    numbered by `index` along the stack; the image name "SAX" marks short-axis slices, which get the SAX-specific
+    regularizers, QC and reports. All slices of one non-SAX image must have the same in-plane size."""
+    image: str                      # image (stack) the slice belongs to, e.g. "SAX", "LAX_4Ch", a series name
+    index: int                      # position in its stack (0, 1, ...)
+    data: np.ndarray                # (X, Y, T) float32 full cine
+    affine: np.ndarray              # (4, 4) voxel (i, j, 0) -> world mm
+    thickness: float                # slice thickness (mm), for the slice-profile PSF
+    seg: np.ndarray | None = None   # (X, Y, T) integer labels (optional; heart mask and Dice / Hausdorff)
+    source: object = None           # loader-specific handle for writing the slice back (never read here)
+
+    @property
+    def key(self) -> str:
+        return f"{self.image}:{self.index}"
+
+
+@dataclass
+class Subject:
+    subject_id: str
+    slices: list                    # list[SliceImage], images in the order they were found
+    status: str = "ok"              # "ok", or e.g. "no_images" (nothing to align)
+
 
 def phase_frames(n_frames_available: int, n_frames: int) -> list[int]:
     return sorted({int(math.floor(k / n_frames * n_frames_available)) for k in range(n_frames)})
 
 
-def load_nifti(path: Path, dtype=np.float32) -> tuple[np.ndarray, np.ndarray, nib.Nifti1Header]:
-    """Full 4D array (X, Y, Z, T), affine and header. Integer dtypes are rounded, not truncated."""
-    img = nib.load(str(path))
-    arr = np.asarray(img.dataobj, dtype=np.float32)
-    if np.issubdtype(dtype, np.integer):
-        arr = np.rint(arr).astype(dtype)                                   # scaled label files store 1 as 0.9999999
-    if arr.ndim == 3:
-        arr = arr[..., None]
-    return arr, img.affine.astype(np.float64), img.header.copy()
+def prepare_subject(subject: Subject, args) -> dict:
+    """The internal form of a subject: --n-frames evenly spaced frames per slice (the same number for every slice),
+    SAX slices one by one, every other image as a stack (X, Y, Z, F) with per-slice affines (Z, 4, 4), and, for images
+    with a segmentation, the dilated heart mask (--mask-dilation-mm) and the distance to the heart (mm, for mask
+    annealing) per slice. A non-SAX image whose segmentation contains no heart is left out of the alignment (it is
+    still written, unaligned, by the loader); one without a segmentation takes part unmasked."""
+    out = dict(subject_id=subject.subject_id, status=subject.status, sax=[], lax={}, order=[])
+    if not subject.slices:
+        out["status"] = "no_images"
+        return out
+    n_f = min([args.n_frames] + [s.data.shape[-1] for s in subject.slices])
 
+    def frames(a):
+        return a[..., phase_frames(a.shape[-1], n_f)]
 
-def sax_slice_files(subj_dir: Path) -> dict[int, Path]:
-    """{slice index: path} of the subject's SAX_slice<nn>.nii.gz files."""
-    out = {}
-    for p in subj_dir.glob("SAX_slice*.nii.gz"):
-        digits = p.name[len("SAX_slice"):-len(".nii.gz")]
-        if digits.isdigit():
-            out[int(digits)] = p
-    return dict(sorted(out.items()))
-
-
-def load_subject(subj_dir: Path, args) -> dict:
-    """Load one subject laid out as single-slice NIfTIs (see prepare_ukbb_slices.py):
-        <subj_dir>/SAX_slice<nn>.nii.gz, LAX_2Ch.nii.gz, LAX_3Ch.nii.gz, LAX_4Ch.nii.gz
-        <subj_dir>/nnUNet_segs/<same stem>_nnUNetSeg.nii.gz
-    Every SAX slice is its own (X, Y, 1, T) image with its own affine; nothing assumes a regular stack.
-    data["sax"] is a list of per-slice dicts {index, arr, affine, seg}; data["lax"] holds the LAX views that can take
-    part in the alignment (those with a segmentation containing the heart, which defines their mask).
-    data["full"] / data["full_seg"] hold the complete cines of *every* image present by plane key ("SAX:<nn>",
-    "LAX_2Ch:0", ...) for writing the output; images that are not aligned are written with their acquired affine.
-    Any subset of the images may be missing; status is "ok", or "no_images" if there is none."""
-    out = {"subject_id": subj_dir.name, "status": "ok", "sax": [], "lax": {}, "full": {}, "full_seg": {}}
-    for z, path in sax_slice_files(subj_dir).items():
-        arr, aff, header = load_nifti(path)
-        if arr.shape[2] != 1:
-            raise ValueError(f"{path}: expected a single slice, got shape {arr.shape}")
-        frames = phase_frames(arr.shape[3], args.n_frames)
-        entry = dict(index=z, arr=arr[..., frames], affine=aff, seg=None)
-        out["full"][f"SAX:{z}"] = (arr, aff, header)
-        seg_path = subj_dir / SEG_DIR / f"{path.name[:-len('.nii.gz')]}_nnUNetSeg.nii.gz"
-        if seg_path.exists():
-            seg, _, seg_header = load_nifti(seg_path, dtype=np.int16)
-            if seg.shape == arr.shape:
-                entry["seg"] = seg[..., frames]
-                out["full_seg"][f"SAX:{z}"] = (seg, seg_header)
-        out["sax"].append(entry)
-
-    for view in LAX_VIEWS:
-        img_path = subj_dir / f"{view}.nii.gz"
-        seg_path = subj_dir / SEG_DIR / f"{view}_nnUNetSeg.nii.gz"
-        if not img_path.exists():
+    for s in subject.slices:
+        if s.image not in out["order"]:
+            out["order"].append(s.image)
+    for s in sorted((s for s in subject.slices if s.image == "SAX"), key=lambda s: s.index):
+        out["sax"].append(dict(index=s.index, arr=frames(s.data)[:, :, None].astype(np.float32), affine=s.affine,
+                               seg=None if s.seg is None else frames(s.seg)[:, :, None], thickness=s.thickness))
+    for image in out["order"]:
+        if image == "SAX":
             continue
-        a, affine, header = load_nifti(img_path)
-        out["full"][f"{view}:0"] = (a, affine, header)
-        if not seg_path.exists():
-            continue
-        seg, _, seg_header = load_nifti(seg_path, dtype=np.int16)
-        if view == "LAX_2Ch":
-            seg[seg == 3] = 4                                   # 2Ch has no class 3; its class 3 is class 4 elsewhere
-        frames = phase_frames(a.shape[3], args.n_frames)
-        zooms = header.get_zooms()
-        seg_sub = seg[..., frames] if seg.shape == a.shape else None
-        if seg_sub is not None:
-            out["full_seg"][f"{view}:0"] = (seg, seg_header)
-        heart = (seg > 0).any(-1)[:, :, 0]
-        if not heart.any():
-            continue
-        dist = distance_transform_edt(~heart, sampling=zooms[:2])
-        mask = (dist <= args.mask_dilation_mm)[:, :, None]
-        thickness = args.lax_thickness if args.lax_thickness else float(zooms[2])
-        out["lax"][view] = dict(arr=a[..., frames], affine=affine, mask=mask, seg=seg_sub, thickness=thickness,
-                                dist=dist.astype(np.float32))      # distance to the heart (mm), for mask annealing
-
-    if not out["full"]:
+        sl = sorted((s for s in subject.slices if s.image == image), key=lambda s: s.index)
+        if len({s.data.shape[:2] for s in sl}) > 1:
+            raise ValueError(f"{subject.subject_id}: the slices of image {image} differ in size")
+        arr = np.stack([frames(s.data) for s in sl], 2).astype(np.float32)          # (X, Y, Z, F)
+        entry = dict(arr=arr, affine=np.stack([s.affine for s in sl]), mask=None, seg=None,
+                     thickness=sl[0].thickness, dist=None)
+        if any(s.seg is not None for s in sl):
+            seg = np.stack([frames(s.seg) if s.seg is not None else np.zeros_like(frames(s.data), np.int16)
+                            for s in sl], 2)
+            entry["seg"] = seg
+            heart = np.stack([(s.seg > 0).any(-1) if s.seg is not None else np.zeros(s.data.shape[:2], bool)
+                              for s in sl], 2)                                       # (X, Y, Z), union over all frames
+            if not heart.any():
+                continue                                                             # segmented, but no heart
+            spacing = tuple(float(np.linalg.norm(sl[0].affine[:3, k])) for k in (0, 1))
+            dist = np.full(heart.shape, np.inf, np.float32)                          # inf: slice without heart
+            for z in range(len(sl)):
+                if heart[:, :, z].any():
+                    dist[:, :, z] = distance_transform_edt(~heart[:, :, z], sampling=spacing)
+            entry.update(dist=dist, mask=dist <= args.mask_dilation_mm)
+        out["lax"][image] = entry
+    if not out["sax"] and not out["lax"]:
         out["status"] = "no_images"
     return out
 
@@ -298,15 +305,19 @@ def build_planes(data: dict, args, device, with_seg: bool = True) -> tuple[list[
     only needed for the Dice / Hausdorff metrics; the LAX heart masks are built from them at load time)."""
     l2 = getattr(args, "metric", "ncc") in ("l1", "l2")              # intensity-difference metrics need a common scale
     sax_ref = np.concatenate([e["arr"].ravel() for e in data["sax"]]) if l2 and data["sax"] else None
+    order = data.get("order", [])
+    rank = lambda name: order.index(name) if name in order else len(order)  # noqa: E731
     sax_planes = []
     for e in data["sax"]:
         arr = normalize_intensity(e["arr"], ref=sax_ref) if l2 else e["arr"]
-        sax_planes += make_planes("SAX", arr, e["affine"], args.sax_thickness, None, e["seg"] if with_seg else None,
-                                  device, first_index=e["index"])
+        sax_planes += make_planes("SAX", arr, e["affine"], e.get("thickness", args.sax_thickness), None,
+                                  e["seg"] if with_seg else None,
+                                  device, first_index=e["index"], stack_rank=rank("SAX"))
     lax_planes = []
     for view, d in data["lax"].items():
         arr = normalize_intensity(d["arr"]) if l2 else d["arr"]
-        lax_planes += make_planes(view, arr, d["affine"], d["thickness"], d["mask"], d["seg"] if with_seg else None, device)
+        lax_planes += make_planes(view, arr, d["affine"], d["thickness"], d["mask"], d["seg"] if with_seg else None, device,
+                                  stack_rank=rank(view))
     # programmatic callers without the option (older runs' configs) keep the image-centre rotation they were made with
     set_rotation_pivots(sax_planes, lax_planes, getattr(args, "rotation_pivot", "image-centre"))
     return sax_planes, lax_planes
@@ -318,16 +329,17 @@ def set_rotation_pivots(sax_planes: list[Plane], lax_planes: list[Plane], mode: 
     image-centre: the centre of the plane's pixel grid. The heart is typically 20-60 mm away from it, so a rotation
       also displaces the heart by ~angle x that distance, which the translation has to cancel: rotation and
       translation are entangled.
-    long-axis: a point on the LV long axis (the crossing line of the two most perpendicular LAX views, acquired
-      geometry, see long_axis_line): for a SAX slice where the axis pierces it, for a LAX view the heart centre (the
-      mean of the SAX pivots, i.e. the axis at mid-stack) projected onto the view. Rotations then turn the plane about
-      the heart, leaving it in place, and t is the heart's displacement. Falls back to image-centre without an axis.
+    long-axis: a point on the LV long axis (see heart_axis: the crossing line of the two most perpendicular LAX views,
+      acquired geometry, or without two such views the axis through the centre of the first stack): for a SAX slice
+      where the axis pierces it, for any other plane the heart centre (the mean of the SAX pivots, i.e. the axis at
+      mid-stack) projected onto the plane. Rotations then turn the plane about the heart, leaving it in place, and t is
+      the heart's displacement.
     """
     for p in sax_planes + lax_planes:
         p.pivot = None
     if mode != "long-axis":
         return
-    axis = long_axis_line(lax_planes)
+    axis = heart_axis(sax_planes, lax_planes)
     if axis is None:
         return
     L0, ell = axis[0], axis[1] / np.linalg.norm(axis[1])
@@ -348,14 +360,19 @@ def set_rotation_pivots(sax_planes: list[Plane], lax_planes: list[Plane], mode: 
 
 
 def make_planes(image: str, arr: np.ndarray, affine: np.ndarray, thickness: float,
-                mask_arr: np.ndarray | None, seg_arr: np.ndarray | None, device, first_index: int = 0) -> list[Plane]:
-    """Planes of a (X, Y, Z, F) image; plane z gets slice index first_index + z. Every input file holds one slice
-    (Z = 1), so first_index is the slice's own index (SAX_slice<nn>) and its affine is the file's affine."""
+                mask_arr: np.ndarray | None, seg_arr: np.ndarray | None, device, first_index: int = 0,
+                stack_rank: int = 0) -> list[Plane]:
+    """Planes of a (X, Y, Z, F) image; plane z gets slice index first_index + z and the affine of slice z: affine is
+    either one per slice (Z, 4, 4) or the stack's (4, 4), whose origin is then moved to slice z. SAX slices come one at
+    a time (Z = 1, first_index = the slice's index); other images may be stacks (first_index 0)."""
     X, Y, Z, _ = arr.shape
     planes = []
     for z in range(Z):
-        A = affine.copy()
-        A[:3, 3] = (affine @ np.array([0.0, 0.0, z, 1.0]))[:3]
+        if affine.ndim == 3:
+            A = affine[z].copy()
+        else:
+            A = affine.copy()
+            A[:3, 3] = (affine @ np.array([0.0, 0.0, z, 1.0]))[:3]
         inv = torch.linalg.inv(torch.from_numpy(A)).numpy()
         u, v = A[:3, 0], A[:3, 1]
         n = np.cross(u, v)
@@ -373,7 +390,7 @@ def make_planes(image: str, arr: np.ndarray, affine: np.ndarray, thickness: floa
             origin=A[:3, 3].copy(),
             center=(A @ np.array([(X - 1) / 2, (Y - 1) / 2, 0.0, 1.0]))[:3],
             u_hat=u / np.linalg.norm(u), v_hat=v / np.linalg.norm(v), normal=n, thickness=thickness,
-            spacing=(float(np.linalg.norm(u)), float(np.linalg.norm(v))), affine=A.copy(),
+            spacing=(float(np.linalg.norm(u)), float(np.linalg.norm(v))), affine=A.copy(), stack_rank=stack_rank,
         ))
     return planes
 
@@ -520,7 +537,7 @@ def soft_nmi(a: torch.Tensor, b: torch.Tensor, w: torch.Tensor, bins: int = 24, 
         return k / k.sum(-1, keepdim=True).clamp_min(eps)
 
     pa, pb = parzen(to_unit(a)), parzen(to_unit(b))
-    joint = torch.einsum("msk,msl,ms->mkl", pa, pb, w) / ws[..., None]         # (M, bins, bins)
+    joint = torch.bmm((pa * w[..., None]).transpose(1, 2), pb) / ws[..., None]  # (M, bins, bins), no (M, S, b, b)
     pa_m, pb_m = joint.sum(2), joint.sum(1)
     h_ab = -(joint * torch.log(joint + eps)).sum((1, 2))
     h_a = -(pa_m * torch.log(pa_m + eps)).sum(1)
@@ -591,6 +608,95 @@ def lncc_similarity(a: torch.Tensor, b: torch.Tensor, w: torch.Tensor, k: int, m
     return ((loc * wt).sum(-1) / wt.sum(-1).clamp_min(1e-6)).mean(1)
 
 
+class ImageVolume:
+    """All planes' images in one zero-padded volume (1, F, D, Hmax, Wmax), plane p at depth p, stored once per subject
+    in the sampling precision (--sample-dtype) and shared by its samplers.
+
+    Any set of lines is sampled with one 3D grid_sample call (line-major: the cost scales with the lines sampled, e.g.
+    a --pair-keep subset). Trilinear sampling at plane p's depth is the bilinear sample of plane p: in float32 the
+    normalized depth 2p / (D - 1) - 1 round-trips to p within ~1e-5 (a negligible weight on the neighbour); in float16
+    / bfloat16 D is padded to 2^k + 1, where depth and un-normalization are exact. Pixels beyond a plane's own size are
+    zeros, as outside the image with padding_mode="zeros". In half precision, images brighter than 32768 are scaled by
+    an exact power of two (the metrics are invariant to the intensity scale; float16 holds integers to 2048 exactly,
+    blurred values to ~0.05%).
+
+    raw holds the originals; vol the images sampled -- the same tensor until an in-plane blur is first set, then a
+    blurred copy (allocated before any CUDA graph is captured, as the blur is set before the first step). The planes'
+    img / seg become views into raw / seg, so the images are held once. seg (segmentations, nearest sampling; -1
+    inside a plane without one) exists only when a plane has one.
+    """
+
+    def __init__(self, planes: list[Plane], device, dtype=torch.float32):
+        N, self.nf = len(planes), planes[0].img.shape[0]
+        self.dtype = dtype
+        self.Hmax, self.Wmax = max(p.H for p in planes), max(p.W for p in planes)
+        self.D = max(2, N) if dtype == torch.float32 else 2 ** max(1, math.ceil(math.log2(max(2, N - 1)))) + 1
+        self.depth = torch.tensor([2.0 * p / (self.D - 1) - 1.0 for p in range(N)], dtype=torch.float32, device=device)
+        shape = (1, self.nf, self.D, self.Hmax, self.Wmax)
+        peak = max(float(p.img.abs().max()) for p in planes)
+        self.scale = 1.0 if dtype == torch.float32 or peak <= 32768 else 2.0 ** -math.ceil(math.log2(peak / 32768))
+        self.raw = torch.zeros(shape, dtype=dtype, device=device)
+        self.seg = torch.zeros(shape, dtype=dtype, device=device) if any(p.seg is not None for p in planes) else None
+        self.groups = []                                 # planes of equal size, blurred together
+        by_size = {}
+        for p, plane in enumerate(planes):
+            by_size.setdefault((plane.H, plane.W), []).append(p)
+        for (H, W), members in by_size.items():
+            self.groups.append(dict(H=H, W=W, pidx=torch.tensor(members, device=device),
+                                    spacing_list=[list(planes[p].spacing) for p in members]))
+        for p, pl in enumerate(planes):
+            H, W = pl.H, pl.W
+            self.raw[0, :, p, :H, :W] = pl.img[:, 0] * self.scale
+            pl.img = self.raw[0, :, p, :H, :W][:, None]              # (F, 1, H, W) view: the plane's own copy is freed
+            if self.seg is not None:
+                self.seg[0, :, p, :H, :W] = pl.seg[:, 0] if pl.seg is not None else -1.0
+                if pl.seg is not None:
+                    pl.seg = self.seg[0, :, p, :H, :W][:, None]
+        self.vol = self.raw
+        self.cur_sigma = 0.0
+
+    @torch.no_grad()
+    def set_blur(self, sigma_mm: float) -> None:
+        """Write in-plane Gaussian-blurred versions of the originals (sigma in mm; 0 = the originals) into vol.
+
+        Updated in place (CUDA graphs keep pointing at it); nothing is done if sigma is unchanged. Blurred in float32,
+        stored in the volume's precision."""
+        if sigma_mm == self.cur_sigma:
+            return
+        self.cur_sigma = sigma_mm
+        if sigma_mm > 1e-6 and self.vol is self.raw:
+            self.vol = self.raw.clone()
+        if self.vol is self.raw:
+            return
+        if sigma_mm <= 1e-6:
+            self.vol.copy_(self.raw)
+            return
+        for gr in self.groups:
+            raw = self.raw[0, :, gr["pidx"], :gr["H"], :gr["W"]].transpose(0, 1).float()     # (G, F, H, W)
+            self.vol[0, :, gr["pidx"], :gr["H"], :gr["W"]] = self._blur(raw, gr["spacing_list"], sigma_mm).transpose(0, 1).to(self.dtype)
+
+    @staticmethod
+    def _blur(raw: torch.Tensor, spacing_list: list, sigma_mm: float) -> torch.Tensor:
+        """(G, F, H, W) images blurred in-plane with sigma (mm), per plane in its own pixel spacing."""
+        G, Fn, H, W = raw.shape
+        sig = [[max(sigma_mm / s, 1e-3) for s in row] for row in spacing_list]       # voxels, per plane/axis
+        r = int(math.ceil(3.0 * max(max(row) for row in sig)))
+        x = torch.arange(-r, r + 1, device=raw.device, dtype=raw.dtype)
+        sig_t = torch.tensor(sig, device=raw.device, dtype=raw.dtype)            # (G, 2)
+        k = torch.exp(-0.5 * (x[None, None, :] / sig_t[:, :, None]) ** 2)      # (G, 2, 2r+1)
+        k = (k / k.sum(-1, keepdim=True)).repeat_interleave(Fn, dim=0)          # (G*F, 2, 2r+1)
+        out = F.pad(raw.reshape(1, G * Fn, H, W), (r, r, r, r), mode="replicate")
+        out = F.conv2d(out, k[:, 0][:, None, :, None], groups=G * Fn)          # along image axis 0 (H)
+        out = F.conv2d(out, k[:, 1][:, None, None, :], groups=G * Fn)          # along image axis 1 (W)
+        return out.reshape(G, Fn, H, W)
+
+    def sample(self, grid: torch.Tensor, kind: str = "img", mode: str = "bilinear") -> torch.Tensor:
+        """grid_sample of vol (kind 'img') or seg at grid (1, Do, Ho, Wo, 3) (float32; cast to the volume's precision)
+        -> (F, Do, Ho, Wo), in the volume's precision."""
+        src = self.vol if kind == "img" else self.seg
+        return F.grid_sample(src, grid.to(self.dtype), mode=mode, padding_mode="zeros", align_corners=True)[0]
+
+
 class LineSampler:
     """Samples both images (or segmentations) of every intersection line for arbitrary rigid poses.
 
@@ -599,8 +705,12 @@ class LineSampler:
     """
 
     def __init__(self, planes: list[Plane], lines: list[tuple[int, int, Line]], n_band: int, device,
-                 psf_model: str = "pulse", psf_tbw: float = 2.5, psf_scale_max: float = 1.0):
+                 psf_model: str = "pulse", psf_tbw: float = 2.5, psf_scale_max: float = 1.0, sample_dtype: str = "float32",
+                 images: "ImageVolume | None" = None):
         self.planes, self.device = planes, device
+        # image precision (--sample-dtype): images stored and sampled (with the sample coordinates) in half precision;
+        # the poses, the line geometry and the metrics stay float32
+        self.lp = None if sample_dtype == "float32" else getattr(torch, sample_dtype)
         self.N, self.M = len(planes), len(lines)
         self.nf = planes[0].img.shape[0]
         self.psf_model, self.psf_tbw = psf_model, psf_tbw
@@ -624,7 +734,6 @@ class LineSampler:
                       if self.K > 1 else torch.zeros(1, device=device))
         self.u_seg, self.w_seg = torch.zeros(1, device=device), torch.ones(1, device=device)
         self.psf_scale = torch.ones((), device=device)
-        self.cur_sigma = 0.0
 
         Lmax = max(l.t.numel() for _, _, l in lines)
         self.Lmax = Lmax
@@ -654,40 +763,9 @@ class LineSampler:
         self.inv_rot = torch.stack([p.inv_rot for p in planes])
         self.inv_trans = torch.stack([p.inv_trans for p in planes])
 
-        self.groups = []
-        by_size = {}
-        for p, plane in enumerate(planes):
-            by_size.setdefault((plane.H, plane.W), []).append(p)
-        for (H, W), members in by_size.items():
-            entries = [[(int(m), 0) for m in la_idx[p]] + [(int(m), 1) for m in lb_idx[p]] for p in members]
-            nmax = max(len(e) for e in entries)
-            if nmax == 0:
-                continue
-            line_ids = torch.zeros(len(members), nmax, dtype=torch.long, device=device)
-            side = torch.zeros(len(members), nmax, dtype=torch.long, device=device)
-            e_g, e_slot, e_m, e_side = [], [], [], []
-            for g, e in enumerate(entries):
-                for s, (m, sd) in enumerate(e):
-                    line_ids[g, s], side[g, s] = m, sd
-                    e_g.append(g), e_slot.append(s), e_m.append(m), e_side.append(sd)
-            imgs = torch.cat([planes[p].img.transpose(0, 1) for p in members])
-            segs = torch.cat([planes[p].seg.transpose(0, 1) if planes[p].seg is not None
-                              else torch.full_like(planes[p].img.transpose(0, 1), -1.0) for p in members])
-            self.groups.append(dict(
-                H=H, W=W, nmax=nmax, pidx=torch.tensor(members, device=device), img=imgs.clone(), img_raw=imgs, seg=segs,
-                spacing=torch.tensor([planes[p].spacing for p in members], dtype=torch.float32, device=device),
-                spacing_list=[list(planes[p].spacing) for p in members],
-                line_ids=line_ids, side=side,
-                e_g=torch.tensor(e_g, device=device), e_slot=torch.tensor(e_slot, device=device),
-                e_m=torch.tensor(e_m, device=device), e_side=torch.tensor(e_side, device=device),
-            ))
-
-        # static scatter indices from the per-group profiles back to (line, side) -- precomputed so that profiles()
-        # does no boolean indexing (which needs a host sync and cannot be captured in a CUDA graph)
-        em = torch.cat([gr["e_m"] for gr in self.groups])
-        es = torch.cat([gr["e_side"] for gr in self.groups])
-        self.pos_a, self.pos_b = torch.nonzero(es == 0).squeeze(1), torch.nonzero(es == 1).squeeze(1)
-        self.m_a, self.m_b = em[self.pos_a], em[self.pos_b]
+        # the planes' images (shared between the samplers of one subject, e.g. the mask-annealing stages)
+        self.img = images if images is not None else ImageVolume(planes, device, self.lp or torch.float32)
+        self.eval_chunk = 1024                           # lines per chunk when sampling all lines without gradients
 
         # which labels each plane's segmentation contains anywhere, per frame: (N, F, max_label + 1)
         max_label = max([int(p.seg.max()) for p in planes if p.seg is not None] + [0])
@@ -712,31 +790,9 @@ class LineSampler:
             counted = allowed & pres_a[..., lab] & pres_b[..., lab] & (ma.any(-1) | mb.any(-1))  # (M, F)
             yield lab, counted, ma, mb
 
-    @torch.no_grad()
     def set_blur(self, sigma_mm: float) -> None:
-        """Write in-plane Gaussian-blurred versions of the originals (sigma in mm) into the persistent image buffers.
-
-        The buffers are updated in place (CUDA graphs keep pointing at them); nothing is done if sigma is unchanged.
-        """
-        if sigma_mm == self.cur_sigma:
-            return
-        self.cur_sigma = sigma_mm
-        for gr in self.groups:
-            if sigma_mm <= 1e-6:
-                gr["img"].copy_(gr["img_raw"])
-                continue
-            raw = gr["img_raw"]                                                    # (G, F, H, W)
-            G, Fn, H, W = raw.shape
-            sig = [[max(sigma_mm / s, 1e-3) for s in row] for row in gr["spacing_list"]]   # voxels, per plane/axis
-            r = int(math.ceil(3.0 * max(max(row) for row in sig)))
-            x = torch.arange(-r, r + 1, device=raw.device, dtype=raw.dtype)
-            sig_t = torch.tensor(sig, device=raw.device, dtype=raw.dtype)            # (G, 2)
-            k = torch.exp(-0.5 * (x[None, None, :] / sig_t[:, :, None]) ** 2)      # (G, 2, 2r+1)
-            k = (k / k.sum(-1, keepdim=True)).repeat_interleave(Fn, dim=0)          # (G*F, 2, 2r+1)
-            out = F.pad(raw.reshape(1, G * Fn, H, W), (r, r, r, r), mode="replicate")
-            out = F.conv2d(out, k[:, 0][:, None, :, None], groups=G * Fn)          # along image axis 0 (H)
-            out = F.conv2d(out, k[:, 1][:, None, None, :], groups=G * Fn)          # along image axis 1 (W)
-            gr["img"].copy_(out.reshape(G, Fn, H, W))
+        """In-plane Gaussian blur (sigma in mm) of the images that are sampled (see ImageVolume.set_blur)."""
+        self.img.set_blur(sigma_mm)
 
     def set_psf_scale(self, scale: float) -> None:
         """Width of the PSF band relative to the nominal slice profile (1 = physical)."""
@@ -758,8 +814,15 @@ class LineSampler:
         s = self.psf_sigma * math.sqrt(2.0)
         return 0.5 * (torch.erf((x + 0.5) / s) - torch.erf((x - 0.5) / s))
 
-    def profiles(self, theta_deg: torch.Tensor, t: torch.Tensor, kind: str = "img") -> tuple[torch.Tensor, torch.Tensor]:
-        """Profiles of both planes of every line at the given poses -> (M, F, Lmax) x 2."""
+    def profiles(self, theta_deg: torch.Tensor, t: torch.Tensor, kind: str = "img",
+                 sel: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+        """Profiles of both planes of every line (or of the lines `sel`, an index tensor) at the given poses
+        -> (M or len(sel), F, Lmax) x 2. Only the requested lines are sampled; without gradients all lines are
+        sampled in chunks of self.eval_chunk lines."""
+        if sel is None and not torch.is_grad_enabled() and self.M > self.eval_chunk:
+            parts = [self.profiles(theta_deg, t, kind, torch.arange(s, min(s + self.eval_chunk, self.M), device=self.device))
+                     for s in range(0, self.M, self.eval_chunk)]
+            return torch.cat([p[0] for p in parts]), torch.cat([p[1] for p in parts])
         band = kind == "img"
         mode = "bilinear" if band else "nearest"
         # PSF: samples are placed across the other slice's profile (through-plane offsets u, in units of that
@@ -776,13 +839,13 @@ class LineSampler:
         # intersection_line, where the masks were made), so anchor on the posed image centre, not the rotation pivot
         Gp = (R @ (self.Ctr - self.C)[..., None])[..., 0] + Cp
 
-        IA, IB = self.IA, self.IB
+        IA, IB, T = (self.IA, self.IB, self.T) if sel is None else (self.IA[sel], self.IB[sel], self.T[sel])
         na, nb = Np[IA], Np[IB]
         d = torch.cross(na, nb, dim=1)
         d = d / d.norm(dim=1, keepdim=True)
         rhs = torch.stack([(na * Op[IA]).sum(1), (nb * Op[IB]).sum(1), (d * Gp[IB]).sum(1)], 1)
         x0 = solve3_rows(na, nb, d, rhs)
-        pts = x0[:, None, :] + self.T[:, :, None] * d[:, None, :]              # (M, Lmax, 3)
+        pts = x0[:, None, :] + T[:, :, None] * d[:, None, :]                   # (M, Lmax, 3)
 
         # band directions: the other plane's normal projected into this plane. Moving a distance x along this
         # in-plane direction moves sin(theta) * x along the other plane's normal (theta = crossing angle), so a
@@ -795,27 +858,24 @@ class LineSampler:
         sig_a = self.thick[IB] / sin_ab[:, 0]                                 # mm per unit of u inside A (B's slab)
         sig_b = self.thick[IA] / sin_ab[:, 0]                                 # and inside B (A's slab)
 
-        prof_parts = []
-        for gr in self.groups:
-            li, sd, pidx = gr["line_ids"], gr["side"], gr["pidx"]
-            mdir = torch.where(sd[..., None] == 0, ma[li], mb[li])
-            sig = torch.where(sd == 0, sig_a[li], sig_b[li])
-            P = pts[li][:, :, :, None, :] + u[None, None, None, :, None] * sig[:, :, None, None, None] * mdir[:, :, None, None, :]
-            G = P.shape[0]
-            P = P.reshape(G, -1, 3)
-            # world -> plane-local (undo the pose) -> voxel, folded into one affine map per plane
-            A = torch.einsum("gij,gkj->gik", self.inv_rot[pidx], R[pidx])            # inv_rot @ R^T
-            bvec = (torch.einsum("gij,gj->gi", self.inv_rot[pidx], self.C[pidx]) + self.inv_trans[pidx]
-                    - torch.einsum("gij,gj->gi", A, Cp[pidx]))
-            vox = torch.einsum("gnj,gij->gni", P, A) + bvec[:, None, :]
-            grid = torch.stack([2 * vox[..., 1] / (gr["W"] - 1) - 1, 2 * vox[..., 0] / (gr["H"] - 1) - 1], -1)
-            out = F.grid_sample(gr[kind], grid[:, None], mode=mode, padding_mode="zeros", align_corners=True)
-            out = (out[:, :, 0].view(G, self.nf, gr["nmax"], self.Lmax, K) * wts).sum(-1)
-            prof_parts.append(out[gr["e_g"], :, gr["e_slot"]])
-        prof = torch.cat(prof_parts)
-        profA = torch.zeros(self.M, self.nf, self.Lmax, device=self.device).index_put((self.m_a,), prof[self.pos_a])
-        profB = torch.zeros(self.M, self.nf, self.Lmax, device=self.device).index_put((self.m_b,), prof[self.pos_b])
-        return profA, profB
+        # both sides of every line in one batch: side A samples plane IA across B's slab (direction ma, width sig_a),
+        # side B plane IB across A's slab
+        plane = torch.cat([IA, IB])                                            # (2M,)
+        mdir = torch.cat([ma, mb])
+        sig = torch.cat([sig_a, sig_b])
+        P = pts.repeat(2, 1, 1)[:, :, None, :] + u[None, None, :, None] * sig[:, None, None, None] * mdir[:, None, None, :]
+        # world -> plane-local (undo the pose) -> voxel, folded into one affine map per sampled plane
+        A = torch.einsum("pij,pkj->pik", self.inv_rot[plane], R[plane])             # inv_rot @ R^T
+        bvec = (torch.einsum("pij,pj->pi", self.inv_rot[plane], self.C[plane]) + self.inv_trans[plane]
+                - torch.einsum("pij,pj->pi", A, Cp[plane]))
+        vox = torch.einsum("plkj,pij->plki", P, A) + bvec[:, None, None, :]   # (2M, Lmax, K, 3)
+        iv = self.img
+        z = iv.depth[plane][:, None, None].expand_as(vox[..., 0])
+        grid = torch.stack([2 * vox[..., 1] / (iv.Wmax - 1) - 1, 2 * vox[..., 0] / (iv.Hmax - 1) - 1, z], -1)
+        out = iv.sample(grid[None], kind, mode)                                # (F, 2M, Lmax, K)
+        out = (out * wts.to(out.dtype)).sum(-1).float().transpose(0, 1)       # (2M, F, Lmax)
+        n = IA.shape[0]
+        return out[:n], out[n:]
 
     def ncc_lines(self, theta_deg, t, use_gradient: bool, prof=None, W=None) -> torch.Tensor:
         a, b = prof if prof is not None else self.profiles(theta_deg, t, "img")
@@ -826,7 +886,8 @@ class LineSampler:
         """Normalized mutual information per line, samples pooled over frames -> (M,)."""
         a, b = prof if prof is not None else self.profiles(theta_deg, t, "img")
         w = (self.W if W is None else W)[:, None, :].expand_as(a)
-        return soft_nmi(a.reshape(self.M, -1), b.reshape(self.M, -1), w.reshape(self.M, -1), bins, sigma_bins)
+        m = a.shape[0]
+        return soft_nmi(a.reshape(m, -1), b.reshape(m, -1), w.reshape(m, -1), bins, sigma_bins)
 
     def l2_lines(self, theta_deg, t, prof=None, W=None) -> torch.Tensor:
         """Negative weighted mean squared intensity difference per line, mean over frames -> (M,) (higher = better).
@@ -835,10 +896,14 @@ class LineSampler:
         w = (self.W if W is None else W)[:, None, :]
         return -((w * (a - b) ** 2).sum(-1) / w.sum(-1).clamp_min(1.0)).mean(1)
 
-    def similarity_lines(self, theta_deg, t, args, prof=None, W=None) -> torch.Tensor:
+    def similarity_lines(self, theta_deg, t, args, prof=None, W=None, sel=None) -> torch.Tensor:
         """The optimized similarity per line (--metric), with the loss weights W_loss (points outside the mask
-        down-weighted by --outside-mask-weight) or the given W (e.g. self.W: the mask points only) -> (M,)."""
+        down-weighted by --outside-mask-weight) or the given W (e.g. self.W: the mask points only) -> (M,).
+        sel: only the lines with these indices are sampled and scored -> (len(sel),)."""
         W = self.W_loss if W is None else W
+        if sel is not None:
+            W = W[sel]
+            prof = self.profiles(theta_deg, t, "img", sel) if prof is None else prof
         if args.metric == "nmi":
             return self.nmi_lines(theta_deg, t, args.nmi_bins, args.nmi_sigma, prof, W)
         if args.metric == "l2":
@@ -949,8 +1014,93 @@ def long_axis_line(lax_planes: list[Plane]) -> tuple[np.ndarray, np.ndarray] | N
     return torch.linalg.solve(torch.from_numpy(M), torch.from_numpy(rhs)).numpy(), d
 
 
+def stack_frame(planes: list[Plane]) -> tuple[np.ndarray, np.ndarray]:
+    """(centre, unit normal) of a set of (near-)parallel planes: the mean of their centres and of their normals."""
+    n0 = planes[0].normal
+    n = np.mean([p.normal if p.normal @ n0 >= 0 else -p.normal for p in planes], 0)
+    return np.mean([p.center for p in planes], 0), n / np.linalg.norm(n)
+
+
+def heart_axis(sax_planes: list[Plane], lax_planes: list[Plane]) -> tuple[np.ndarray, np.ndarray] | None:
+    """(point, unit direction) of the LV long axis used for the rotation pivots and the SAX-SAX terms.
+
+    With two non-parallel single-slice long-axis views (the UKBB 2Ch / 3Ch / 4Ch views; images of one slice that are
+    not SAX): their crossing line (long_axis_line). Otherwise, as no long axis can be derived, the line through the
+    centre of the first stack along its normal: the SAX image if there is one (its normal approximates the long axis),
+    else the image found first (the loader's order). None without planes."""
+    count = {}
+    for p in lax_planes:
+        count[p.image] = count.get(p.image, 0) + 1
+    axis = long_axis_line([p for p in lax_planes if count[p.image] == 1])
+    if axis is not None or not (sax_planes or lax_planes):
+        return axis
+    first = sax_planes or min(([p for p in lax_planes if p.image == im] for im in count),
+                              key=lambda ps: ps[0].stack_rank)
+    return stack_frame(first)
+
+
+def stack_spacing(planes: list[Plane]) -> float:
+    """Median distance (mm) between neighbouring slices of a stack along its normal (0 for a single slice)."""
+    if len(planes) < 2:
+        return 0.0
+    _, n = stack_frame(planes)
+    pos = np.sort([p.center @ n for p in planes])
+    return float(np.median(np.diff(pos)))
+
+
+def candidate_pairs(planes: list[Plane], args) -> list[tuple[Plane, Plane]]:
+    """The plane pairs whose intersection lines enter the loss (acquired geometry), in plane order (SAX first).
+
+    A pair is a candidate when the planes cross at an angle of at least --min-pair-angle-deg (slices of one stack are
+    parallel and never pair; nearly parallel slices give ill-conditioned lines). Between two stacks of several slices
+    the pairs are thinned (--pair-spacing-mm, default each stack's slice thickness): densely spaced, thick slices
+    overlap, so the lines of neighbouring slices carry nearly the same information. With k = max over both stacks of
+    round(pair spacing / slice spacing), slices of rank i and j along their stacks pair when (i + j) % k == 0: every
+    slice keeps partners k slices apart in the other stack, at a different phase than its neighbours, so every slice
+    still has lines. Single slices (e.g. the UKBB LAX views) are never thinned. Whether a candidate's line lies inside
+    both images (and the masks) is decided by intersection_line."""
+    cos_max = math.cos(math.radians(getattr(args, "min_pair_angle_deg", 20.0)))
+    spacing_opt = getattr(args, "pair_spacing_mm", -1.0)
+    by_image = {}
+    for p in planes:
+        by_image.setdefault(p.image, []).append(p)
+    rank, k_of = {}, {}
+    for image, ps in by_image.items():
+        _, n = stack_frame(ps)
+        for r, p in enumerate(sorted(ps, key=lambda p: float(p.center @ n))):
+            rank[p.key] = r
+        spacing = stack_spacing(ps)
+        target = ps[0].thickness if spacing_opt < 0 else spacing_opt
+        k_of[image] = max(1, int(round(target / spacing))) if spacing > 1e-6 and target > 0 else 1
+    out = []
+    for i, a in enumerate(planes):
+        for b in planes[i + 1:]:
+            if abs(float(a.normal @ b.normal)) > cos_max:
+                continue
+            if len(by_image[a.image]) > 1 and len(by_image[b.image]) > 1 and a.image != b.image:
+                k = max(k_of[a.image], k_of[b.image])
+                if (rank[a.key] + rank[b.key]) % k:
+                    continue
+            out.append((a, b))
+    return out
+
+
+def build_lines(planes: list[Plane], args, device) -> list[tuple[int, int, Line]]:
+    """(index a, index b, Line) of every candidate pair (candidate_pairs) whose line lies inside both images and the
+    masks over at least --min-line-mm (intersection_line), at the planes' current masks."""
+    index = {p.key: i for i, p in enumerate(planes)}
+    lines = []
+    with torch.no_grad():
+        for a, b in candidate_pairs(planes, args):
+            line = intersection_line(a, b, args, device)
+            if line is not None:
+                lines.append((index[a.key], index[b.key], line))
+    return lines
+
+
 class SaxNeighbourLines:
-    """Neighbouring SAX slices (indices z and z + 1): their crossing line and the gap between them.
+    """Neighbouring SAX slices (parallel as acquired and at most --parallel-max-dist-mm apart; UKBB: z and z + 1):
+    their crossing line and the gap between them.
 
     As acquired the SAX slices are parallel and ~10 mm apart, and real breath-hold tilts are a few degrees, so two
     neighbours crossing inside the heart means a pose is wrong. Two loss terms act on this (both off at weight 0):
@@ -978,19 +1128,15 @@ class SaxNeighbourLines:
     def __init__(self, sampler: LineSampler, planes: list[Plane], pairs: list[tuple[int, int]],
                  axis: tuple[np.ndarray, np.ndarray], args, device):
         self.sampler, self.device = sampler, device
-        # loss weights; 0 = only recorded (with logging). Without rotations the slices stay parallel and cannot cross,
-        # but through-plane shifts can still close the gap, so the barrier applies with --dof 3 as well
+        # loss weights; 0 = only recorded (with logging). Without tilts (--dof 3, 4) the slices stay parallel and cannot cross,
+        # but through-plane shifts can still close the gap, so the barrier applies then as well
         self.weight = float(getattr(args, "sax_sax_weight", 0.0)) if args.dof == 6 else 0.0
         self.falloff = getattr(args, "sax_sax_falloff", "gaussian")
         self.radius = float(args.sax_sax_radius_mm)
         self.gap_weight = float(getattr(args, "sax_gap_reg", 0.0))
         self.gap_margin = float(getattr(args, "sax_gap_margin_mm", 4.0))
         self.gap_radius = float(getattr(args, "sax_gap_radius_mm", 50.0))
-        loc = {}                                                 # plane -> (group, row) of its image buffer
-        for gi, gr in enumerate(sampler.groups):
-            for row, p in enumerate(gr["pidx"].tolist()):
-                loc[p] = (gi, row)
-        self.pairs = [(ia, ib) for ia, ib in pairs if ia in loc and ib in loc]
+        self.pairs = list(pairs)
         self.P = len(self.pairs)
         f32 = dict(dtype=torch.float32, device=device)
         self.IA = torch.tensor([ia for ia, _ in self.pairs], device=device)
@@ -1011,32 +1157,18 @@ class SaxNeighbourLines:
         C0, N0 = sampler.C, sampler.Nrm
         step = ((C0[self.IB] - C0[self.IA]) * N0[self.IA]).sum(1)
         self.stack_sign = torch.where(step >= 0, 1.0, -1.0)
-        # per side, the pairs grouped by image-buffer group; contiguous rows are read as a view
-        self.sides = []
-        for idx in (self.IA.tolist(), self.IB.tolist()):
-            by_group = {}
-            for k, p in enumerate(idx):
-                gi, row = loc[p]
-                by_group.setdefault(gi, []).append((k, row))
-            side = []
-            for gi, entries in by_group.items():
-                ks = torch.tensor([k for k, _ in entries], device=device)
-                rows = [r for _, r in entries]
-                contiguous = rows == list(range(rows[0], rows[0] + len(rows)))
-                side.append((gi, ks, (rows[0], rows[-1] + 1) if contiguous else torch.tensor(rows, device=device)))
-            self.sides.append(side)
+        # per pair, the barrier margin is at most half the acquired gap, so densely spaced slices (e.g. 1-3 mm) are not
+        # penalized as acquired (UKBB, ~10 mm apart: --sax-gap-margin-mm itself)
+        self.margins = torch.minimum(torch.full_like(step, self.gap_margin), 0.5 * step.abs())[:, None, None]
 
     def _sample(self, side: int, vox: torch.Tensor) -> torch.Tensor:
-        """Bilinear samples (P, F, L) of each pair's side-`side` image at voxel coordinates vox (P, L, 3)."""
-        out = torch.zeros(self.P, self.sampler.nf, self.T.numel(), device=self.device)
-        for gi, ks, rows in self.sides[side]:
-            gr = self.sampler.groups[gi]
-            img = gr["img"][rows[0]:rows[1]] if isinstance(rows, tuple) else gr["img"][rows]      # (n, F, H, W)
-            v = vox[ks]
-            grid = torch.stack([2 * v[..., 1] / (gr["W"] - 1) - 1, 2 * v[..., 0] / (gr["H"] - 1) - 1], -1)
-            s = F.grid_sample(img, grid[:, None], mode="bilinear", padding_mode="zeros", align_corners=True)   # (n, F, 1, L)
-            out = out.index_put((ks,), s[:, :, 0])
-        return out
+        """Bilinear samples (P, F, L) of each pair's side-`side` image at voxel coordinates vox (P, L, 3), read from
+        the sampler's image volume (exact plane depths, see LineSampler)."""
+        iv = self.sampler.img
+        idx = self.IA if side == 0 else self.IB
+        z = iv.depth[idx][:, None].expand_as(vox[..., 0])
+        grid = torch.stack([2 * vox[..., 1] / (iv.Wmax - 1) - 1, 2 * vox[..., 0] / (iv.Hmax - 1) - 1, z], -1)
+        return iv.sample(grid[None, :, :, None, :])[:, :, :, 0].float().transpose(0, 1)       # (P, F, L)
 
     def profiles(self, theta_deg: torch.Tensor, t: torch.Tensor):
         """At the given poses: both images' profiles (P, F, L) x 2, the point weights (P, L), which pairs cross at
@@ -1123,7 +1255,7 @@ class SaxNeighbourLines:
     def barrier(self, theta_deg: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """--sax-gap-reg term (mm^2): mean over pairs, both slices and the disk points of softplus(margin - gap)^2."""
         gap = self.gaps(theta_deg, t)["gap"]
-        return F.softplus(self.gap_margin - gap).pow(2).mean()
+        return F.softplus(self.margins - gap).pow(2).mean()
 
     def dissimilarity(self, theta_deg: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """--sax-sax-weight term: sum over pairs of (sum of point weights) x (1 - NCC), unnormalized."""
@@ -1179,6 +1311,14 @@ class SaxNeighbourLines:
         return c, w.sum(-1), dist
 
 
+def new_sampler(planes: list[Plane], lines: list[tuple[int, int, Line]], args, device,
+                images: ImageVolume | None = None) -> LineSampler:
+    """A LineSampler with the run's PSF settings and image precision (--sample-dtype); `images`: the ImageVolume of
+    another sampler of the same planes, to share (default: a new one)."""
+    return LineSampler(planes, lines, args.n_band, device, args.psf_model, args.psf_tbw, getattr(args, "psf_scale_start", 1.0),
+                       sample_dtype=getattr(args, "sample_dtype", "float32"), images=images)
+
+
 def attach_sax_pairs(sampler: LineSampler, planes: list[Plane], sax_planes: list[Plane], lax_planes: list[Plane],
                      args, device) -> None:
     """Give a sampler the neighbouring-SAX-slice terms (SaxNeighbourLines; needs >= 2 LAX views for the long axis).
@@ -1188,21 +1328,27 @@ def attach_sax_pairs(sampler: LineSampler, planes: list[Plane], sax_planes: list
     supervise = ((getattr(args, "sax_sax_weight", 0.0) > 0 and args.dof == 6) or getattr(args, "sax_gap_reg", 0.0) > 0)
     if not (supervise or getattr(args, "logging", True)):
         return
-    axis = long_axis_line(lax_planes)
+    axis = heart_axis(sax_planes, lax_planes)
     if axis is None:
         return
+    # neighbours: (nearly) parallel SAX slices -- closer in angle than --min-pair-angle-deg, so not an intersection
+    # pair -- whose centres are at most --parallel-max-dist-mm apart along the normal (UKBB, 10 mm spacing: z, z + 1)
     index = {p.key: i for i, p in enumerate(planes)}
-    by_slice = {p.slice_idx: index[p.key] for p in sax_planes}
-    pairs = [(by_slice[z], by_slice[z + 1]) for z in sorted(by_slice) if z + 1 in by_slice]
+    cos_min = math.cos(math.radians(getattr(args, "min_pair_angle_deg", 20.0)))
+    max_dist = getattr(args, "parallel_max_dist_mm", 12.0)
+    ordered = sorted(sax_planes, key=lambda p: p.slice_idx)
+    pairs = [(index[a.key], index[b.key]) for i, a in enumerate(ordered) for b in ordered[i + 1:]
+             if abs(float(a.normal @ b.normal)) > cos_min and abs(float((b.center - a.center) @ a.normal)) <= max_dist]
     if pairs:
         sampler.sax_pairs = SaxNeighbourLines(sampler, planes, pairs, axis, args, device)
 
 
-def similarity_objective(smp: LineSampler, theta_deg, t, args, keep=None, sim=None) -> torch.Tensor:
-    """The optimized similarity: the point-weighted mean over the SAX-LAX / LAX-LAX lines (npts weights, optionally
-    x keep). `sim`: the per-line similarities of smp if already computed."""
-    c = smp.similarity_lines(theta_deg, t, args) if sim is None else sim
-    w = smp.npts if keep is None else smp.npts * keep
+def similarity_objective(smp: LineSampler, theta_deg, t, args, sel=None, sim=None) -> torch.Tensor:
+    """The optimized similarity: the point-weighted mean over the SAX-LAX / LAX-LAX lines (npts weights), or over the
+    lines `sel` only (an index tensor; only those are sampled). `sim`: the per-line similarities of smp if already
+    computed (all lines)."""
+    c = smp.similarity_lines(theta_deg, t, args, sel=sel) if sim is None else sim
+    w = smp.npts if sel is None else smp.npts[sel]
     return (c * w).sum() / w.sum()
 
 
@@ -1249,7 +1395,7 @@ OPTIMIZERS = ("adam", "nadam", "radam", "adamax", "rmsprop", "adagrad", "sgd")
 # methods take steps of about lr per iteration whatever the gradient scale; Adagrad's steps shrink like 1/sqrt(step),
 # so it needs a larger lr; plain SGD steps are lr * gradient, and the NCC objective's gradients are small (see --lr).
 DEFAULT_LR = {"adam": (0.2, 0.04), "nadam": (0.2, 0.04), "radam": (0.2, 0.04), "adamax": (0.2, 0.04),
-              "rmsprop": (0.2, 0.04), "adagrad": (1.0, 0.2), "sgd": (60.0, 5.0)}
+              "rmsprop": (0.2, 0.04), "adagrad": (1.0, 0.2), "sgd": (80.0, 20.0)}
 
 
 def make_optimizer(param_groups: list[dict], args, device):
@@ -1310,20 +1456,26 @@ def stack_terms(theta_deg, t, C0, N0, nb_a, nb_b, target, which, tilt_deg: float
     return out
 
 
-def pose_model(n_sax: int, n_lax: int, dof: int) -> str:
-    """The pose model a subject's planes support, given its number of SAX slices and of usable LAX views.
+def pose_model(n_sax: int, n_lax: int, dof: int, n_lax_stacks: int = 0) -> str:
+    """The pose model a subject's planes support, given its number of SAX slices, of usable non-SAX images and of
+    those that are stacks (more than one slice).
 
-    6dof: SAX slices and >= 2 LAX views; every plane is crossed by planes of two other orientations, so its tilt is
-      constrained. inplane: SAX slices and a single LAX view, or LAX views only; each plane is crossed along a single
-      direction, so tilts about it are unconstrained and rotations can run into degenerate solutions -- only
-      translation and rotation about the plane's own normal are optimized. none: no pair of planes crosses (no LAX
-      view, or one LAX view and no SAX slice); nothing is optimized. --dof 3 turns 6dof / inplane into translation.
+    6dof: >= 3 images (SAX counts as one) of which at least one is a stack (SAX slices, or e.g. an oblique cine stack):
+      every plane is crossed by planes of two other orientations, so its tilt is constrained. inplane: two images, or
+      single-slice LAX views only; each plane is crossed along a single direction (or by too few planes), so tilts are
+      unconstrained and rotations can run into degenerate solutions -- only translation and rotation about the plane's
+      own normal are optimized. none: fewer than two images; nothing is optimized. --dof 4 forces inplane (e.g. to
+      leave the weakly constrained tilts out even where 6dof is possible); --dof 3 turns 6dof / inplane into
+      translation.
     """
-    if n_lax == 0 or (n_sax == 0 and n_lax < 2):
+    n_images = (1 if n_sax else 0) + n_lax
+    if n_images < 2:
         return "none"
     if dof == 3:
         return "translation"
-    return "6dof" if n_sax > 0 and n_lax >= 2 else "inplane"
+    if dof == 4:
+        return "inplane"
+    return "6dof" if n_images >= 3 and (n_sax > 0 or n_lax_stacks > 0) else "inplane"
 
 
 def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]] | None = None,
@@ -1342,6 +1494,8 @@ def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]
     place before each replay. --no-cuda-graph runs the identical step eagerly.
     """
     device, N = final_sampler.device, final_sampler.N
+    if device.type == "cuda":                    # CUDA graphs allocate from a private pool: hand cached blocks back
+        torch.cuda.empty_cache()
     stages = sorted(stages or [(0, final_sampler)], key=lambda s: s[0])
     anneal_end = stages[-1][0]
 
@@ -1353,7 +1507,7 @@ def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]
         return active
 
     f32 = dict(dtype=torch.float32, device=device)
-    rotate = args.dof == 6 and args.rot_lr > 0 and pose_model in ("6dof", "inplane")
+    rotate = args.dof in (4, 6) and args.rot_lr > 0 and pose_model in ("6dof", "inplane")
     inplane = rotate and pose_model == "inplane"
     theta_deg = torch.zeros(N, 3, **f32).requires_grad_(rotate and not inplane)
     phi = torch.zeros(N, 1, **f32).requires_grad_(inplane)          # inplane: angle (deg) about each plane's normal
@@ -1389,8 +1543,8 @@ def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]
                             tilt_hinge_deg)
         return sum(weights[k] * v for k, v in terms.items())
 
-    def objective(theta_deg, t, keep=None, smp=final_sampler):
-        score = similarity_objective(smp, theta_deg, t, args, keep)
+    def objective(theta_deg, t, sel=None, smp=final_sampler):
+        score = similarity_objective(smp, theta_deg, t, args, sel)
         gauge = args.gauge * (t.mean(0).pow(2).sum() + theta_deg.mean(0).pow(2).sum())
         dz = (t * smp.Nrm).sum(1)
         prior = args.prior * (theta_deg.pow(2).sum(1) + dz.pow(2)).mean()
@@ -1400,16 +1554,20 @@ def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]
             prior = prior + tilt_prior * torch.relu(tilt_deg - tilt_hinge_deg).pow(2).mean()
         return score - gauge - prior - (stack_penalty(theta_deg, t) if stack_reg else 0.0) - sax_pair_penalty(smp, theta_deg, t)
 
-    # stochastic line-pair dropping: each step keeps a random subset of the intersection lines (at least one)
+    # stochastic line-pair dropping: each step samples only a random subset of round(--pair-keep x M) of the
+    # intersection lines (at least one), so memory and time per step scale with the kept lines; a fixed subset size
+    # keeps the shapes static for the CUDA graphs
     keep_frac = getattr(args, "pair_keep", 1.0)
     stochastic = keep_frac < 1.0
     gen = torch.Generator(device=device)
     gen.manual_seed(getattr(args, "seed", 0))
     eval_every = max(1, getattr(args, "eval_every", 10))
 
+    def n_keep(smp):
+        return max(1, min(smp.M, int(round(keep_frac * smp.M))))
+
     def draw_keep(smp):
-        r = torch.rand(smp.M, generator=gen, device=device)
-        return ((r < keep_frac) | (r == r.min())).float()
+        return torch.randperm(smp.M, generator=gen, device=device)[:n_keep(smp)]
 
     # learning rates as device tensors (updated in place each step; captured graphs read them)
     lr_t = torch.tensor(float(args.lr), **f32)
@@ -1435,7 +1593,9 @@ def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]
     best_th, best_t = theta_deg.detach().clone(), t.detach().clone()
     best_step = torch.zeros((), **f32)
     step_buf, track_buf = torch.zeros((), **f32), torch.zeros((), **f32)
-    keep_bufs = {id(smp): torch.ones(smp.M, **f32) for _, smp in stages}
+    sel_bufs = {id(smp): torch.arange(n_keep(smp), device=device) for _, smp in stages} if stochastic else {}
+    for _, smp in stages:                                # the full-objective evaluations stay within a step's memory
+        smp.eval_chunk = min(smp.eval_chunk, n_keep(smp)) if stochastic else smp.eval_chunk
 
     def update_best(o):
         better = (o > best_obj) & (track_buf > 0)
@@ -1446,7 +1606,7 @@ def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]
 
     def body(smp):
         opt.zero_grad(set_to_none=False)
-        obj = objective(pose_theta(), t, keep_bufs[id(smp)], smp)
+        obj = objective(pose_theta(), t, sel_bufs.get(id(smp)), smp)
         (-obj).backward()
         update_best(obj.detach())                          # pose *before* this update, as before
         opt.step()
@@ -1513,7 +1673,7 @@ def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]
             nominal = step >= track_from
             step_buf.fill_(float(step))
             if stochastic:
-                keep_bufs[id(smp)].copy_(draw_keep(smp))
+                sel_bufs[id(smp)].copy_(draw_keep(smp))
                 # the dropped-line objective is not comparable between steps: track the best periodically on the
                 # full objective (eagerly, before the update), and never inside the graph
                 if nominal and (step % eval_every == 0 or step == args.steps - 1):
@@ -1645,23 +1805,20 @@ def annealed_stages(data, planes, sax_planes, lax_planes, final_sampler, args, d
     if anneal_end <= 0:
         return None
     starts = sorted({int(round(k / n_stages * anneal_end)) for k in range(n_stages)})
-    index = {p.key: i for i, p in enumerate(planes)}
-    dists = {v: torch.from_numpy(d["dist"]).to(device) for v, d in data["lax"].items()}
+    dists = {v: torch.from_numpy(d["dist"]).to(device) for v, d in data["lax"].items() if d.get("dist") is not None}
+    if not dists:                                        # no segmented image: no masks to anneal
+        return None
     nominal_masks = {p.key: p.mask for p in lax_planes}
     stages = []
     try:
         for k, start in enumerate(starts):
             dil = dil0 + (args.mask_dilation_mm - dil0) * k / n_stages
             for p in lax_planes:
-                p.mask = (dists[p.image] <= dil).float()[None, None]
-            lines = []
-            with torch.no_grad():
-                for a, b in [(s, l) for s in sax_planes for l in lax_planes] + list(combinations(lax_planes, 2)):
-                    line = intersection_line(a, b, args, device)
-                    if line is not None:
-                        lines.append((index[a.key], index[b.key], line))
+                if p.image in dists:                             # (unsegmented images stay unmasked)
+                    p.mask = (dists[p.image][:, :, p.slice_idx] <= dil).float()[None, None]
+            lines = build_lines(planes, args, device)
             if lines:
-                smp = LineSampler(planes, lines, args.n_band, device, args.psf_model, args.psf_tbw, getattr(args, "psf_scale_start", 1.0))
+                smp = new_sampler(planes, lines, args, device, images=final_sampler.img)
                 attach_sax_pairs(smp, planes, sax_planes, lax_planes, args, device)
                 stages.append((start, smp))
     finally:
@@ -1670,14 +1827,16 @@ def annealed_stages(data, planes, sax_planes, lax_planes, final_sampler, args, d
     return stages + [(anneal_end, final_sampler)]
 
 
-def process_subject(data: dict, args, device, on_lines=None) -> tuple:
-    """Returns the summary row, the per-plane rows, the per-line-pair rows, the per-plane poses (plane, R, t) and the
+def process_subject(subject: Subject, args, device, on_lines=None) -> tuple:
+    """Align one subject (its slices as handed over by a loader, see SliceImage). Returns the summary row, the
+    per-plane rows, the per-line-pair rows, the per-plane poses (plane, R, t; see corrected_affines) and the
     pose/metric history (dict with 'planes' and 'steps' row lists, empty unless args.history_every > 0, i.e. with --logging).
 
     `on_lines(planes, lines)` is called once the intersection lines are known, before alignment.
     Without args.logging only the poses are computed: no metrics are evaluated, the segmentations stay off the GPU and
     the summary / per-pair rows and the history are None / empty (the per-plane rows only hold n_pairs).
     """
+    data = prepare_subject(subject, args)
     sid = data["subject_id"]
     nan = float("nan")
     log = getattr(args, "logging", True)
@@ -1685,23 +1844,23 @@ def process_subject(data: dict, args, device, on_lines=None) -> tuple:
     planes = sax_planes + lax_planes
     index = {p.key: i for i, p in enumerate(planes)}
 
-    lines, n_pairs = [], [0] * len(planes)
-    with torch.no_grad():
-        for a, b in [(s, l) for s in sax_planes for l in lax_planes] + list(combinations(lax_planes, 2)):
-            line = intersection_line(a, b, args, device)
-            if line is not None:
-                lines.append((index[a.key], index[b.key], line))
-                n_pairs[index[a.key]] += 1
-                n_pairs[index[b.key]] += 1
+    lines, n_pairs = build_lines(planes, args, device), [0] * len(planes)
+    for ia, ib, _ in lines:
+        n_pairs[ia] += 1
+        n_pairs[ib] += 1
     if on_lines is not None:
         on_lines(planes, lines)
-    model = pose_model(len(sax_planes), len(lax_planes), args.dof) if lines else "none"
+    per_image = {}
+    for p in lax_planes:
+        per_image[p.image] = per_image.get(p.image, 0) + 1
+    model = (pose_model(len(sax_planes), len(per_image), args.dof, sum(n > 1 for n in per_image.values()))
+             if lines else "none")
 
     N = len(planes)
     if not log:                                      # alignment only
         theta, t_rel = np.zeros((N, 3)), np.zeros((N, 3))
         if lines:
-            sampler = LineSampler(planes, lines, args.n_band, device, args.psf_model, args.psf_tbw, getattr(args, "psf_scale_start", 1.0))
+            sampler = new_sampler(planes, lines, args, device)
             attach_sax_pairs(sampler, planes, sax_planes, lax_planes, args, device)
             result = align(sampler, args, annealed_stages(data, planes, sax_planes, lax_planes, sampler, args, device),
                            pose_model=model)
@@ -1720,11 +1879,12 @@ def process_subject(data: dict, args, device, on_lines=None) -> tuple:
     t_rel = np.zeros((N, 3))
     theta = np.zeros((N, 3))
     if lines:
-        sampler = LineSampler(planes, lines, args.n_band, device, args.psf_model, args.psf_tbw, getattr(args, "psf_scale_start", 1.0))
+        sampler = new_sampler(planes, lines, args, device)
         attach_sax_pairs(sampler, planes, sax_planes, lax_planes, args, device)
         n_points = [float(sampler.npts[idx].sum()) for idx in sampler.plane_lines]
-        labels = [int(x) for x in args.seg_labels.split(",") if x.strip()]
-        labels_sax = [int(x) for x in args.sax_seg_labels.split(",") if x.strip()]
+        # segmentation labels compared by the Dice / Hausdorff metrics (loader options; none = no label metrics)
+        labels = [int(x) for x in getattr(args, "seg_labels", "").split(",") if x.strip()]
+        labels_sax = [int(x) for x in getattr(args, "sax_seg_labels", "").split(",") if x.strip()]
         has_seg = any(p.seg is not None for p in planes)
         zeros = torch.zeros(N, 3, device=device)
         line_zero = sampler.evaluate(zeros, zeros, args, labels, labels_sax, has_seg)
@@ -1885,7 +2045,7 @@ def empty_summary(sid: str, status: str) -> dict:
 
 
 # --------------------------------------------------------------------------------------
-# Saving aligned images
+# Corrected geometry
 # --------------------------------------------------------------------------------------
 
 def corrected_affine(affine: np.ndarray, plane: Plane, R: np.ndarray, t: np.ndarray) -> np.ndarray:
@@ -1897,67 +2057,12 @@ def corrected_affine(affine: np.ndarray, plane: Plane, R: np.ndarray, t: np.ndar
     return A
 
 
-def write_nifti(vol: np.ndarray, affine: np.ndarray, header: nib.Nifti1Header, path: Path, dtype,
-                descrip: str | None = None) -> None:
-    if np.issubdtype(dtype, np.unsignedinteger):
-        vol = np.clip(np.rint(vol), 0, np.iinfo(dtype).max)
-    img = nib.Nifti1Image(np.ascontiguousarray(vol).astype(dtype), affine, header=header)
-    img.set_data_dtype(dtype)
-    img.header.set_slope_inter(None, None)
-    if descrip is not None:
-        img.header["descrip"] = descrip.encode()[:79]
-    img.set_qform(affine, code=1)
-    img.set_sform(affine, code=1)
-    nib.save(img, str(path))
-
-
-def uint8_clip_value(path) -> float | None:
-    """Clip value of an image saved with --image-dtype uint8 (original intensity = value * clip / 255), else None."""
-    d = nib.load(str(path)).header["descrip"].item().decode(errors="ignore")
-    m = re.search(r"uint8 clip=([0-9.eE+-]+)", d)
-    return float(m.group(1)) if m else None
-
-
-def aligned_complete(subj_in: Path, subj_out: Path) -> bool:
-    """True when every input NIfTI that is written out (SAX slices, LAX views and their segmentations; see
-    load_subject) has its counterpart in the output folder, i.e. the subject was fully processed."""
-    inputs = []
-    for p in subj_in.glob("*.nii.gz"):
-        stem = p.name[:-len(".nii.gz")]
-        seg = subj_in / SEG_DIR / f"{stem}_nnUNetSeg.nii.gz"
-        if stem.startswith("SAX_slice") or stem in LAX_VIEWS:
-            inputs.append(p.relative_to(subj_in))
-            if seg.exists():
-                inputs.append(seg.relative_to(subj_in))
-    return bool(inputs) and all((subj_out / rel).exists() for rel in inputs)
-
-
-def save_aligned(data: dict, poses: list[tuple[Plane, np.ndarray, np.ndarray]], run_dir: Path, args) -> None:
-    """Write every image's full cine to <run>/<subject>/, in the input layout (SAX_slice<nn>.nii.gz, LAX_*.nii.gz,
-    nnUNet_segs/<stem>_nnUNetSeg.nii.gz): with its corrected affine where `poses` holds a pose for it, otherwise
-    (not aligned: e.g. a LAX view without a segmentation, or a subject that could not be optimized) unchanged, with its
-    acquired affine, in the same format. The subject folder is created even if there is nothing to write."""
-    out = run_dir / data["subject_id"]
-    (out / SEG_DIR).mkdir(parents=True, exist_ok=True)
-    dtype, scale, descrip = np.uint16, 1.0, None
-    if getattr(args, "image_dtype", "uint16") == "uint8":
-        # one scale per subject (SAX and LAX share it): clip at --uint8-percentile of all its slices and frames
-        vols = [v for v, _, _ in data["full"].values()]
-        clip = float(np.percentile(np.concatenate([np.asarray(v, np.float32).ravel() for v in vols]),
-                                   args.uint8_percentile)) if vols else 0.0
-        dtype, scale = np.uint8, 255.0 / max(clip, 1e-6)
-        # header descrip: original intensity = value * clip / 255 (below the clip); read with uint8_clip_value()
-        descrip = f"uint8 clip={clip:.6g} pct={args.uint8_percentile:g} orig=v*clip/255"
+def corrected_affines(subject: Subject, poses: list[tuple[Plane, np.ndarray, np.ndarray]]) -> list[np.ndarray]:
+    """The motion-corrected 4x4 affine of every slice of the subject (in subject.slices order): the acquired affine
+    with the slice's pose applied, or unchanged for a slice without a pose (not aligned)."""
     pose_of = {plane.key: (plane, R, t) for plane, R, t in poses}
-    for key, (arr, affine, header) in data["full"].items():
-        image, idx = key.split(":")
-        A = corrected_affine(affine, *pose_of[key]) if key in pose_of else affine
-        stem = f"SAX_slice{int(idx):02d}" if image == "SAX" else image
-        write_nifti(arr if dtype is np.uint16 else np.asarray(arr, np.float32) * scale, A, header,
-                    out / f"{stem}.nii.gz", dtype, descrip)   # uint8: clipped to [0, 255] in write_nifti
-        if key in data["full_seg"]:
-            seg, seg_header = data["full_seg"][key]
-            write_nifti(seg, A, seg_header, out / SEG_DIR / f"{stem}_nnUNetSeg.nii.gz", np.uint8)
+    return [corrected_affine(s.affine, *pose_of[s.key]) if s.key in pose_of else s.affine.copy() for s in subject.slices]
+
 
 
 # --------------------------------------------------------------------------------------
@@ -2216,7 +2321,8 @@ def plot_translation_figure(det: pd.DataFrame, label: str, out_path: Path, per_i
     fig.get_layout_engine().set(rect=(0, 0, 1, 0.94))
     gs = fig.add_gridspec(2, 4, height_ratios=(1, 1.3))
     if per_image:
-        images = [im for im in ("SAX",) + LAX_VIEWS if (det["image"] == im).any()]
+        names = list(dict.fromkeys(det["image"]))         # SAX first, then the others in the order found
+        images = (["SAX"] if "SAX" in names else []) + [im for im in names if im != "SAX"]
         for i, image in enumerate(images[:4]):
             sub = det[det["image"] == image]
             _hist_series(fig.add_subplot(gs[0, i]), [(sub["shift_inplane_mm"], LABEL_ALIGNED, st["orange"])],
@@ -2296,8 +2402,11 @@ def plot_results(summary_path: Path, detail_path: Path, out_dir: Path, pairs_pat
     written = []
     sax, lax = det[det["image"] == "SAX"], det[det["image"] != "SAX"]
     p = out_dir / "motion_metrics_hist.png"
-    plot_metrics_figure(per_subject_metrics(sax), "all SAX slices", p,
-                        lax_metrics=per_subject_metrics(lax) if len(lax) else None)
+    if len(sax):
+        plot_metrics_figure(per_subject_metrics(sax), "all SAX slices", p,
+                            lax_metrics=per_subject_metrics(lax) if len(lax) else None)
+    else:                                            # no SAX image (e.g. oblique stacks only): all slices together
+        plot_metrics_figure(per_subject_metrics(det), "all slices", p)
     written.append(p)
     p = out_dir / "motion_translations.png"
     plot_translation_figure(det, "all slices", p, per_image=True)
@@ -2337,10 +2446,16 @@ def mask_plot_data(planes: list[Plane], lines: list[tuple[int, int, Line]], exte
     """CPU copies of what the mask overlay needs: LAX image/seg/mask and, per line in voxel coords, the full
     +-extent candidate segment, the part inside both images and the points used in the loss."""
     views = {}
+    by_image = {}
     for i, p in enumerate(planes):
-        if p.image == "SAX" or p.mask is None:
+        if p.image != "SAX" and p.mask is not None:
+            by_image.setdefault(p.image, []).append(i)
+    shown = {ids[len(ids) // 2] for ids in by_image.values()}          # one panel per image: a stack's middle slice
+    for i, p in enumerate(planes):
+        if i not in shown:
             continue
-        views[i] = dict(name=p.image, img=p.img[0, 0].cpu().numpy(),
+        name = p.image if len(by_image[p.image]) == 1 else f"{p.image} slice {p.slice_idx}"
+        views[i] = dict(name=name, img=p.img[0, 0].float().cpu().numpy(),
                         seg=(p.seg[:, 0].cpu().numpy() > 0).any(0) if p.seg is not None else None,
                         mask=p.mask[0, 0].cpu().numpy() > 0.5, pts=[], soft=[], full=[], inimg=[])
     for ia, ib, line in lines:
@@ -2643,58 +2758,37 @@ def str2bool(s: str) -> bool:
     raise argparse.ArgumentTypeError(f"expected true or false, got {s!r}")
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    # ###################    DATA INPUT AND OUTPUT PARAMS    #############################
-    ap.add_argument("--root", type=Path, default=Path(r"C:\Users\Nil\Documents\data\ukbb_slices"),
-                    help="Directory containing one folder per subject with single-slice NIfTIs (see prepare_ukbb_slices.py)")
-    ap.add_argument("--out-root", type=Path, default=Path(r"C:\Users\Nil\Documents\data\ukbb_alignment"), help="Parent of the run directory")
-    ap.add_argument("--run-name", type=str, default=None,
-                    help="Run directory name, used as given (pass an existing run's name to add to or resume it, e.g. with "
-                         "--skip-processed). Default: the start time followed by the settings given on the command line, "
-                         "e.g. 20261025-143012_steps1000-lr25-optimizersgd-..., so every run gets a new directory")
-    ap.add_argument("--max-subjects", type=int, default=-1, help="Max number of subjects to evaluate (-1 = all)")
-    ap.add_argument("--skip-processed", action="store_true",
-                    help="Skip subjects whose aligned NIfTIs are already complete in the run directory (to resume a run, "
-                         "pass its directory name with --run-name; a default name is always new)")
-    ap.add_argument("--n-frames", type=int, default=10, help="Number of cardiac phases (evenly spaced) to use")
-    ap.add_argument("--logging", type=str2bool, default=True, metavar="BOOL",
-                    help="true (default): write everything besides the aligned NIfTIs: the pose/metric history during "
-                         f"optimization (every {HISTORY_EVERY:g} of the run), per-subject CSVs and figures (metrics/), "
-                         "cohort-wide CSVs and figures (overall_metrics/) and run_config.json. false: only the "
-                         "motion-corrected NIfTIs are written and no metrics are computed (fastest). "
-                         "overall_metrics/sax_relative_motion.csv and run_config.json are written either way.")
+def build_parser(description: str) -> argparse.ArgumentParser:
+    """The algorithm and run-loop options of the motion correction (optimizer, similarity, regularizers, metrics,
+    logging). A data loader's entry script adds the rest -- the paths (--root, --out-root, --run-name), the run
+    options --max-subjects, --skip-processed and --logging, its input/output formats (slice thickness, --image-dtype) and
+    the hardware options (--device, --workers, --no-cuda-graph, --sample-dtype) -- and calls run()."""
+    ap = argparse.ArgumentParser(description=description, formatter_class=argparse.RawDescriptionHelpFormatter)
+    # ###################    RUN PARAMS    ###############################################
+    ap.add_argument("--n-frames", type=int, default=10,
+                    help="Number of cardiac phases (evenly spaced) used for the alignment. Default: %(default)s")
     ap.add_argument("--save-images", type=str2bool, default=True, metavar="BOOL",
-                    help="false: do not write the motion-corrected NIfTIs (e.g. to only estimate the motion of a cohort "
+                    help="false: do not write the motion-corrected images (e.g. to only estimate the motion of a cohort "
                          "with --logging false: then just sax_relative_motion.csv is written)")
-    ap.add_argument("--image-dtype", choices=["uint16", "uint8"], default="uint16",
-                    help="Data type of the saved images. uint16: the acquired intensities unchanged. uint8: ~30%% less disk "
-                         "space per subject (measured: 29 -> 21 MB for one subject incl. segmentations; not half, as the "
-                         "NIfTIs are gzip-compressed and the segmentations are unchanged); per subject, intensities are clipped at --uint8-percentile of all its SAX and LAX "
-                         "slices and frames and scaled to [0, 255] (one scale for the whole subject, so SAX and LAX "
-                         "contrast stay comparable). Segmentations are always uint8 labels")
-    ap.add_argument("--uint8-percentile", type=float, default=99.9,
-                    help="Clip percentile for --image-dtype uint8. On this cohort the max is ~1.25x the 99.9th "
-                         "percentile (a few bright pixels), so 99.9 clips 0.1%% of the voxels")
 
     # ###################    OPTIMIZER PARAMS    #########################################
-    ap.add_argument("--steps", type=int, default=2000, help="Optimizer steps")
+    ap.add_argument("--steps", type=int, default=1000, help="Optimizer steps")
     ap.add_argument("--optimizer", choices=OPTIMIZERS, default="sgd",
-                    help="adam: the default. nadam: Adam with Nesterov momentum (looks ahead, often a little faster). "
+                    help="sgd: plain gradient steps (see --momentum, --nesterov); its steps scale with the gradient, "
+                         "so it needs much larger learning rates (see --lr). SGD lead consistently higher performance. "
+                         "adam: the default. nadam: Adam with Nesterov momentum (looks ahead, often a little faster). "
                          "radam: Adam with the variance rectified during the first steps (no warm-up needed, steadier start). "
                          "adamax: Adam with an infinity-norm denominator (steps bounded by lr, robust to gradient spikes). "
                          "rmsprop: per-parameter step scaling without momentum. "
                          "adagrad: step sizes shrink like 1/sqrt(step), a built-in annealing. "
-                         "sgd: plain gradient steps (see --momentum, --nesterov); its steps scale with the gradient, "
-                         "so it needs much larger learning rates (see --lr). "
-                         "All are CUDA-graph capturable. Default: %(default)s")
+                         "See default: %(default)s for per-optimizer default learning rates.")
     ap.add_argument("--lr", type=float, default=None,
                     help="Learning rate for translations. For the adaptive optimizers roughly the step in mm per "
                          "iteration; for sgd the step is lr x gradient, and the NCC objective's gradients are ~1e-3 per "
-                         "mm. Default: per optimizer (adam/nadam/radam/adamax/rmsprop 0.2, adagrad 1.0, sgd 20)")
+                         "mm. Default: per optimizer (adam/nadam/radam/adamax/rmsprop 0.2, adagrad 1.0, sgd 80)")
     ap.add_argument("--rot-lr", type=float, default=None,
                     help="Learning rate for rotations (degrees; see --lr). Default: per optimizer "
-                         "(adam/nadam/radam/adamax/rmsprop 0.04, adagrad 0.2, sgd 10)")
+                         "(adam/nadam/radam/adamax/rmsprop 0.04, adagrad 0.2, sgd 20)")
     ap.add_argument("--momentum", type=float, default=0.0, help="Momentum for --optimizer sgd (0 = plain SGD). Default: %(default)s")
     ap.add_argument("--nesterov", action="store_true", help="Nesterov momentum for --optimizer sgd")
     ap.add_argument("--lr-schedule", choices=["linear", "constant"], default="constant",
@@ -2702,12 +2796,19 @@ def main():
     ap.add_argument("--lr-end", type=float, default=0.0, help="Final translation learning rate for the linear schedule")
     ap.add_argument("--rot-lr-end", type=float, default=0.0, help="Final rotation learning rate for the linear schedule")
     ap.add_argument("--pair-keep", type=float, default=0.8,
-                    help="Stochastic optimization: fraction of intersection lines kept at each step (1 = deterministic)")
+                    help="Stochastic optimization: fraction of intersection lines used at each step (1 = deterministic). "
+                         "Each step draws a new random subset of round(fraction x lines) lines and samples only those, "
+                         "so GPU memory and time per step scale with this fraction (the full objective for tracking "
+                         "the best pose is evaluated without gradients, in chunks)")
     ap.add_argument("--eval-every", type=int, default=10, help="With --pair-keep < 1: evaluate the full objective every N steps to track the best pose")
     ap.add_argument("--seed", type=int, default=0, help="Seed for the line dropping")
 
     # ###################    POSE MODEL PARAMS    ########################################
-    ap.add_argument("--dof", type=int, choices=[3, 6], default=6, help="3 = translation only, 6 = rigid (translation + rotation)")
+    ap.add_argument("--dof", type=int, choices=[3, 4, 6], default=6,
+                    help="Degrees of freedom per slice. 3: translation only. 4: translation + rotation about the slice's "
+                         "own normal (in-plane rotation; no tilts). 6: rigid (translation + 3D rotation) where the "
+                         "geometry constrains the tilts (>= 3 images, one of them a stack), otherwise automatically "
+                         "reduced to 4 (see pose_model; summary column pose_model). Default: %(default)s")
     ap.add_argument("--rotation-pivot", choices=["long-axis", "image-centre"], default="long-axis",
                     help="Point each plane's pose rotates about. long-axis: on the LV long axis (the crossing line of the "
                          "two most perpendicular LAX views) -- for a SAX slice where the axis pierces it, for a LAX view "
@@ -2727,7 +2828,7 @@ def main():
                          "intensity difference, every image first rescaled so its 1st/99th percentiles map to 0/1 (the "
                          "SAX slices with one common scale). Default: %(default)s")
     ap.add_argument("--lncc-window-mm", type=float, default=20.0, help="--metric lncc: window length (mm). Default: %(default)s")
-    ap.add_argument("--lncc-min-std", type=float, default=0.25,
+    ap.add_argument("--lncc-min-std", type=float, default=0.1,
                     help="--metric lncc: windows whose profiles vary less than this (geometric mean of both standard "
                          "deviations, in units of the profile's standard deviation over the line) are faded out "
                          "(weight sd / this). Default: %(default)s")
@@ -2738,9 +2839,9 @@ def main():
     ap.add_argument("--nmi-sigma", type=float, default=1.0, help="Parzen window width for mutual information, in bins")
 
     # ###################    COARSE-TO-FINE (BLUR) PARAMS    #############################
-    ap.add_argument("--blur-sigma", type=float, default=6.0,
+    ap.add_argument("--blur-sigma", type=float, default=3.0,
                     help="Coarse-to-fine: initial in-plane Gaussian sigma (mm) of the images, decayed linearly to 0 (0 = off)")
-    ap.add_argument("--blur-frac", type=float, default=1.5,
+    ap.add_argument("--blur-frac", type=float, default=0.9,
                     help="Fraction of the steps over which the blur decays to 0 (> 1: it never reaches 0); 0 = no decay, "
                          "the blur stays at --blur-sigma for the whole run")
 
@@ -2753,7 +2854,18 @@ def main():
     ap.add_argument("--min-line-mm", type=float, default=40.0,
                     help="An intersection line is dropped if fewer than this many mm of it lie inside both images and "
                          "the mask. Default: %(default)s")
-    ap.add_argument("--mask-dilation-mm", type=float, default=40.0,
+    ap.add_argument("--min-pair-angle-deg", type=float, default=20.0,
+                    help="Two slices form an intersection pair only if their acquired normals differ by at least this "
+                         "angle: slices of one stack (parallel) never pair, and nearly parallel slices, whose crossing "
+                         "line is ill-conditioned, do not either (UKBB: SAX-LAX ~90 deg, LAX-LAX ~60 deg). "
+                         "Default: %(default)s")
+    ap.add_argument("--pair-spacing-mm", type=float, default=-1.0,
+                    help="Thinning of the pairs between two multi-slice stacks (see candidate_pairs): each slice pairs "
+                         "with slices about this far apart in the other stack, phase-shifted between neighbours so every "
+                         "slice keeps lines. -1 (default) = each stack's slice thickness (thick, densely spaced slices "
+                         "overlap, so their lines are nearly redundant); 0 = keep every pair. Single slices (e.g. the "
+                         "UKBB LAX views) are never thinned, and with the UKBB 10 mm SAX spacing nothing is thinned.")
+    ap.add_argument("--mask-dilation-mm", type=float, default=20.0,
                     help="How far (mm) the LAX heart segmentation is grown to form the mask; only intersection-line points "
                          "inside this mask enter the loss (see --outside-mask-weight). This is also the final value when "
                          "mask annealing is on. Default: %(default)s")
@@ -2777,12 +2889,6 @@ def main():
                          "Default: %(default)s")
 
     # ###################    SLICE PROFILE (PSF) PARAMS    ###############################
-    ap.add_argument("--sax-thickness", type=float, default=8.0,
-                    help="SAX slice thickness in mm. The NIfTI header only stores the slice spacing (10 mm = 8 mm slice "
-                         "+ 2 mm gap in the UK Biobank protocol). Default: %(default)s")
-    ap.add_argument("--lax-thickness", type=float, default=6.0,
-                    help="LAX slice thickness in mm (UK Biobank protocol: 6 mm; the header's 7.5 mm is the spacing). "
-                         "Default: %(default)s")
     ap.add_argument("--n-band", type=int, default=8,
                     help="PSF approximation: when sampling one image along an intersection line, this many points are "
                          "taken across the other slice's through-plane profile (see --psf-model) and combined with the "
@@ -2847,15 +2953,22 @@ def main():
                          "--tilt-hinge-reg. Mean over adjacent pairs (0 = off)")
 
     # ###################    SAX-SAX INTERACTION PARAMS    ###############################
+    ap.add_argument("--parallel-max-dist-mm", type=float, default=12.0,
+                    help="Neighbouring SAX slices for the SAX-SAX terms below (and their QC logging): slices that are "
+                         "parallel as acquired (closer than --min-pair-angle-deg) and at most this far apart along the "
+                         "normal. Slices further apart are never checked for crossing. UKBB (10 mm spacing): each slice "
+                         "and the next; a stack with 1-3 mm spacing: all slices within this distance. Default: %(default)s")
     ap.add_argument("--sax-gap-reg", type=float, default=0.0,
-                    help="Barrier keeping adjacent SAX slices from approaching or crossing each other inside the heart: "
+                    help="Barrier keeping neighbouring SAX slices from approaching or crossing each other inside the heart: "
                          "on a disk of --sax-gap-radius-mm around the LV long axis (the crossing line of the two most "
-                         "perpendicular LAX views) on each slice, the gap to the neighbouring slice along the acquired "
-                         "stacking direction (~10 mm as acquired) is penalized below --sax-gap-margin-mm: mean "
-                         "softplus(margin - gap)^2 (mm^2). Zero for ordinary poses, smooth, no image sampling (0 = off; "
-                         "e.g. 1e-2 costs 0.16 at a 0 mm gap). Needs two LAX views. Default: %(default)s")
+                         "perpendicular LAX views, else the SAX stack's axis) on each slice, the gap to the neighbouring "
+                         "slice along the acquired stacking direction (~10 mm as acquired) is penalized below the margin "
+                         "(--sax-gap-margin-mm, at most half the pair's acquired gap): mean softplus(margin - gap)^2 "
+                         "(mm^2). Zero for ordinary poses, smooth, no image sampling (0 = off; e.g. 1e-2 costs 0.16 at a "
+                         "0 mm gap). Default: %(default)s")
     ap.add_argument("--sax-gap-margin-mm", type=float, default=4.0,
-                    help="Smallest gap (mm) between adjacent SAX slices allowed without cost by --sax-gap-reg. Default: %(default)s")
+                    help="Smallest gap (mm) between neighbouring SAX slices allowed without cost by --sax-gap-reg (for "
+                         "each pair at most half its acquired gap). Default: %(default)s")
     ap.add_argument("--sax-gap-radius-mm", type=float, default=120.0,
                     help="Radius (mm) of the disk around the long axis on which --sax-gap-reg measures the gap (5 mm grid). "
                          "Default: %(default)s")
@@ -2878,19 +2991,21 @@ def main():
                          "threshold: the radius (mm) around the long axis. Also "
                          "the extent of the 'used' part of the lines in sax_lines.csv. Default: %(default)s")
 
-    # ###################    EVALUATION METRIC PARAMS (REPORTING ONLY)    ################
-    ap.add_argument("--seg-labels", type=str, default="1,2,3,4,5", help="Labels compared along LAX-LAX intersections")
-    ap.add_argument("--sax-seg-labels", type=str, default="1,2,3", help="Labels compared along SAX-LAX intersections")
-    ap.add_argument("--hd-miss-mm", type=float, default=100.0,
-                    help="Hausdorff value (mm) when both planes contain a label but only one intersection profile hits it")
 
-    # ###################    HARDWARE PARAMS    ##########################################
-    ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
-    ap.add_argument("--workers", type=int, default=4, help="Background threads for loading and writing NIfTI files")
-    ap.add_argument("--no-cuda-graph", action="store_true",
-                    help="Run each optimization step eagerly instead of replaying a captured CUDA graph (same result, "
-                         "slower; for debugging)")
-    args = ap.parse_args()
+    return ap
+
+
+
+def run(ap: argparse.ArgumentParser, args, load, save, is_complete) -> None:
+    """Align every subject folder under args.root, writing to args.out_root / (args.run_name or a generated name)
+    (see the module docstring). args.root / out_root / run_name are the entry script's path options.
+
+    The data loader supplies:
+      load(subj_dir, args) -> Subject              read one subject folder (called in background threads)
+      save(subject, affines, out_dir, args)        write the subject's slices with the given 4x4 affines (one per
+                                                   slice, in subject.slices order) into out_dir, in its own format
+      is_complete(subj_dir, out_dir) -> bool       whether out_dir already holds every output (--skip-processed)
+    """
     if args.no_psf:                          # one band sample at offset 0 with weight 1 = the raw line intensities
         args.n_band, args.psf_scale_start = 1, 1.0
     lr0, rot_lr0 = DEFAULT_LR[args.optimizer]
@@ -2910,23 +3025,23 @@ def main():
 
     def scan() -> list[Path]:
         """Subject folders under --root not listed before, without those already complete (--skip-processed), within
-        --max-subjects. Hidden folders are ignored: prepare_ukbb_slices.py writes a subject as .<subject> and renames
-        it when complete, so a subject is only picked up once fully written."""
+        --max-subjects. Hidden folders are ignored (a tool copying subjects in can write them as .<subject> and rename
+        them when complete, so a subject is only picked up once fully written)."""
         nonlocal budget
         new = sorted(d for d in args.root.iterdir() if d.is_dir() and not d.name.startswith(".") and d.name not in seen)
         seen.update(d.name for d in new)
         if args.skip_processed:
             n0 = len(new)
-            new = [s for s in new if not aligned_complete(s, run_dir / s.name)]
+            new = [s for s in new if not is_complete(s, run_dir / s.name)]
             if n0 > len(new):
-                print(f"Skipping {n0 - len(new)} subjects whose aligned NIfTIs are complete")
+                print(f"Skipping {n0 - len(new)} subjects whose aligned images are complete")
         if budget >= 0:
             new, budget = new[:budget], budget - min(budget, len(new))
         return new
 
     subjects = scan()
     print(f"Aligning {len(subjects)} subjects on {device}; outputs in {run_dir}"
-          + ("" if args.logging else " (aligned NIfTIs only; --logging for metrics, CSVs and figures)"))
+          + ("" if args.logging else " (aligned images only; --logging for metrics, CSVs and figures)"))
     if not subjects:
         return
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -2953,7 +3068,7 @@ def main():
 
             def top_up():
                 """Keep 2 x --workers subjects loading ahead. When the known subjects run out, rescan --root for
-                subjects written since (e.g. by a concurrently running prepare_ukbb_slices.py): at most every
+                subjects written since (e.g. by a concurrently running download): at most every
                 RESCAN_SECONDS while others are still queued, always once the queue is empty."""
                 nonlocal it, last_scan
                 while len(queue) < 2 * args.workers:
@@ -2971,7 +3086,7 @@ def main():
                             pbar.refresh()
                         it = iter(more)
                         continue
-                    queue.append((nxt, ex.submit(load_subject, nxt, args)))
+                    queue.append((nxt, ex.submit(load, nxt, args)))
 
             top_up()
             while queue:
@@ -2992,19 +3107,22 @@ def main():
 
                 status = "ok"
                 try:
-                    data = fut.result()
-                    status = data["status"]
+                    subject = fut.result()
+                    status = subject.status if subject.slices else "no_images"
                     poses = []
                     if status == "ok":
                         summary, details, pairs, poses, history = process_subject(
-                            data, args, device, on_lines=on_lines if args.logging else None)
+                            subject, args, device, on_lines=on_lines if args.logging else None)
                         if not any(d["n_pairs"] > 0 for d in details):
                             status = "not_optimized"                 # no crossing planes: written unaligned
                         for row in sax_relative_motion(subj.name, poses, [d["n_pairs"] for d in details]):
                             relmotion_writer.writerow(fmt_row(row))
                         relmotion_f.flush()
                     if args.save_images:          # whatever could be loaded, aligned or not (folder created regardless)
-                        save_jobs.append((subj.name, "aligned NIfTIs", ex.submit(save_aligned, data, poses, run_dir, args)))
+                        out_dir = run_dir / subj.name
+                        out_dir.mkdir(parents=True, exist_ok=True)
+                        save_jobs.append((subj.name, "aligned images",
+                                          ex.submit(save, subject, corrected_affines(subject, poses), out_dir, args)))
                 except Exception as e:  # noqa: BLE001
                     traceback.print_exc()
                     status = f"error: {type(e).__name__}: {e}"[:200]
@@ -3066,9 +3184,11 @@ def main():
             print("Overall plotting failed:")
             traceback.print_exc()
     if args.save_images:
-        print(f"Aligned NIfTIs under {run_dir}\\<subject>\\" + (" (and metrics\\)" if args.logging else ""))
+        print(f"Aligned images under {run_dir}\\<subject>\\" + (" (and metrics\\)" if args.logging else ""))
     print(f"SAX relative motion: {overall_dir / 'sax_relative_motion.csv'}")
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit("motion_gradient.py is the motion-correction library; run it through a data entry point:\n"
+             "  python moco_nifti.py ...   (UKBB NIfTI: SAX stack + LAX views)\n"
+             "  python moco_dicom.py ...   (DICOM series)")
