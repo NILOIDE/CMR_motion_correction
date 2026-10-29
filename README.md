@@ -1,14 +1,18 @@
 # CMR Motion Correction
 
-Inter-slice motion estimation and correction for cardiac MRI (UK Biobank cine SAX/LAX
-acquisitions), plus a 3D viewer for inspecting alignment results.
+Inter-slice motion estimation and correction for cardiac cine MRI (UK Biobank SAX/LAX acquisitions, or any set of
+cine slices and stacks as NIfTI or DICOM), plus a 3D viewer for inspecting alignment results.
 
-Different cine acquisitions (each short-axis slice, each long-axis view) are breath-held
-independently, so they commonly disagree about where the heart actually is in scanner space.
-This pipeline estimates a rigid pose correction per slice/view by comparing image intensities
-along the 3D lines where pairs of planes intersect, then writes out motion-corrected NIfTIs.
+Different cine acquisitions (each short-axis slice, each long-axis view or stack) are breath-held independently, so
+they commonly disagree about where the heart actually is in scanner space. This pipeline estimates a rigid pose
+correction per slice by comparing image intensities along the 3D lines where pairs of planes intersect, then writes
+out the motion-corrected images in the format they were read in.
 
-#### Note: This was vibe-coded in a couple of days. All praise Claude Code. 
+These the motion corrected slices (as well as the intermediate optimization process) can be visualized using the
+provided visualization tool.
+![Optimization process in the 3D viewer (slice_viewer_3d.py)](media/optimization_sa09.gif)
+
+#### Note: This project was vibe-coded within a couple of days. All praise Claude Code.
 
 -------------------------
 
@@ -16,124 +20,123 @@ along the 3D lines where pairs of planes intersect, then writes out motion-corre
 ## Pipeline
 
 ```
-download_ukbb.py                          -> raw per-subject NIfTIs (SSH from a remote data store)
+<root>/<subject>/...                      -> your data, one folder per subject (NIfTI or DICOM; layouts below)
             |
             v
-prepare_ukbb_slices.py                    -> single-slice layout expected by motion_gradient.py
-            |
+moco_nifti.py  /  moco_dicom.py           -> entry points: load a subject (NIfTI / DICOM), hand its slices to the
+            |                                motion correction, write the corrected images in the same format
             v
-motion_gradient.py                        -> estimates per-plane rigid poses, writes corrected NIfTIs (+ optional metrics/figures)
-            |
+motion_gradient.py                        -> the motion correction (library): estimates per-slice rigid poses
+            |                                (+ optional metrics/figures)
             v
-slice_viewer_3d.py                        -> interactive 3D viewer over the optimization history
+slice_viewer_3d.py                        -> interactive 3D viewer over the optimization history (UKBB NIfTI runs)
 ```
 
-### `download_ukbb.py`
+### `moco_nifti.py` (UK Biobank NIfTI)
 
-Downloads subjects from a remote dataset over a single SSH connection (tar-streamed, so you're
-only prompted for a password/key once), in sorted batches, tracking already-downloaded subjects
-(`.downloaded_subjects.txt`) so reruns only fetch new ones.
-
-The dataset is expected to hold UK Biobank cine SAX/LAX acquisitions together with nnU-Net
-segmentations in the style of Ugurlu et al. [1].
+Expects UK Biobank cine SAX/LAX acquisitions as NIfTI, one folder per subject, used as is: no preparation step.
+Each subject folder is searched recursively (wrapper folders such as `Instance_2` don't matter), and files are
+classified by name:
 
 ```
-python download_ukbb.py --host user@server --n-subjects 50
-```
-
-Run with `--help` for all options (remote/local directories, batch size, `--refresh-list`,
-`--flatten`, ...).
-
-### `prepare_ukbb_slices.py`
-
-Converts the downloaded per-subject layout (SAX stack, LAX_2Ch/3Ch/4Ch, nnU-Net segmentations)
-into the single-slice-per-file layout `motion_gradient.py` expects: every SAX slice becomes its
-own NIfTI with its own affine (origin shifted along the stack normal), LAX views are copied
-unchanged, and segmentation labels are rounded to clean integers. Wrapper folders (e.g.
-`Instance_2`) are detected and flattened automatically. The nnU-Net segmentations are expected
-to be the ones produced by the [Ugurlu et al. pipeline](https://github.com/CEMRG-publications/Ugurlu_2025_PLoS_One) [1].
-
-```
-python prepare_ukbb_slices.py --src <downloaded_dir> --dst <slices_dir> --workers 8
-```
-
-`motion_gradient.py` expects the destination (`--dst`) to hold one folder per subject, laid out
-like this:
-
-```
-<dst>/
+<root>/
   <subject>/
-    SAX_slice00.nii.gz            # one file per SAX slice, (X, Y, 1, T), own affine
-    SAX_slice01.nii.gz
-    ...
-    LAX_2Ch.nii.gz                 # (X, Y, 1, T)
-    LAX_3Ch.nii.gz
-    LAX_4Ch.nii.gz
-    nnUNet_segs/
-      SAX_slice00_nnUNetSeg.nii.gz
-      SAX_slice01_nnUNetSeg.nii.gz
-      ...
-      LAX_2Ch_nnUNetSeg.nii.gz
-      LAX_3Ch_nnUNetSeg.nii.gz
-      LAX_4Ch_nnUNetSeg.nii.gz
-  <subject>/
-    ...
-  prepare_log.csv                  # one row per subject (what was written)
+    Instance_2/                    # any folder structure
+      SAX.nii.gz                   # SAX stack (X, Y, Z, T), and/or single-slice files SAX_slice<nn>.nii.gz
+      LAX_2Ch.nii.gz               # LAX views (X, Y, 1, T); any other NIfTI is a LAX image of its own
+      LAX_3Ch.nii.gz
+      LAX_4Ch.nii.gz
+      nnUNet_segs/                 # optional; matched to their image by name (SAX slices by position)
+        SAX_nnUNetSeg.nii.gz
+        LAX_2Ch_nnUNetSeg.nii.gz
+        ...
 ```
 
-Missing inputs (the SAX stack, any LAX view, any segmentation) are allowed: the subject folder is
-always created and whatever is present is written. `prepare_log.csv` lists what was missing per
-subject.
+Missing images or segmentations are allowed. The nnU-Net segmentations are expected to be the ones produced by the
+[Ugurlu et al. pipeline](https://github.com/CEMRG-publications/Ugurlu_2025_PLoS_One) [1]. They define the dilated
+heart masks and the Dice / Hausdorff metrics. NIfTI headers only store the slice spacing, so the thickness is set with
+`--sax-thickness` (8 mm) / `--lax-thickness` (6 mm).
 
-See the module docstring for the exact source layout and `--help` for all options
-(`--max-subjects`, `--overwrite`, ...).
+Output, per subject: `SAX_slice<nn>.nii.gz`, `LAX_2Ch.nii.gz`, ... with the corrected affines, and the segmentations
+in `nnUNet_segs/`. `--image-dtype uint8` (default `uint16`) saves ~30% disk space.
+
+```
+python moco_nifti.py --root <ukbb_dir> --out-root <alignment_dir>
+```
+
+### `moco_dicom.py` (DICOM)
+
+For other cine data, e.g. several stacks in different orientations. Every DICOM series (files sharing a
+`SeriesInstanceUID`) below a subject folder is one image, named after its folder. Its slices are the distinct
+positions/orientations and its cardiac frames the files at one slice (ordered by `TriggerTime` / `InstanceNumber`).
+The slice thickness comes from `SliceThickness`. Real/imaginary image pairs are combined into the magnitude. DICOM
+data has no segmentations, so lines run over the whole image overlap.
+
+```
+<root>/
+  <subject>/
+    <series_1>/phase_01/*.dcm ... phase_25/*.dcm      # any folder layout
+    <series_2>/...
+```
+
+Output: every input file rewritten at the same relative path, with the corrected `ImagePositionPatient` /
+`ImageOrientationPatient` and new UIDs; pixel data are unchanged (`--image-dtype uint8` for 8-bit).
+
+```
+python moco_dicom.py --root <dicom_dir>                     # output: <dicom_dir>_aligned
+python moco_dicom.py --root <dicom_dir> --pair-keep 0.25 --sample-dtype float16   # many slices, small GPU
+```
+
+Both entry points share the motion-correction options. Paths, run options (`--max-subjects`, `--skip-processed`,
+`--logging`), data formats and hardware (`--device`, `--workers`, `--sample-dtype`) are defined per entry point; see
+`--help`. A new data format only needs a new entry script that loads a subject into a list of 2D+time slices
+(`motion_gradient.SliceImage`: cine, affine, thickness, optional segmentation) and writes them back with the
+corrected affines.
 
 ### `motion_gradient.py`
 
-For every pair of non-parallel planes (SAX-LAX and LAX-LAX), samples intensity profiles along
-their 3D intersection line (restricted to a dilated heart mask from the LAX segmentations) and
-optimizes a 6-DOF rigid pose per plane (PyTorch, Adam/SGD) to maximize agreement across cardiac
-phases. Optional SAX-stack regularizers keep neighbouring slices from tilting, drifting apart, or
-crossing. Always writes motion-corrected NIfTIs in the input layout; with `--logging`, also writes
-per-subject and dataset-level metrics (CSV) and figures (PNG) under the run directory. The method
-builds on the intersection-line intensity-matching approach of
-[Stolt-Ansó et al.](https://arxiv.org/pdf/2404.00767) [2].
+The motion correction, used by the entry points (not run on its own).
 
-We found best results with plain SGD (`--optimizer sgd`, no momentum) rather than Adam. There is
-also a substantial amount of non-rigid deformation in the torso between acquisitions (the heart
-itself moves close to rigidly, but the surrounding anatomy does not), so the intersection-line
-optimization is restricted to a dilated foreground (heart) mask derived from the LAX
-segmentations, rather than the full extent of each line, to keep it from being pulled off by
-non-rigid motion further out.
+Every two slices whose acquired normals differ by at least `--min-pair-angle-deg` (20°) are paired. Slices of one
+stack never pair. Between densely spaced stacks the pairs are thinned to partners about a slice thickness apart
+(`--pair-spacing-mm`). For each pair it samples intensity profiles along their 3D intersection line (with a PSF band
+for the slice thickness, restricted to a dilated heart mask where segmentations exist) and optimizes a rigid pose per
+slice (PyTorch, SGD/Adam) to maximize agreement across cardiac phases. Optional SAX-stack regularizers keep
+neighbouring slices from tilting, drifting apart, or crossing. With `--logging`, it also writes per-subject and
+dataset-level metrics (CSV) and figures (PNG) under the run directory. The method builds on the intersection-line
+intensity-matching approach of [Stolt-Ansó et al.](https://arxiv.org/pdf/2404.00767) [2].
 
-The pose model depends on which views a subject has (a LAX view counts only if it has a
-segmentation containing the heart):
+We found best results with plain SGD (the default, no momentum) rather than Adam. There is also a substantial amount
+of non-rigid deformation in the torso between acquisitions (the heart itself moves close to rigidly, but the
+surrounding anatomy does not), so the intersection-line optimization is restricted to a dilated foreground (heart)
+mask derived from the LAX segmentations, rather than the full extent of each line, to keep it from being pulled off
+by non-rigid motion further out.
 
-| Available views                     | Optimized                                   |
-|-------------------------------------|---------------------------------------------|
-| SAX + 2 or more LAX                 | full 6-DOF (translation + 3D rotation)      |
-| SAX + 1 LAX, or 2 or more LAX only  | translation + in-plane rotation only        |
-| SAX only, 1 LAX only, nothing       | nothing (images written unaligned)          |
+The pose model (`--dof`, default 6) depends on which images a subject has. A segmented LAX view counts only if its
+segmentation contains the heart; an unsegmented image takes part unmasked.
 
-With fewer crossing orientations, a plane's tilt is unconstrained, and optimizing it leads to
-degenerate solutions. Every image present is always written to the output folder; images that
-could not be aligned keep their acquired affine. The `pose_model` column of the summary CSV
-records which model each subject used.
+| Available images                                                   | Optimized with `--dof 6`                 |
+|--------------------------------------------------------------------|------------------------------------------|
+| 3 or more, at least one a stack (SAX + 2 LAX, or 3+ oblique stacks) | full 6-DOF (translation + 3D rotation)   |
+| 2, or single-slice LAX views only                                  | translation + in-plane rotation (4-DOF)  |
+| fewer than 2                                                       | nothing (images written unaligned)       |
 
-```
-python motion_gradient.py --root <slices_dir> --out-root <alignment_dir> --max-subjects -1 --logging true --optimizer sgd --momentum 0
-```
+With fewer crossing orientations, a plane's tilt is unconstrained, and optimizing it leads to degenerate solutions.
+`--dof 4` forces translation + in-plane rotation, and `--dof 3` translation only. Every image present is always
+written to the output folder; images that could not be aligned keep their acquired affine. The `pose_model` column of
+the summary CSV records which model each subject used.
 
-This script has a large number of tuning options (optimizer/schedule, blur coarse-to-fine,
-stack regularizers, similarity metric, point-spread-function model, mask annealing, ...) — see
-the module docstring for the full method description and `--help` for every flag.
+This script has a large number of tuning options (optimizer/schedule, blur coarse-to-fine, stack regularizers,
+similarity metric, point-spread-function model, mask annealing, ...); see the module docstring for the full method
+description and `--help` of either entry point for every flag.
 
 ### `slice_viewer_3d.py`
 
 Interactive PyVista viewer that renders every SAX slice and LAX view as a textured quad in
-scanner/world space, using the poses from a `motion_gradient.py` run's optimization history
+scanner/world space, using the poses from a `moco_nifti.py` run's optimization history
 (`metrics/history.csv`). A slider scrubs through optimization steps; segmentation overlays,
 per-plane similarity-metric coloring, intersection lines and mask contours can be toggled.
+It reads the UK Biobank NIfTI layout (SAX slices, `LAX_2Ch` / `3Ch` / `4Ch`, `nnUNet_segs/`), not DICOM runs.
 
 ```
 python slice_viewer_3d.py                      # most recently created run, its first subject
@@ -141,21 +144,19 @@ python slice_viewer_3d.py 1000071               # a specific subject
 python slice_viewer_3d.py 1000071 --run <run-name>
 ```
 
-![Optimization process in the viewer](media/optimization_sa09.gif)
-
 See the module docstring for the full keyboard/mouse interaction reference.
 
 ## Dependencies
 
 - `numpy`, `pandas`, `scipy`
 - `nibabel` (NIfTI I/O)
+- `pydicom` (DICOM I/O, `moco_dicom.py`)
 - `torch` (pose optimization)
 - `pyvista` (3D viewer)
-- `matplotlib` (figures, `motion_gradient.py --logging`)
-- `paramiko` (`download_ukbb.py`)
+- `matplotlib` (figures, `--logging`)
 
 ```
-pip install numpy pandas scipy nibabel torch pyvista matplotlib paramiko
+pip install numpy pandas scipy nibabel pydicom torch pyvista matplotlib
 ```
 
 ## References
