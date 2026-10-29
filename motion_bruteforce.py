@@ -94,6 +94,7 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 
+import moco_nifti as mn
 import motion_gradient as mg
 
 VIEW_ORDER = ("LAX_4Ch", "LAX_3Ch", "LAX_2Ch")      # fixed reference, stage 1, stage 3
@@ -495,11 +496,9 @@ class GridSearcher:
                     offset=offs[k].tolist())
 
 
-def brute_force_align(final_sampler: mg.LineSampler, args, stages=None, pose_model: str = "6dof",
-                      log: list | None = None) -> dict:
+def brute_force_align(final_sampler: mg.LineSampler, args, stages=None, log: list | None = None) -> dict:
     """Stands in for motion_gradient.align (same signature and result; `stages`, the mask annealing, is unused): the
-    staged grid search of the module docstring. `log` collects one SEARCH_COLUMNS row per plane search. The grid has
-    no in-plane-only rotation, so any pose_model other than 6dof (see mg.pose_model) searches translations only."""
+    staged grid search of the module docstring. `log` collects one SEARCH_COLUMNS row per plane search."""
     planes, device = final_sampler.planes, final_sampler.device
     pair_weight = {frozenset((ia, ib)): float(n) for ia, ib, n in
                    zip(final_sampler.IA.tolist(), final_sampler.IB.tolist(), final_sampler.npts.tolist())}
@@ -509,13 +508,12 @@ def brute_force_align(final_sampler: mg.LineSampler, args, stages=None, pose_mod
     views = [view_idx[v] for v in VIEW_ORDER if v in view_idx]
     sax = sorted((p.slice_idx, i) for i, p in enumerate(planes) if p.image == "SAX")
     dz = args.dz_range_mm if args.dz_range_mm is not None else args.t_range_mm
-    rotate = args.dof == 6 and pose_model == "6dof"
-    rot = args.rot_range_deg if rotate else 0.0
+    rot = args.rot_range_deg if args.dof == 6 else 0.0
     coarse = dict(coarse_t_step=args.coarse_t_step_mm, coarse_rot_step=args.coarse_rot_step_deg, blur_mm=args.coarse_blur_mm)
     full = GridSpec(args.t_range_mm, args.t_step_mm, dz, rot, args.rot_step_deg, **coarse)
     translations = GridSpec(args.t_range_mm, args.t_step_mm, dz, **coarse)
     refine = GridSpec(args.refine_t_range_mm, args.refine_t_step_mm, args.refine_t_range_mm,
-                      args.refine_rot_range_deg if rotate else 0.0, args.refine_rot_step_deg)   # one exhaustive level
+                      args.refine_rot_range_deg if args.dof == 6 else 0.0, args.refine_rot_step_deg)   # one exhaustive level
 
     def run(stage: int, m: int | None, others: list, spec: GridSpec, neighbours=()):
         if m is None:
@@ -586,8 +584,8 @@ def default_run_name(ap: argparse.ArgumentParser, argv: list[str], args) -> str:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--root", type=Path, default=Path(r"C:\Users\Nil\Documents\data\ukbb_slices"),
-                    help="Directory containing one folder per subject with single-slice NIfTIs (see prepare_ukbb_slices.py)")
+    ap.add_argument("--root", type=Path, default=Path(r"C:\Users\Nil\Documents\data\ukbb"),
+                    help="Directory containing one folder per subject, any structure below it (SAX stack and/or single slices, LAX views, segmentations; see moco_nifti.discover_subject)")
     ap.add_argument("--out-root", type=Path, default=Path(r"C:\Users\Nil\Documents\data\ukbb_alignment_bf"), help="Parent of the run directory")
     ap.add_argument("--run-name", type=str, default=None,
                     help="Run directory name (default: the start time followed by the settings given on the command line)")
@@ -687,6 +685,7 @@ def main():
     ap.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     ap.add_argument("--workers", type=int, default=4, help="Background threads for loading and writing NIfTI files")
     args = ap.parse_args()
+    args.image_dtype = "uint16"                          # moco_nifti.save: write the acquired intensities
     if args.no_psf:
         args.n_band = 1
     # settings motion_gradient's shared code reads; nothing here optimizes them
@@ -705,7 +704,7 @@ def main():
     subjects = sorted(d for d in args.root.iterdir() if d.is_dir())
     if args.skip_processed:
         n0 = len(subjects)
-        subjects = [s for s in subjects if not mg.aligned_complete(s, run_dir / s.name)]
+        subjects = [s for s in subjects if not mn.is_complete(s, run_dir / s.name)]
         print(f"Skipping {n0 - len(subjects)} subjects whose aligned NIfTIs are complete")
     if args.max_subjects >= 0:
         subjects = subjects[:args.max_subjects]
@@ -731,13 +730,13 @@ def main():
     try:
         with ThreadPoolExecutor(max_workers=args.workers) as ex:
             it = iter(subjects)
-            queue = deque((s, ex.submit(mg.load_subject, s, args)) for s in islice(it, 2 * args.workers))
+            queue = deque((s, ex.submit(mn.load_subject, s, args)) for s in islice(it, 2 * args.workers))
             pbar = tqdm(total=len(subjects), unit="subj")
             while queue:
                 subj, fut = queue.popleft()
                 nxt = next(it, None)
                 if nxt is not None:
-                    queue.append((nxt, ex.submit(mg.load_subject, nxt, args)))
+                    queue.append((nxt, ex.submit(mn.load_subject, nxt, args)))
                 t0 = time.time()
                 metrics_dir = run_dir / subj.name / "metrics"
                 summary, details, pairs, history, search_rows = None, [], [], None, []
@@ -753,14 +752,17 @@ def main():
 
                 status = "ok"
                 try:
-                    data = fut.result()
-                    status = data["status"]
+                    subject = fut.result()
+                    status = subject.status
                     if status == "ok":
                         # process_subject builds the planes and lines, calls align() and computes the metrics
                         mg.align = functools.partial(brute_force_align, log=search_rows)
                         summary, details, pairs, poses, history = mg.process_subject(
-                            data, args, device, on_lines=on_lines if args.logging else None)
-                        save_jobs.append((subj.name, "aligned NIfTIs", ex.submit(mg.save_aligned, data, poses, run_dir, args)))
+                            subject, args, device, on_lines=on_lines if args.logging else None)
+                        out_dir = run_dir / subj.name
+                        out_dir.mkdir(parents=True, exist_ok=True)
+                        save_jobs.append((subj.name, "aligned NIfTIs", ex.submit(
+                            mn.save, subject, mg.corrected_affines(subject, poses), out_dir, args)))
                 except Exception as e:  # noqa: BLE001
                     traceback.print_exc()
                     status = f"error: {type(e).__name__}: {e}"[:200]
