@@ -405,7 +405,7 @@ OPTIMIZERS = ("adam", "nadam", "radam", "adamax", "rmsprop", "adagrad", "sgd")
 # default learning rates (translation mm, rotation deg) per optimizer when --lr / --rot-lr are not given. The adaptive
 # methods take steps of about lr per iteration whatever the gradient scale; Adagrad's steps shrink like 1/sqrt(step),
 # so it needs a larger lr; plain SGD steps are lr * gradient, and the NCC objective's gradients are small (see --lr).
-DEFAULT_LR = {"adam": (0.2, 0.04), "nadam": (0.2, 0.04), "radam": (0.2, 0.04), "adamax": (0.2, 0.04),
+DEFAULT_LR = {"adam": (0.01, 0.004), "nadam": (0.2, 0.04), "radam": (0.2, 0.04), "adamax": (0.2, 0.04),
               "rmsprop": (0.2, 0.04), "adagrad": (1.0, 0.2), "sgd": (80.0, 20.0)}
 
 def main():
@@ -446,11 +446,16 @@ def main():
                          "Each step draws a new random subset of round(fraction x lines) lines and samples only those, "
                          "so GPU memory and time per step scale with this fraction (the full objective for tracking "
                          "the best pose is evaluated without gradients, in chunks)")
-    g.add_argument("--center-mask-radius-mm", type=float, default=70.0,
+    g.add_argument("--center-mask-radius-mm", type=float, default=55.0,
                    help="DICOM data has no segmentations, so by default the lines are masked by a disc of this radius "
                         "(mm) around the centre of each stack (where it projects onto each slice), grown by "
                         "--mask-dilation-mm and annealed from --mask-dilation-start-mm like a heart mask (final radius = "
                         "this + --mask-dilation-mm). 0 = no mask: lines over the whole image overlap. Default: %(default)s")
+    ap.add_argument("--mask-dilation-start-mm", type=float, default=70,
+                    help="Mask annealing (off unless given). The dilation (mm) used at the start of the run; it then "
+                         "shrinks linearly to --mask-dilation-mm over the first --mask-anneal-frac of the run. "
+                         "Example: '--mask-dilation-start-mm 40 --mask-dilation-mm 25' starts with a 40 mm mask and "
+                         "ends at 25 mm.")
     g = ap.add_argument_group("neighbouring slices of a stack (the slice above / below; motion_gradient.SaxNeighbourLines)")
     g.add_argument("--sax-sax-weight", type=float, default=0.0,
                    help="Similarity supervision of neighbouring slices of the same stack: where the poses make a slice "
