@@ -165,11 +165,28 @@ moves the other stacks to the slices passing through it, each stack's slice slid
 button jumps every stack to its worst slice by the chosen metric (NCC / LNCC / NMI, or motion from the acquired pose). The selected slice (keys or double click) shows its
 metrics and its intensity profiles against the crossing slice of each other stack, plus against the slices before and
 after it in its own stack (where the poses make them cross; the `--sax-sax-weight` lines, also drawn in 3D with the
-neighbour-lines toggle). Pixel data are read from the run's input DICOMs and the poses from its history (`--logging`).
+neighbour-lines toggle). As in `slice_viewer_3d.py`, two toggles show the images as the loss saw them at the shown
+step: image blurring (the coarse-to-fine in-plane blur, on the slices and in the profiles) and PSF in profiles (each
+profile averaged across the other slice's slab). Pixel data are read from the run's input DICOMs and the poses from
+its history (`--logging`).
 
 ```
 python slice_viewer_dicom.py                                   # newest run under --align-root, first subject
 python slice_viewer_dicom.py vol1302 --run <run-name> --neighbours 3
+```
+
+### `analyze_alignment.py`
+
+Pre- vs post-optimization alignment of every subject of a run (made with `--logging`), as sortable CSVs in
+`<run>/overall_metrics/alignment_analysis/`: `alignment_subjects.csv` (one row per subject), `alignment_slices.csv`
+(one row per subject-slice) and `alignment_lines.csv` (one row per intersection line). Each metric has `_pre`
+(acquired geometry), `_post` (saved pose) and `_delta` columns: mean NCC / LNCC / NMI / Dice / Hausdorff, the worst
+line's NCC / Dice / Hausdorff, the mean over the worst 10% of lines, and the correction (largest / mean translation and
+rotation). It also writes and prints the best / worst N subjects and subject-slices per metric.
+
+```
+python analyze_alignment.py <run_dir>                        # ranked by the post-optimization values
+python analyze_alignment.py <run_dir> --stage pre --top 10   # the best / worst aligned as acquired
 ```
 
 ## Dependencies

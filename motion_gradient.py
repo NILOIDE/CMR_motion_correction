@@ -1207,7 +1207,11 @@ class SaxNeighbourLines:
         iv = self.sampler.img
         idx = self.IA if side == 0 else self.IB
         z = iv.depth[idx][:, None].expand_as(vox[..., 0])
-        grid = torch.stack([2 * vox[..., 1] / (iv.Wmax - 1) - 1, 2 * vox[..., 0] / (iv.Hmax - 1) - 1, z], -1)
+        # clamped just outside the image: points outside it have weight 0 anyway (sampled as 0 either way), but the
+        # crossing line of nearly parallel neighbours lies extremely far away, and its coordinates would overflow a
+        # half-precision grid to inf -- whose gradient (inf x 0 weight) is NaN
+        xy = torch.stack([2 * vox[..., 1] / (iv.Wmax - 1) - 1, 2 * vox[..., 0] / (iv.Hmax - 1) - 1], -1).clamp(-1.1, 1.1)
+        grid = torch.cat([xy, z[..., None]], -1)
         return iv.sample(grid[None, :, :, None, :])[:, :, :, 0].float().transpose(0, 1)       # (P, F, L)
 
     def profiles(self, theta_deg: torch.Tensor, t: torch.Tensor):
@@ -1455,6 +1459,8 @@ class GraphSGD(torch.optim.Optimizer):
                 p.sub_(d * g["lr"])
 
 
+GRAD_SCALE = 2.0 ** 10   # loss scaling of the backward pass (align.body): keeps half-precision sampling gradients exact
+                         # (2^8 already matches float32 on a DICOM subject; larger scales risk float16 overflow)
 OPTIMIZERS = ("adam", "nadam", "radam", "adamax", "rmsprop", "adagrad", "sgd")
 # default learning rates (translation mm, rotation deg) per optimizer when --lr / --rot-lr are not given. The adaptive
 # methods take steps of about lr per iteration whatever the gradient scale; Adagrad's steps shrink like 1/sqrt(step),
@@ -1682,11 +1688,29 @@ def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]
         best_t.copy_(torch.where(better, t.detach(), best_t))
         best_step.copy_(torch.where(better, step_buf, best_step))
 
+    params_all = [p for g in param_groups for p in g["params"]]
+    n_skipped = torch.zeros((), **f32)                   # steps skipped for a non-finite gradient
+
     def body(smp):
         opt.zero_grad(set_to_none=False)
         obj = objective(pose_theta(), t, sel_bufs.get(id(smp)), smp)
-        (-obj).backward()
-        update_best(obj.detach())                          # pose *before* this update, as before
+        # loss scaling: with --sample-dtype float16 / bfloat16 the backward pass of the image sampling runs in half
+        # precision, where each sample's share of the gradient (~1e-5: the objective averages thousands of line points)
+        # underflows -- the gradient came out ~100x too small and pointing nowhere (cosine 0.01 with the float32
+        # gradient on a DICOM subject), so the poses random-walked and the metrics fell. Scaled by GRAD_SCALE (a power
+        # of two, exact) it matches float32 (cosine 0.997); the scale is divided out before the update.
+        (-obj * GRAD_SCALE).backward()
+        with torch.no_grad():
+            # a step whose gradient is not finite (a half-precision overflow, or a degenerate line) is skipped: its
+            # gradient is zeroed (as AMP's GradScaler does) instead of turning every pose into NaN for the rest of the
+            # run; counted in n_skipped (no host sync inside the CUDA graph)
+            grads = [p.grad for p in params_all if p.grad is not None]
+            finite = torch.stack([torch.isfinite(g).all() for g in grads]).all() & torch.isfinite(obj)
+            for g in grads:
+                g.copy_(torch.where(finite, torch.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0) / GRAD_SCALE,
+                                    torch.zeros_like(g)))
+            n_skipped.add_((~finite).float())
+        update_best(torch.where(finite, obj.detach(), best_obj))   # pose *before* this update, as before
         opt.step()
 
     use_graph = device.type == "cuda" and not getattr(args, "no_cuda_graph", False)
@@ -1697,7 +1721,7 @@ def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]
         params = [p for g in param_groups for p in g["params"]]
         saved_p = [p.detach().clone() for p in params]
         saved_state = {i: {k: v.clone() for k, v in opt.state[p].items()} for i, p in enumerate(params) if p in opt.state}
-        saved_book = [x.clone() for x in (best_obj, best_th, best_t, best_step)]
+        saved_book = [x.clone() for x in (best_obj, best_th, best_t, best_step, n_skipped)]
         side = torch.cuda.Stream()
         side.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(side):
@@ -1716,7 +1740,7 @@ def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]
                         v.copy_(saved_state[i][k])
                     else:
                         v.zero_()
-            for x, v in zip((best_obj, best_th, best_t, best_step), saved_book):
+            for x, v in zip((best_obj, best_th, best_t, best_step, n_skipped), saved_book):
                 x.copy_(v)
         return graph
 
@@ -1785,6 +1809,8 @@ def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]
     for _, smp in stages:
         smp.set_blur(0.0)
         smp.set_psf_scale(1.0)
+    if int(n_skipped.item()):
+        print(f"\n[align] {int(n_skipped.item())} of {args.steps} steps skipped (non-finite gradient)", flush=True)
     return dict(theta_deg=best_th.clone(), t=best_t.clone(), best_step=int(best_step.item()), snapshots=snapshots)
 
 
