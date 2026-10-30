@@ -7,11 +7,15 @@
 #SBATCH --cpus-per-task=8   # Number of processor cores
 #SBATCH --time=4-00:00:00
 
-# Submit from the repository root:  sbatch submit_alignment.sh [extra motion_gradient.py arguments]
+# Submit from the repository root:  sbatch submit_alignment.sh [extra moco_nifti.py arguments]
 # e.g.  sbatch submit_alignment.sh --logging true
 # The run name is fixed and --skip-processed is set, so resubmitting resumes an interrupted run.
+# Chunks (index range in the subject folders sorted by name; end exclusive), e.g. one job per 10000 subjects:
+#   sbatch submit_alignment.sh --start-index 0 --end-index 10000
+#   sbatch submit_alignment.sh --start-index 10000 --end-index 20000   ...
+#   sbatch submit_alignment.sh --start-index 50000                      (to the end)
 
-echo "Running slice alignment (motion_gradient.py) on GPU..."
+echo "Running slice alignment (moco_nifti.py) on GPU..."
 echo "Additional arguments passed: $@"
 
 # 1. Initialize Conda for this bash shell
@@ -21,17 +25,18 @@ source /u/home/stol/miniconda3/etc/profile.d/conda.sh
 conda activate ugurlu
 
 # Define your absolute paths
-REPO_DIR="$SLURM_SUBMIT_DIR"
+REPO_DIR="/u/home/stol/Documents/Projects/CMR_motion_correction"
 ALIGN_DIR="/vol/miltank/projects/ukbb/data/cardiac/slice_alignment"
-DATA_DIR="$ALIGN_DIR/unaligned_subjects"
+# moco_nifti.py reads the raw UKBB layout directly
+DATA_DIR="/vol/miltank/projects/ukbb/data/cardiac/cardiac_segmentations/projects/ugurlu_segmentations/data"
 OUT_ROOT="$ALIGN_DIR"
 RUN_NAME="aligned_subjects"          # outputs: $OUT_ROOT/$RUN_NAME/<subject>/
 
 cd "$REPO_DIR" || { echo "Error: repository directory not found"; exit 1; }
-[ -f motion_gradient.py ] || { echo "Error: motion_gradient.py not found in $REPO_DIR (submit from the repo root)"; exit 1; }
+[ -f moco_nifti.py ] || { echo "Error: moco_nifti.py not found in $REPO_DIR (submit from the repo root)"; exit 1; }
 
 # Run the alignment using srun; arguments passed to sbatch come last and override the defaults here
-srun python -u motion_gradient.py \
+srun python -u moco_nifti.py \
     --root "$DATA_DIR" \
     --out-root "$OUT_ROOT" \
     --run-name "$RUN_NAME" \
@@ -39,4 +44,5 @@ srun python -u motion_gradient.py \
     --logging true \
     --workers "$SLURM_CPUS_PER_TASK" \
     --device cuda \
+    --sample-dtype float16 \
     "$@"

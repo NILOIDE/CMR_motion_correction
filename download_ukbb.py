@@ -1,3 +1,13 @@
+"""
+Downloads subjects from the UKBB cardiac segmentations dataset in sorted batches over a single SSH connection.
+
+DATA PROTECTION DISCLAIMER:
+UK Biobank data is provided under a restricted access agreement. It must only be stored and processed
+on the approved, access-restricted infrastructure (e.g., the institute's secured servers / compute cluster).
+Do NOT download it to personal machines (laptops, home PCs), external drives, or any personal or cloud
+storage outside that infrastructure. Make sure --local-dir points to approved storage before running.
+"""
+
 import argparse
 import getpass
 import shlex
@@ -13,6 +23,12 @@ except ImportError:
 
 SUBJECT_LIST_FILE = "subject_ids.txt"
 DONE_FILE = ".downloaded_subjects.txt"
+
+DISCLAIMER = (
+    "DISCLAIMER: UK Biobank data is provided under a restricted access agreement. Only download it to the\n"
+    "approved, access-restricted infrastructure (e.g., the institute's secured servers / compute cluster).\n"
+    "Do NOT download it to personal machines (laptops, home PCs), external drives, or personal/cloud storage."
+)
 
 
 def parse_host(host: str) -> tuple[str, str | None]:
@@ -82,6 +98,40 @@ def fetch_subject_ids(client: paramiko.SSHClient, remote_base_dir: str, cache_fi
     return ids
 
 
+def filter_existing(client: paramiko.SSHClient, remote_base_dir: str, subject_ids: list[str]) -> list[str]:
+    """
+    Returns the subject IDs that exist in the remote dataset directory and warns about the rest.
+    Only the given names are checked (no directory listing). IDs are sent over stdin so long
+    lists don't hit the remote command-line length limit.
+    """
+    cmd = (f"cd {shlex.quote(remote_base_dir)} && "
+           'while IFS= read -r d; do if [ -e "$d" ]; then printf "%s\\n" "$d"; fi; done')
+    stdin, stdout, stderr = client.exec_command(cmd)
+    stdin.write("\n".join(subject_ids) + "\n")
+    stdin.channel.shutdown_write()
+    out = stdout.read().decode(errors="replace")
+    status = stdout.channel.recv_exit_status()
+    if status != 0:
+        err = stderr.read().decode(errors="replace").strip()
+        raise RuntimeError(f"Remote existence check failed (exit {status}):\n{err}")
+
+    existing = {line.strip() for line in out.splitlines() if line.strip()}
+    missing = [s for s in subject_ids if s not in existing]
+    if missing:
+        shown = ", ".join(missing[:20]) + (f", ... and {len(missing) - 20} more" if len(missing) > 20 else "")
+        print(f"WARNING: {len(missing)} of {len(subject_ids)} requested subjects not found on the remote, "
+              f"skipping: {shown}")
+    return [s for s in subject_ids if s in existing]
+
+
+def read_subject_file(path: Path) -> list[str]:
+    """Reads subject IDs from a text file: whitespace/newline separated, '#' starts a comment."""
+    ids = []
+    for line in path.read_text().splitlines():
+        ids.extend(line.split("#", 1)[0].split())
+    return ids
+
+
 def load_done(done_file: Path) -> set[str]:
     if not done_file.exists():
         return set()
@@ -144,15 +194,22 @@ def download_ukbb_in_batches(
         n_subjects: int,
         batch_size: int,
         refresh_list: bool,
+        subject_ids: list[str] | None = None,
 ) -> None:
+    print(f"{DISCLAIMER}\nDestination: {local_base_dir.resolve()}\n")
     local_base_dir.mkdir(parents=True, exist_ok=True)
     cache_file = local_base_dir / SUBJECT_LIST_FILE
     done_file = local_base_dir / DONE_FILE
 
     client = connect(remote_host)
     try:
-        all_ids = fetch_subject_ids(client, remote_base_dir, cache_file, refresh_list)
-        wanted = all_ids if n_subjects < 0 else all_ids[:n_subjects]
+        if subject_ids:
+            # Explicit IDs skip the remote listing entirely; dedupe and sort like the full list,
+            # then drop IDs that don't exist so a typo can't abort a whole batch.
+            wanted = filter_existing(client, remote_base_dir, sorted(set(subject_ids), key=sort_key))
+        else:
+            all_ids = fetch_subject_ids(client, remote_base_dir, cache_file, refresh_list)
+            wanted = all_ids if n_subjects < 0 else all_ids[:n_subjects]
 
         done = load_done(done_file)
         todo = [s for s in wanted if s not in done]
@@ -176,7 +233,9 @@ def download_ukbb_in_batches(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Download subjects from the UKBB cardiac segmentations dataset in sorted batches "
-                    "over a single SSH connection.")
+                    "over a single SSH connection.",
+        epilog=DISCLAIMER,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
         "--host",
         type=str,
@@ -192,14 +251,29 @@ if __name__ == "__main__":
     parser.add_argument(
         "--local-dir",
         type=Path,
-        default=Path(r"C:\Users\Nil\Documents\data\ukbb"),
+        default=Path(r"/home/nil/data/ukbb"),
         help="Local destination directory"
     )
     parser.add_argument(
         "--n-subjects",
         type=int,
-        default=25,
-        help="Number of subjects to download, taken from the lowest ID upwards. Use -1 for all."
+        default=120,
+        help="Number of subjects to download, taken from the lowest ID upwards. Use -1 for all. "
+             "Ignored when --subjects or --subjects-file is given."
+    )
+    parser.add_argument(
+        "--subjects",
+        type=str,
+        nargs="+",
+        default=None,
+        help="Specific subject IDs to download (e.g., --subjects 1000123 1000456)"
+    )
+    parser.add_argument(
+        "--subjects-file",
+        type=Path,
+        default=None,
+        help="Text file with subject IDs to download (whitespace/newline separated, '#' for comments). "
+             "Can be combined with --subjects."
     )
     parser.add_argument(
         "--batch-size",
@@ -214,6 +288,15 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
+
+    subject_ids = list(args.subjects or [])
+    if args.subjects_file is not None:
+        if not args.subjects_file.is_file():
+            parser.error(f"--subjects-file not found: {args.subjects_file}")
+        subject_ids += read_subject_file(args.subjects_file)
+        if not subject_ids:
+            parser.error(f"No subject IDs found in {args.subjects_file}")
+
     download_ukbb_in_batches(
         remote_host=args.host,
         remote_base_dir=args.remote_dir,
@@ -221,4 +304,5 @@ if __name__ == "__main__":
         n_subjects=args.n_subjects,
         batch_size=args.batch_size,
         refresh_list=args.refresh_list,
+        subject_ids=subject_ids,
     )

@@ -227,6 +227,8 @@ def save(subject: mg.Subject, affines: list[np.ndarray], out: Path, args) -> Non
 def is_complete(subj_in: Path, subj_out: Path) -> bool:
     """True when every image slice found in the input has its output file in subj_out (SAX_slice<nn>.nii.gz,
     <image>.nii.gz, <image>_slice<nn>.nii.gz)."""
+    if not subj_out.is_dir():                            # not started: no need to read the input (one stat, not a
+        return False                                     # folder walk + header reads on a network filesystem)
     found = discover_subject(subj_in)
     names = [output_stem("SAX", s["index"], 0) for s in sax_slice_list(found["sax"])]
     for image, path in found["lax"].items():
@@ -236,6 +238,8 @@ def is_complete(subj_in: Path, subj_out: Path) -> bool:
 
 
 def main():
+    # Every option of motion_gradient.build_parser is available; the ones below are repeated here for visibility and
+    # with defaults for UK Biobank NIfTI data (a repeated option replaces the general one, see build_parser).
     ap = mg.build_parser(__doc__)
     g = ap.add_argument_group("paths")
     g.add_argument("--root", type=Path, default=Path(r"C:\Users\Nil\Documents\data\ukbb"),
@@ -250,6 +254,12 @@ def main():
     g = ap.add_argument_group("run")
     g.add_argument("--max-subjects", type=int, default=-1,
                    help="Max number of subjects to process (-1 = all). Default: %(default)s")
+    g.add_argument("--start-index", type=int, default=0,
+                   help="First subject folder to process, as an index into the subject folders under --root sorted by "
+                        "name (0-based; with --end-index, to submit the cohort in chunks). Default: %(default)s")
+    g.add_argument("--end-index", type=int, default=-1,
+                   help="Process only subject folders before this index (exclusive; -1 = to the end). "
+                        "Default: %(default)s")
     g.add_argument("--skip-processed", action="store_true",
                    help="Skip subjects whose aligned images are already complete in the run directory (to resume a run, "
                         "pass its directory name with --run-name; a default name is always new)")
@@ -300,8 +310,7 @@ def main():
                         "bfloat16 only to ~0.4 pixel and ~0.4%% in intensity (coarse for sub-mm motion). Poses, line "
                         "geometry and metrics stay float32; the saved images are unaffected (see --image-dtype). "
                         "Default: %(default)s")
-    args = ap.parse_args()
-    mg.run(ap, args, load_subject, save, is_complete)
+    mg.run(ap, ap.parse_args(), load_subject, save, is_complete)
 
 
 if __name__ == "__main__":
