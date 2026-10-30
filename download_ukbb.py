@@ -1,3 +1,13 @@
+"""
+Downloads subjects from the UKBB cardiac segmentations dataset in sorted batches over a single SSH connection.
+
+DATA PROTECTION DISCLAIMER:
+UK Biobank data is provided under a restricted access agreement. It must only be stored and processed
+on the approved, access-restricted infrastructure (e.g., the institute's secured servers / compute cluster).
+Do NOT download it to personal machines (laptops, home PCs), external drives, or any personal or cloud
+storage outside that infrastructure. Make sure --local-dir points to approved storage before running.
+"""
+
 import argparse
 import getpass
 import shlex
@@ -13,6 +23,12 @@ except ImportError:
 
 SUBJECT_LIST_FILE = "subject_ids.txt"
 DONE_FILE = ".downloaded_subjects.txt"
+
+DISCLAIMER = (
+    "DISCLAIMER: UK Biobank data is provided under a restricted access agreement. Only download it to the\n"
+    "approved, access-restricted infrastructure (e.g., the institute's secured servers / compute cluster).\n"
+    "Do NOT download it to personal machines (laptops, home PCs), external drives, or personal/cloud storage."
+)
 
 
 def parse_host(host: str) -> tuple[str, str | None]:
@@ -180,6 +196,7 @@ def download_ukbb_in_batches(
         refresh_list: bool,
         subject_ids: list[str] | None = None,
 ) -> None:
+    print(f"{DISCLAIMER}\nDestination: {local_base_dir.resolve()}\n")
     local_base_dir.mkdir(parents=True, exist_ok=True)
     cache_file = local_base_dir / SUBJECT_LIST_FILE
     done_file = local_base_dir / DONE_FILE
@@ -216,7 +233,9 @@ def download_ukbb_in_batches(
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Download subjects from the UKBB cardiac segmentations dataset in sorted batches "
-                    "over a single SSH connection.")
+                    "over a single SSH connection.",
+        epilog=DISCLAIMER,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument(
         "--host",
         type=str,
