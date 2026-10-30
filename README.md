@@ -29,7 +29,8 @@ moco_nifti.py  /  moco_dicom.py           -> entry points: load a subject (NIfTI
 motion_gradient.py                        -> the motion correction (library): estimates per-slice rigid poses
             |                                (+ optional metrics/figures)
             v
-slice_viewer_3d.py                        -> interactive 3D viewer over the optimization history (UKBB NIfTI runs)
+slice_viewer_3d.py  /  slice_viewer_dicom.py   -> interactive 3D viewers over the optimization history
+                                                 (UKBB NIfTI runs / DICOM runs with hundreds of slices)
 ```
 
 ### `moco_nifti.py` (UK Biobank NIfTI)
@@ -70,7 +71,9 @@ For other cine data, e.g. several stacks in different orientations. Every DICOM 
 `SeriesInstanceUID`) below a subject folder is one image, named after its folder. Its slices are the distinct
 positions/orientations and its cardiac frames the files at one slice (ordered by `TriggerTime` / `InstanceNumber`).
 The slice thickness comes from `SliceThickness`. Real/imaginary image pairs are combined into the magnitude. DICOM
-data has no segmentations, so lines run over the whole image overlap.
+data has no segmentations, so the lines are masked by a disc around the centre of each stack instead
+(`--center-mask-radius-mm`, default 40 mm), grown and annealed like the heart masks (radius 120 mm at the start, 60 mm
+at the end with the default dilation); `--center-mask-radius-mm 0` uses the whole image overlap.
 
 ```
 <root>/
@@ -80,18 +83,23 @@ data has no segmentations, so lines run over the whole image overlap.
 ```
 
 Output: every input file rewritten at the same relative path, with the corrected `ImagePositionPatient` /
-`ImageOrientationPatient` and new UIDs; pixel data are unchanged (`--image-dtype uint8` for 8-bit).
+`ImageOrientationPatient` and new UIDs; pixel data are unchanged (`--image-dtype uint8` for 8-bit). With `--logging`,
+each subject's `metrics/` also gets line plots of the metrics over the optimization: `metric_trends.png` (the optimized
+objective, then NCC / LNCC / NMI per slice: mean, min / max and inter-quartile range, and the slope over the last 25% of
+the steps) and `metric_trends_stacks.png` (the same per stack), to see whether a run improved, is still improving, or
+diverged.
 
 ```
 python moco_dicom.py --root <dicom_dir>                     # output: <dicom_dir>_aligned
 python moco_dicom.py --root <dicom_dir> --pair-keep 0.25 --sample-dtype float16   # many slices, small GPU
 ```
 
-Both entry points share the motion-correction options. Paths, run options (`--max-subjects`, `--skip-processed`,
-`--logging`), data formats and hardware (`--device`, `--workers`, `--sample-dtype`) are defined per entry point; see
-`--help`. A new data format only needs a new entry script that loads a subject into a list of 2D+time slices
-(`motion_gradient.SliceImage`: cine, affine, thickness, optional segmentation) and writes them back with the
-corrected affines.
+Every option is defined with a general default in `motion_gradient.build_parser`. An entry point adds its
+data-format options (slice thickness, `--image-dtype`) and repeats the options worth seeing at a glance (paths, run
+options, hardware, ...) with its own defaults: a repeated option replaces the general one (e.g. `--blur-frac` is 0.9 in
+`motion_gradient.py` and 0.1 in `moco_dicom.py`). See `--help` for everything. A new data format only needs a new entry
+script that loads a subject into a list of 2D+time slices (`motion_gradient.SliceImage`: cine, affine, thickness,
+optional segmentation) and writes them back with the corrected affines.
 
 ### `motion_gradient.py`
 
@@ -102,7 +110,9 @@ stack never pair. Between densely spaced stacks the pairs are thinned to partner
 (`--pair-spacing-mm`). For each pair it samples intensity profiles along their 3D intersection line (with a PSF band
 for the slice thickness, restricted to a dilated heart mask where segmentations exist) and optimizes a rigid pose per
 slice (PyTorch, SGD/Adam) to maximize agreement across cardiac phases. Optional SAX-stack regularizers keep
-neighbouring slices from tilting, drifting apart, or crossing. With `--logging`, it also writes per-subject and
+neighbouring slices from tilting, drifting apart, or crossing. The crossing terms (`--sax-sax-weight`: image
+dissimilarity along the line where a slice crosses the one above / below it; `--sax-gap-reg`: a gap barrier) act on
+every stack, so also on the oblique DICOM stacks (exposed in `moco_dicom.py`). With `--logging`, it also writes per-subject and
 dataset-level metrics (CSV) and figures (PNG) under the run directory. The method builds on the intersection-line
 intensity-matching approach of [Stolt-Ansó et al.](https://arxiv.org/pdf/2404.00767) [2].
 
@@ -145,6 +155,22 @@ python slice_viewer_3d.py 1000071 --run <run-name>
 ```
 
 See the module docstring for the full keyboard/mouse interaction reference.
+
+### `slice_viewer_dicom.py`
+
+Viewer for `moco_dicom.py` runs, built for subjects with hundreds of slices (e.g. several stacks of 40-60 slices).
+Slices are grouped by stack (series), and only a subset is drawn at a time. Each stack shows its current slice and
+optionally +-w neighbours, which its ghost button turns into faint outlines in the stack's colour: selecting a slice
+moves the other stacks to the slices passing through it, each stack's slice slider scrolls through its slices, and a
+button jumps every stack to its worst slice by the chosen metric (NCC / LNCC / NMI, or motion from the acquired pose). The selected slice (keys or double click) shows its
+metrics and its intensity profiles against the crossing slice of each other stack, plus against the slices before and
+after it in its own stack (where the poses make them cross; the `--sax-sax-weight` lines, also drawn in 3D with the
+neighbour-lines toggle). Pixel data are read from the run's input DICOMs and the poses from its history (`--logging`).
+
+```
+python slice_viewer_dicom.py                                   # newest run under --align-root, first subject
+python slice_viewer_dicom.py vol1302 --run <run-name> --neighbours 3
+```
 
 ## Dependencies
 

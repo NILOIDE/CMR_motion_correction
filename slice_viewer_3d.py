@@ -75,7 +75,10 @@ Interaction
     Buttons < / > next to "run" (top right, above), keys } and { (> = older)
                         step through the runs of the same directory (--align-root, or the
                         parent of --run-dir), newest first; the current subject is kept when
-                        the other run has it, else the same position in its subject list
+                        the other run has it, else the same position in its subject list. Same
+                        subject: its pixels are not read again (only the NIfTI headers, for the
+                        run's saved affines, and its history), the slices and the view (camera,
+                        shown slices, frame, profiled slice) stay; only overlays and UI are rebuilt
     p / , / .           intersection intensity profiles (right): toggle / previous / next slice;
                         hovering a chart marks that position on the line in 3D (red tick in both
                         slices) and shows both grey values in the chart title;
@@ -94,7 +97,10 @@ Interaction
                         selected metric per point along the same line (NCC: z_a z_b, mean = NCC;
                         LNCC: local NCC per window; Dice: 1 same label / 0 one only; Hausdorff:
                         distance to the nearest same label in the other profile, max = HD; empty
-                        for NMI); hovering shows the value at that position. Each chart keeps one
+                        for NMI), drawn as the profiles: thin over the whole intersection (the
+                        metric without the mask; NCC z-scored with the loss part's mean / std),
+                        thick over the loss part, yellow bar: inside the mask; hovering shows the
+                        value at that position. Each chart keeps one
                         y scale: the curve's min / max over all history snapshots (at the frame shown
                         when it was built, widened if another frame goes beyond), so the metric can
                         be watched rising or falling while scrubbing the history
@@ -400,6 +406,47 @@ def load_images(instance_dir: Path) -> dict:
     if not data:
         raise RuntimeError(f"No views found in {instance_dir}")
     return data
+
+
+def image_signature(instance_dir: Path) -> dict:
+    """What a run's images of one subject look like without reading their pixels: per image file (view, file name)
+    its shape, data type and intensity scaling, whether it has a segmentation, and its affine (NIfTI headers only).
+    Two runs of a subject with equal signatures (but for the affines) hold the same pixels: the alignment writes the
+    input images with corrected affines (see reuse_images)."""
+    sig = {}
+    for view in VIEWS:
+        mode, paths = find_view_files(instance_dir, view)
+        for p in paths:
+            img = nib.load(str(p))
+            slope, inter = img.dataobj.slope, img.dataobj.inter
+            sig[(view, p.name)] = dict(mode=mode, shape=tuple(img.shape), dtype=str(img.get_data_dtype()),
+                                       scale=(float(slope), float(inter)),
+                                       seg=seg_path_for(instance_dir, p).exists(),
+                                       affine=np.asarray(img.affine, dtype=np.float64))
+    return sig
+
+
+def reuse_images(cached: dict, cached_sig: dict, instance_dir: Path) -> tuple[dict, dict] | None:
+    """Another run's images of the cached subject without reading pixels: (data as load_images, signature), sharing
+    the cached slices' arrays, with the affines of instance_dir's headers (each run saves its own corrected pose).
+    None if any file differs in name, shape, data type, scaling or segmentation (e.g. a run saved with --image-dtype
+    uint8): then everything has to be read."""
+    sig = image_signature(instance_dir)
+    strip = lambda d: {k: (v["mode"], v["shape"], v["dtype"], v["scale"], v["seg"]) for k, v in d.items()}  # noqa: E731
+    if strip(sig) != strip(cached_sig):
+        return None
+    data = {}
+    for view, v in cached.items():
+        slices = []
+        for s in v["slices"]:
+            hdr = sig[(view, s["file"])]
+            nz = hdr["shape"][2] if len(hdr["shape"]) > 2 else 1
+            k = int(s["index"]) if v["mode"] == "volume" else (int(s["index"]) % nz if nz > 1 else 0)
+            A0 = hdr["affine"].copy()                    # origin moved to this slice, as load_images
+            A0[:3, 3] += k * hdr["affine"][:3, 2]
+            slices.append(dict(s, affine=A0))
+        data[view] = {"mode": v["mode"], "slices": slices}
+    return data, sig
 
 
 def describe_images(instance_dir: Path, data: dict) -> None:
@@ -911,8 +958,9 @@ class SliceViewer:
         self._scene_actors.append(actor)
         return actor
 
-    def _teardown(self):
-        """Remove every actor and widget of the current subject (the navigation UI stays)."""
+    def _teardown(self, keep_slices: bool = False):
+        """Remove every actor and widget of the current subject (the navigation UI stays). keep_slices: the slices'
+        actors (image quads and outlines) and their entries stay, for another run of the same subject (load_index)."""
         pl = self.pl
         wh = getattr(pl, "widgets", pl)          # pyvista >= 0.45 keeps the widget lists here
         for w in list(self._widgets.values()) + list(self._radios.values()) + list(self._profile_radios.values()) + \
@@ -920,6 +968,8 @@ class SliceViewer:
             if w is None:
                 continue
             w.Off()
+            # switching a widget off leaves its representation (the drawn button / slider) in the renderer
+            pl.renderer.RemoveViewProp(w.GetRepresentation())
             for lst in (getattr(wh, "button_widgets", []), getattr(wh, "slider_widgets", [])):
                 if w in lst:
                     lst.remove(w)
@@ -929,13 +979,27 @@ class SliceViewer:
             rd.pop("profile", None)
         rt = getattr(wh, "radio_button_title_dict", None)
         if isinstance(rt, dict):
-            rt.pop("outline_metric", None)
+            for t in rt.pop("outline_metric", None) or []:
+                pl.remove_actor(t, render=False)
         if "outline colour" in pl.scalar_bars:
             pl.remove_scalar_bar("outline colour", render=False)
+        keep = {id(e[k]) for e in self.entries for k in ("actor", "outline")} if keep_slices else set()
         for a in self._scene_actors:
-            pl.remove_actor(a, render=False)
+            if id(a) not in keep:
+                pl.remove_actor(a, render=False)
+        kept = ([a for a in self._scene_actors if id(a) in keep], self.entries, self._entry_by_key, self._tex_cache)
         self._scene_actors = []
         self._reset_scene_state()
+        if keep_slices:
+            self._scene_actors, self.entries, self._entry_by_key, self._tex_cache = kept
+
+    def _same_slices(self, data: dict) -> bool:
+        """Whether `data` (load_images) holds exactly the shown slices -- the same subject from another run, its
+        pixels reused (load_subject_run's cache) -- so their actors can be kept (load_index)."""
+        new = [(view, s) for view in VIEWS if view in data for s in data[view]["slices"]]
+        return len(new) == len(self.entries) and all(
+            e["view"] == view and e["name"] == s["name"] and e["slice"]["grey"] is s["grey"]
+            for e, (view, s) in zip(self.entries, new))
 
     def load_index(self, index: int, run_index: int | None = None, subjects: list[str] | None = None) -> bool:
         """Show subject number `index` (clipped) of run `run_index` (default: the current run),
@@ -956,8 +1020,11 @@ class SliceViewer:
             print(f"[warn] could not load {Path(run).name} / {subject}: {type(exc).__name__}: {exc}",
                   file=sys.stderr)
             return False
+        # another run of the shown subject (same pixels): keep the slices' actors and the view (camera, visibility,
+        # frame, profiled slice); only the run's data, overlays and UI are rebuilt -- much faster than a full load
+        same = self._built and self._same_slices(loaded["data"])
         if self._built:
-            self._teardown()
+            self._teardown(keep_slices=same)
         self.offsets = {}
         self._hover = None
         self._blur_cache = {}
@@ -995,7 +1062,13 @@ class SliceViewer:
             start = self.history["best_index"] if self.history["best_index"] is not None else len(self.snapshots) - 1
         self.snap_index = int(np.clip(start, 0, len(self.snapshots) - 1))
 
-        self._build_slices()
+        if same:                                         # the kept entries: this run's slice dicts (its affines)
+            new = [s for view in VIEWS if view in self.data for s in self.data[view]["slices"]]
+            for e, s in zip(self.entries, new):
+                e["slice"] = s
+                e["in_history"] = any(e["key"] in snap["affines"] for snap in self.snapshots)
+        else:
+            self._build_slices()
         self._build_overlays()
         names = [e["name"] for e in self.entries]
         if self.profile_key not in names:
@@ -1005,7 +1078,8 @@ class SliceViewer:
         self._configure_metric()
         self._apply_snapshot()
         self._apply_visibility()
-        self._set_initial_camera()
+        if not same:
+            self._set_initial_camera()
         self._update_nav_text()
         self._update_move_text()
         self._built = True
@@ -1140,8 +1214,11 @@ class SliceViewer:
             self._profile_charts.append({"chart": ch, "plots": plots, "item": None})
 
             ch = new_chart(PROFILE_SLOTS - 1 - k)
+            # as the profile charts: thin over the whole intersection, thick where it enters the loss, mask bar
             plots = {"zero": ch.line(x0, x0 * 0, color=(0.4, 0.4, 0.4), width=1.0),
-                     "curve": ch.line(x0, x0 * np.nan, color=PROFILE_LOSS_COLOR, width=1.5),
+                     "full": ch.line(x0, x0 * np.nan, color=PROFILE_LOSS_COLOR, width=1.0),
+                     "curve": ch.line(x0, x0 * np.nan, color=PROFILE_LOSS_COLOR, width=2.5),
+                     "mask": ch.line(x0, x0 * np.nan, color=MASK_CONTOUR_COLOR, width=2.0),
                      "cursor": ch.line(np.array([0.0, 0.0]), np.array([0.0, 1.0]), color=HOVER_COLOR, width=1.5)}
             plots["cursor"].visible = False
             pl.add_chart(ch)
@@ -1858,10 +1935,13 @@ class SliceViewer:
 
     def _profile_metric(self, e: dict, it: dict, snap: dict, t: np.ndarray, ya: np.ndarray, yb: np.ndarray,
                         used: np.ndarray):
-        """The selected metric of one chart and its per-point curve: (label, value or None, curve t, curve or None).
-        Computed like the loss / logged metrics on the line's loss points, resampled on the --line-step-mm grid,
-        current frame only. Curves (NaN where undefined):
-          NCC   z_a(t) z_b(t) of the z-scored profiles -- their mean over the loss points is the NCC
+        """The selected metric of one chart and its per-point curves: (label, value or None, curve t, loss curve or
+        None, full curve or None), resampled on the --line-step-mm grid, current frame only. The value and the loss
+        curve are computed like the loss / logged metrics on the line's loss points (NaN elsewhere); the full curve
+        is the same metric over the whole intersection inside both images (the metric without the mask), equal to
+        the loss curve on the loss points. Curves (NaN where undefined):
+          NCC   z_a(t) z_b(t) of the profiles z-scored with the loss points' mean / std -- their mean over the loss
+                points is the NCC (no loss points: z-scored over the whole intersection)
           LNCC  the local NCC of the window centred at t -- their weighted mean is the LNCC
           Dice  1 where both slices show the same counted label, 0 where only one does
           HD    distance (mm) to the nearest point of the same label in the other profile -- the line's
@@ -1871,30 +1951,54 @@ class SliceViewer:
         cfg = getattr(self, "config", None) or {}
         step = float(cfg.get("line_step_mm", PROFILE_STEP_MM))
         tg = np.arange(np.ceil(t[0] / step) * step, t[-1] + 1e-6, step)
-        none = (spec["label"], None, tg, None)
+        none = (spec["label"], None, tg, None, None)
         if len(tg) < 3:
             return none
         interp = lambda y: np.interp(tg, t, np.where(np.isfinite(y), y, np.nan))   # noqa: E731
         a, b = interp(ya), interp(yb)
-        w = (np.interp(tg, t, used.astype(float)) > 0.5) & np.isfinite(a) & np.isfinite(b)
-        if w.sum() < 3:
+        v = np.isfinite(a) & np.isfinite(b)                 # inside both images
+        w = (np.interp(tg, t, used.astype(float)) > 0.5) & v  # loss points
+        if v.sum() < 3:
             return none
-        a, b = np.where(w, a, 0.0), np.where(w, b, 0.0)
-        wf = w.astype(float)
+        has_loss = w.sum() >= 3
+        a, b = np.where(v, a, 0.0), np.where(v, b, 0.0)
+        wf, vf = w.astype(float), v.astype(float)
+
+        def merged(loss, full):                             # the full curve takes the loss values on the loss points
+            if full is None:
+                return loss
+            return full if loss is None else np.where(w & np.isfinite(loss), loss, full)
+
         if self.metric == "ncc":
-            ws = wf.sum()
-            za = (a - (wf * a).sum() / ws); za = za / max(np.sqrt((wf * za * za).sum() / ws), 1e-9)
-            zb = (b - (wf * b).sum() / ws); zb = zb / max(np.sqrt((wf * zb * zb).sum() / ws), 1e-9)
-            return spec["label"], np_ncc(a, b, wf), tg, np.where(w, za * zb, np.nan)
+            sf = wf if has_loss else vf                       # z-scored with the loss points' statistics
+            ss = sf.sum()
+            za = (a - (sf * a).sum() / ss); za = za / max(np.sqrt((sf * za * za).sum() / ss), 1e-9)
+            zb = (b - (sf * b).sum() / ss); zb = zb / max(np.sqrt((sf * zb * zb).sum() / ss), 1e-9)
+            full = np.where(v, za * zb, np.nan)
+            if not has_loss:
+                return spec["label"], None, tg, None, full
+            return spec["label"], np_ncc(a, b, wf), tg, np.where(w, full, np.nan), full
         if self.metric == "lncc":
             k = max(3, int(round(float(cfg.get("lncc_window_mm", 20.0)) / step)))
-            value, loc, wt = np_lncc(a, b, wf, k, float(cfg.get("lncc_min_std", 0.25)), return_windows=True)
-            curve = np.full(len(tg), np.nan)
-            centre = np.arange(len(loc)) + (k - 1) // 2
-            curve[centre] = np.where(wt > 0, loc, np.nan)
-            return spec["label"], value, tg, curve
+            min_std = float(cfg.get("lncc_min_std", 0.25))
+            centre = np.arange(len(tg) - k + 1) + (k - 1) // 2
+
+            def local(weights):
+                value, loc, wt = np_lncc(a, b, weights, k, min_std, return_windows=True)
+                curve = np.full(len(tg), np.nan)
+                curve[centre[:len(loc)]] = np.where(wt > 0, loc, np.nan)
+                return value, curve
+
+            _, full = local(vf)
+            if not has_loss:
+                return spec["label"], None, tg, None, full
+            value, curve = local(wf)
+            return spec["label"], value, tg, curve, merged(curve, full)
         if self.metric == "nmi":
-            return spec["label"], np_nmi(a, b, wf, int(cfg.get("nmi_bins", 24)), float(cfg.get("nmi_sigma", 1.0))), tg, None
+            if not has_loss:
+                return none
+            return (spec["label"], np_nmi(a, b, wf, int(cfg.get("nmi_bins", 24)), float(cfg.get("nmi_sigma", 1.0))),
+                    tg, None, None)
         if self.metric in ("dice", "hd"):
             if it.get("sa_sa"):
                 return none                                 # not evaluated on SA-SA lines
@@ -1903,11 +2007,15 @@ class SliceViewer:
             labs = cfg.get("seg_labels", "1,2,3,4,5") if la_la else cfg.get("sax_seg_labels", "1,2,3")
             labs = [int(x) for x in str(labs).split(",") if x.strip()]
             if self.metric == "dice":
-                value, curve = self._line_dice(e, it["other"], snap, pts, w, labs)
+                line = lambda valid: self._line_dice(e, it["other"], snap, pts, valid, labs)   # noqa: E731
             else:
-                value, curve = self._line_hd(e, it["other"], snap, pts, w, labs, tg,
-                                             float(cfg.get("hd_miss_mm", 100.0)))
-            return spec["label"], value, tg, curve
+                line = lambda valid: self._line_hd(e, it["other"], snap, pts, valid, labs, tg,   # noqa: E731
+                                                   float(cfg.get("hd_miss_mm", 100.0)))
+            _, full = line(v)
+            if not has_loss:
+                return spec["label"], None, tg, None, full
+            value, curve = line(w)
+            return spec["label"], value, tg, curve, merged(curve, full)
         return none
 
     def _seg_on(self, e: dict, snap: dict, pts: np.ndarray) -> np.ndarray | None:
@@ -1981,14 +2089,14 @@ class SliceViewer:
                 ya, yb, mode_txt = self._profile_values(e, it, snap, pts)
                 used = (t >= it["t_used"][0]) & (t <= it["t_used"][1]) if np.isfinite(it["t_used"]).all() \
                     else np.zeros(len(t), bool)
-                mname, mval, ct, curve = self._profile_metric(e, it, snap, t, ya, yb, used)
+                mname, mval, ct, curve, full = self._profile_metric(e, it, snap, t, ya, yb, used)
                 c.update(t=t, pts=pts, ya=ya, yb=yb, used=used, mode_txt=mode_txt, mname=mname, mval=mval,
-                         ct=ct, curve=curve)
+                         ct=ct, curve=curve, full=full)
             out.append(c)
         return out
 
     def _metric_ranges(self, data: list[dict]) -> list:
-        """Per chart slot: (min, max) of the metric curve over every history snapshot, so the metric
+        """Per chart slot: (min, max) of the full metric curve over every history snapshot, so the metric
         charts keep one y scale while scrubbing the history; None where a slot never has a curve.
         Computed at the frame shown when it is (re)built -- slice, metric, profile mode or manual
         offsets changed (~0.6 s for 50 snapshots) -- and only widened afterwards when another frame's
@@ -2002,14 +2110,14 @@ class SliceViewer:
             hi = np.full(PROFILE_SLOTS, -np.inf)
             for snap in self.snapshots:
                 for k, c in enumerate(self._chart_data(snap)):
-                    cv = c.get("curve")
+                    cv = c.get("full")
                     if cv is not None and np.isfinite(cv).any():
                         lo[k] = min(lo[k], float(np.nanmin(cv)))
                         hi[k] = max(hi[k], float(np.nanmax(cv)))
             self._range_cache = cache = (key, lo, hi)
         _, lo, hi = cache
         for k, c in enumerate(data[:PROFILE_SLOTS]):
-            cv = c.get("curve")
+            cv = c.get("full")
             if cv is not None and np.isfinite(cv).any():
                 lo[k] = min(lo[k], float(np.nanmin(cv)))
                 hi[k] = max(hi[k], float(np.nanmax(cv)))
@@ -2037,7 +2145,7 @@ class SliceViewer:
                 ch.title = f"{names}: no crossing"
                 for p_ in pl_.values():
                     p_.update(np.array([0.0, 1.0]), np.array([np.nan, np.nan]))
-                self._fill_metric_chart(mslot, f"{names}: no crossing", None, None, None, None)
+                self._fill_metric_chart(mslot, f"{names}: no crossing", None, None, None, None, None, None)
                 continue
             t, ya, yb, used, mname, mval = c["t"], c["ya"], c["yb"], c["used"], c["mname"], c["mval"]
             ch.title = (f"{names}   {mname} {mval:.2f}{c['mode_txt']}" if mval is not None
@@ -2053,21 +2161,23 @@ class SliceViewer:
             ch.x_range = xr
             ch.y_range = [0, 255]
             item = dict(e=e, other=it["other"], x0=it["x0"], d=it["d"], t=t, ya=ya, yb=yb, names=names,
-                        title=ch.title, ct=c["ct"], curve=c["curve"], mname=mname)
+                        title=ch.title, ct=c["ct"], curve=c["full"], mname=mname)
             slot["item"] = mslot["item"] = item
             item["mtitle"], item["mrange"] = self._fill_metric_chart(
-                mslot, f"{names}   {mname} per point", c["ct"], c["curve"], xr, ranges[k])
+                mslot, f"{names}   {mname} per point", c["ct"], c["curve"], c["full"], xr, ranges[k],
+                (t, in_mask))
         self._draw_hover()
 
-    def _fill_metric_chart(self, mslot: dict, title: str, t, curve, xr, rng):
-        """Draw the per-point metric curve of one intersection on the fixed y range `rng` (the curve's
-        min / max over the history, padded; empty chart when there is no curve, e.g. NMI).
-        Returns the chart title and its y range."""
+    def _fill_metric_chart(self, mslot: dict, title: str, t, curve, full, xr, rng, mask):
+        """Draw the per-point metric curves of one intersection as its intensity profiles: thin over the whole
+        intersection (`full`), thick on the loss points (`curve`), and the mask range (`mask`: (t, in_mask)) as a bar
+        along the bottom; on the fixed y range `rng` (the full curve's min / max over the history, padded; empty
+        chart when there is no curve, e.g. NMI). Returns the chart title and its y range."""
         ch, p = mslot["chart"], mslot["plots"]
         nan2 = np.array([np.nan, np.nan])
-        if curve is None or t is None or not np.isfinite(curve).any():
-            p["curve"].update(np.array([0.0, 1.0]), nan2)
-            p["zero"].update(np.array([0.0, 1.0]), nan2)
+        if full is None or t is None or not np.isfinite(full).any():
+            for key in ("full", "curve", "zero", "mask"):
+                p[key].update(np.array([0.0, 1.0]), nan2)
             if xr is not None:
                 title = title.replace(" per point", ": no per-point values")
                 ch.x_range = xr
@@ -2076,7 +2186,7 @@ class SliceViewer:
             ch.y_axis.tick_labels = ("", "")
             ch.title = title
             return title, (0.0, 1.0)
-        dmin, dmax = rng if rng is not None else (float(np.nanmin(curve)), float(np.nanmax(curve)))
+        dmin, dmax = rng if rng is not None else (float(np.nanmin(full)), float(np.nanmax(full)))
         span = dmax - dmin
         pad = max(0.05 * span, 0.05)
         lo, hi = dmin - pad, dmax + pad
@@ -2086,8 +2196,14 @@ class SliceViewer:
         else:
             ticks = (dmin, (dmin + dmax) / 2, dmax)
         ticks = tuple(dict.fromkeys(round(v, dec) for v in ticks))
-        p["curve"].update(t, curve)
+        p["full"].update(t, full)
+        p["curve"].update(t, curve if curve is not None else np.full(len(t), np.nan))
         p["zero"].update(np.array(xr, dtype=float), np.zeros(2) if lo < 0 < hi else nan2)
+        mt, in_mask = mask if mask is not None else (None, None)
+        if mt is not None and in_mask is not None and in_mask.any():   # same height share as in the profile charts
+            p["mask"].update(mt, np.where(in_mask, lo + PROFILE_MASK_Y / 255.0 * (hi - lo), np.nan))
+        else:
+            p["mask"].update(np.array([0.0, 1.0]), nan2)
         ch.x_range = xr
         ch.y_range = [lo, hi]
         ch.y_axis.tick_locations = ticks
@@ -2795,9 +2911,10 @@ def _first_instance(subject_dir: Path) -> int | None:
     return None
 
 
-def load_subject_run(run_dir: Path, subject: str, instance: int | None = None) -> dict:
+def load_subject_run(run_dir: Path, subject: str, instance: int | None = None, cache: dict | None = None) -> dict:
     """Everything the viewer needs for one subject of a run. The images are read from <run>/<subject>/ (current
-    layout) or, for older runs, from <run>/<subject>/Instance_<n>/."""
+    layout) or, for older runs, from <run>/<subject>/Instance_<n>/. `cache` (a dict kept by the caller) holds the
+    last subject's images: the same subject from another run then reads only the NIfTI headers (reuse_images)."""
     subject_dir = run_dir / subject
     if instance is None:
         instance = _first_instance(subject_dir)
@@ -2805,8 +2922,18 @@ def load_subject_run(run_dir: Path, subject: str, instance: int | None = None) -
     metrics_dir = subject_dir / METRICS_SUBDIR
 
     print(f"Subject {subject}" + (f", instance {instance}" if instance is not None else ""))
-    data = load_images(image_dir)
-    describe_images(image_dir, data)
+    reused = None
+    if cache is not None and cache.get("subject") == (subject, instance):
+        reused = reuse_images(cache["data"], cache["sig"], image_dir)
+    if reused is not None:
+        data = reused[0]
+        print(f"[images] {image_dir}: pixels reused from the previous run (headers read)")
+    else:
+        data = load_images(image_dir)
+        describe_images(image_dir, data)
+        if cache is not None:                            # only the latest subject is kept
+            cache.clear()
+            cache.update(subject=(subject, instance), data=data, sig=image_signature(image_dir))
     status, model = load_alignment_status(metrics_dir)
     not_optimized = status == "not_optimized" or model == "none"
     if (metrics_dir / HISTORY_CSV).exists():
@@ -2914,8 +3041,10 @@ def main(argv=None):
     print(f"{len(runs)} run(s) in {run_dir.parent}; showing run {run_index + 1} "
           f"({run_dir.name}): {len(subjects)} subject(s)")
 
+    image_cache = {}                                     # the last subject's images, reused across runs
+
     def loader(run: Path, subject: str) -> dict:
-        return load_subject_run(run, subject, args.instance)
+        return load_subject_run(run, subject, args.instance, image_cache)
 
     start = None
     if args.start == "end":
