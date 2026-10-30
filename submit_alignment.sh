@@ -10,6 +10,10 @@
 # Submit from the repository root:  sbatch submit_alignment.sh [extra moco_nifti.py arguments]
 # e.g.  sbatch submit_alignment.sh --logging true
 # The run name is fixed and --skip-processed is set, so resubmitting resumes an interrupted run.
+# Chunks (index range in the subject folders sorted by name; end exclusive), e.g. one job per 10000 subjects:
+#   sbatch submit_alignment.sh --start-index 0 --end-index 10000
+#   sbatch submit_alignment.sh --start-index 10000 --end-index 20000   ...
+#   sbatch submit_alignment.sh --start-index 50000                      (to the end)
 
 echo "Running slice alignment (moco_nifti.py) on GPU..."
 echo "Additional arguments passed: $@"
