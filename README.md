@@ -53,9 +53,14 @@ classified by name:
         ...
 ```
 
-Missing images or segmentations are allowed. The nnU-Net segmentations are expected to be the ones produced by the
+An aortic slice (`ao.nii.gz`, one axial slice through the ascending aorta, no segmentation) is treated as a LAX view when
+present: its lines with the SAX slices are SAX-LAX lines, those with the other LAX views LAX-LAX lines, and it counts in
+the LAX statistics. As it has no segmentation, its LAX-LAX lines are masked by the other view's dilated heart mask and
+its SAX-LAX lines by the SAX-SAX cylinder (within `--sax-sax-radius-mm` of the LV long axis). Only the LV long axis leaves it out; `--use-ao false` leaves it out of the alignment (it is still written, unaligned). The 3D viewer
+shows it as "Ao". Missing images or segmentations are allowed. The nnU-Net segmentations are expected to be the ones produced by the
 [Ugurlu et al. pipeline](https://github.com/CEMRG-publications/Ugurlu_2025_PLoS_One) [1]. They define the dilated
-heart masks and the Dice / Hausdorff metrics. NIfTI headers only store the slice spacing, so the thickness is set with
+heart masks and the Dice / Hausdorff metrics. For the SAX stack, the UKBB `nnUNet_segs/seg_sa.nii.gz` is used instead
+when present (same grid and labels), else `SAX_nnUNetSeg.nii.gz`. NIfTI headers only store the slice spacing, so the thickness is set with
 `--sax-thickness` (8 mm) / `--lax-thickness` (6 mm).
 
 Output, per subject: `SAX_slice<nn>.nii.gz`, `LAX_2Ch.nii.gz`, ... with the corrected affines, and the segmentations

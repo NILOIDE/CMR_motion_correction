@@ -6,7 +6,6 @@ C. For slices 8-10 (others at the final poses): the NCC score and the LV segment
    along the lines) on the coarse-to-fine grid of the search; NCC-best vs Dice-best poses.
 """
 import json
-import math
 import sys
 from argparse import Namespace
 from pathlib import Path
@@ -16,7 +15,7 @@ import pandas as pd
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-import motion_bruteforce as bf  # noqa: E402
+from alternate_motion_algs import motion_bruteforce as bf
 import motion_gradient as mg  # noqa: E402
 
 RUN = Path(r"C:\Users\Nil\Documents\data\ukbb_alignment_bf\20261026-033840_bf")

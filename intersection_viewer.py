@@ -33,7 +33,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-import motion_bruteforce as bf
+from alternate_motion_algs import motion_bruteforce as bf
 import moco_nifti as mn
 import motion_gradient as mg
 
