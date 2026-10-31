@@ -6,7 +6,8 @@ Input (--root): one folder per subject, any structure below it (see discover_sub
 Files are classified by name: short-axis images (SAX / SA / short axis in the name) as a stack (X, Y, Z, T) and/or
 single-slice files (X, Y, 1, T), all forming the image 'SAX'; every other NIfTI is a long-axis image (2Ch / 3Ch / 4Ch
 -> LAX_2Ch / LAX_3Ch / LAX_4Ch, other names kept), a single slice or a stack; segmentations ('seg' / 'label' in the
-file or a folder name) are matched to their image by name, SAX slices by position. Segmentations are optional: a LAX
+file or a folder name) are matched to their image by name, SAX slices by position; for the SAX slices the UKBB
+seg_sa.nii.gz is used where present, else the nnU-Net SAX_nnUNetSeg (same labels). Segmentations are optional: a LAX
 image's segmentation defines its dilated heart mask; without one its lines run over the whole image overlap.
 NIfTI headers store the slice spacing, not the thickness: --sax-thickness / --lax-thickness. Complex NIfTIs are
 reduced to their magnitude.
@@ -15,7 +16,8 @@ Each slice is handed to motion_gradient.py as a 2D+time cine (motion_gradient.Sl
 
 Output (<out-root>/<run-name>/<subject>/), every slice's full cine with its corrected affine:
   SAX_slice<nn>.nii.gz, <image>.nii.gz (single-slice LAX views) or <image>_slice<nn>.nii.gz (LAX stacks),
-  nnUNet_segs/<stem>_nnUNetSeg.nii.gz (segmentations), plus the metrics of motion_gradient.py (--logging).
+  nnUNet_segs/<stem>_nnUNetSeg.nii.gz (segmentations -- for the SAX slices the one used, seg_sa or nnU-Net), plus the
+  metrics of motion_gradient.py (--logging).
 
 Usage: python moco_nifti.py [--root DIR] [--out-root DIR] [--run-name NAME] [--sax-thickness MM] [--lax-thickness MM]
                             [--image-dtype uint16|uint8] [motion correction options, see --help]
@@ -36,6 +38,9 @@ SEG_SUFFIX = re.compile(r"[_\-. ]*(nnunet)?[_\-. ]*(seg(mentation)?s?|labels?)$"
 SAX_NAME = re.compile(r"(^|[^a-z])(sax|sa|short[_\- ]?axis)([^a-z]|$)", re.I)
 LAX_CH_NAME = re.compile(r"([234])[_\- ]?ch(?![a-z])", re.I)
 SAME_SLICE_MM = 0.5                         # SAX slices whose origins are closer than this are the same slice
+# preferred SAX segmentation: the UKBB seg_sa.nii.gz (same grid and labels as the nnU-Net SAX_nnUNetSeg: 1 LV blood
+# pool, 2 LV myocardium, 3 RV blood pool) when present, else the nnU-Net one, slice by slice
+PREFERRED_SAX_SEG = re.compile(r"^seg_sa$", re.I)
 
 
 def load_nifti(path: Path, dtype=np.float32) -> tuple[np.ndarray, np.ndarray, nib.Nifti1Header]:
@@ -147,7 +152,11 @@ def load_subject(subj_dir: Path, args) -> mg.Subject:
         return cache[(path, dtype)]
 
     per_image = {}
-    seg_slices = sax_slice_list(found["sax_seg"])
+    # SAX segmentation slices, the preferred file (seg_sa.nii.gz) first: each SAX slice takes its segmentation from it
+    # where it covers that slice, else from the other segmentation files (the nnU-Net SAX_nnUNetSeg)
+    preferred = [p for p in found["sax_seg"] if PREFERRED_SAX_SEG.match(nii_stem(p))]
+    seg_slices = (sax_slice_list(preferred)
+                  + sax_slice_list([p for p in found["sax_seg"] if p not in preferred]))
     sax = sax_slice_list(found["sax"])
     for s in sax:
         arr, _, header = load(s["path"])

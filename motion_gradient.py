@@ -14,6 +14,12 @@ over the whole overlap with the other image, or with --center-mask-radius-mm ove
 Output: per slice its corrected affine (corrected_affines), written back by the loader; metrics and figures below.
 run() is the shared run loop (subject scanning, background loading/writing, CSVs, figures).
 
+Aortic slices (UKBB ao.nii.gz, is_aorta) are LAX views in every respect when present (--use-ao): their lines with the
+SAX slices are SAX-LAX lines, those with the other LAX views LAX-LAX lines, and they count in the LAX reference frame
+and statistics. Only the LV long axis (heart_axis) leaves them out. Having no segmentation, their lines are masked by
+the partner: with a LAX view by its dilated heart mask (as any LAX-LAX line), with a SAX slice by the SAX-SAX cylinder
+(points within --sax-sax-radius-mm of the LV long axis; see build_lines).
+
 Intersection pairs (candidate_pairs): every two slices whose acquired normals differ by at least --min-pair-angle-deg,
 thinned between multi-slice stacks to partners about a slice thickness apart (--pair-spacing-mm). Adjacent slices of
 a stack (SAX, or any image of several slices; within --parallel-max-dist-mm) are neighbours for the neighbouring-slice
@@ -87,7 +93,8 @@ Only with --logging (otherwise nothing else is computed or written, which is the
       history_summary.csv     the same snapshots, one row per step with the objective and subject-level metrics
       lines.csv               every intersection line entering the loss (acquired geometry): the two planes, the
                               anchor point x0 and unit direction d (world, mm) and the parameter ranges along the
-                              line that are inside both images (t_img_*) and actually sampled (t_used_*)
+                              line that are inside both images (t_img_*) and actually sampled (t_used_*: inside the
+                              mask -- for SAX-aortic lines the cylinder of --sax-sax-radius-mm around the LV long axis)
       sax_lines.csv           the crossing line of every pair of neighbouring slices of a stack (kind SAX-SAX for the
                               SAX slices, STACK-STACK for any other stack, image_a / image_b its image) at every history snapshot
                               (recorded whatever --sax-sax-weight is): these lines exist only when the poses tilt the
@@ -121,6 +128,7 @@ import argparse
 import contextlib
 import csv
 import math
+import re
 import sys
 import time
 import traceback
@@ -136,6 +144,24 @@ import pandas as pd
 import torch
 import torch.nn.functional as F
 from scipy.ndimage import distance_transform_edt
+
+# Aortic images (UKBB ao.nii.gz: one axial slice through the ascending aorta, no segmentation). They are LAX views
+# (--use-ao): paired with the SAX slices (SAX-LAX) and the other LAX views (LAX-LAX), and part of the LAX reference frame
+# and statistics. Their lines are masked by the partner: a LAX view's dilated heart mask, or for a SAX slice the SAX-SAX
+# cylinder around the LV long axis (--sax-sax-radius-mm; build_lines). They never define the LV long axis (heart_axis):
+# an axial slice crosses the 2Ch view at a larger angle than the 4Ch view does, so it would win long_axis_line.
+AORTA_NAME = re.compile(r"^ao($|[_\-. ])|aort", re.I)
+
+
+def is_aorta(image: str) -> bool:
+    """Whether an image name denotes an aortic slice (e.g. 'ao', 'ao_1', 'aorta')."""
+    return bool(AORTA_NAME.search(image))
+
+
+def lax_reference_rows(planes: list, n_pairs: list[int]) -> list[int]:
+    """Rows of the planes whose mean pose is the output frame (relative_translation): the aligned non-SAX planes
+    (aortic slices included)."""
+    return [i for i, p in enumerate(planes) if p.image != "SAX" and n_pairs[i] > 0]
 
 
 SUMMARY_COLUMNS = [
@@ -240,7 +266,10 @@ class Subject:
 
 
 def phase_frames(n_frames_available: int, n_frames: int) -> list[int]:
-    return sorted({int(math.floor(k / n_frames * n_frames_available)) for k in range(n_frames)})
+    """The frames of an n_frames_available-frame cine at n_frames evenly spaced phases of the cardiac cycle: frame k
+    -> floor(k * n_frames_available / n_frames), in integer arithmetic (the float k / n * N lands just below an
+    integer for some k, e.g. k = 29 of 50, which repeated a frame and dropped one)."""
+    return sorted({k * n_frames_available // n_frames for k in range(n_frames)})
 
 
 def stack_center(affines: np.ndarray, shape: tuple) -> np.ndarray:
@@ -289,6 +318,8 @@ def prepare_subject(subject: Subject, args) -> dict:
     for image in out["order"]:
         if image == "SAX":
             continue
+        if is_aorta(image) and not getattr(args, "use_ao", True):
+            continue                                       # --use-ao false: written unaligned by the loader
         sl = sorted((s for s in subject.slices if s.image == image), key=lambda s: s.index)
         if len({s.data.shape[:2] for s in sl}) > 1:
             raise ValueError(f"{subject.subject_id}: the slices of image {image} differ in size")
@@ -444,9 +475,13 @@ def inside(plane: Plane, pts: torch.Tensor) -> torch.Tensor:
     return (vox[:, 0] >= 0) & (vox[:, 0] <= plane.H - 1) & (vox[:, 1] >= 0) & (vox[:, 1] <= plane.W - 1)
 
 
-def intersection_line(a: Plane, b: Plane, args, device) -> Line | None:
+def intersection_line(a: Plane, b: Plane, args, device,
+                      cylinder: tuple[np.ndarray, np.ndarray, float] | None = None) -> Line | None:
     """Valid parameter range and mask weights of the a/b intersection line at the acquired geometry.
 
+    The mask is the union of the planes' masks (a LAX view's dilated heart mask); when neither plane has one, the
+    optional cylinder (point, unit direction, radius mm) is the mask instead: the points within radius of that axis
+    (build_lines passes the SAX-SAX cylinder around the LV long axis for the SAX-aortic pairs).
     Whether a line is kept (--min-line-mm) and its n_points only count the points inside the mask. With
     --outside-mask-weight > 0 the line is extended over its whole part inside both images, and the points outside
     the mask get that weight in the loss (w_loss); w stays the binary in-mask indicator used by the metrics.
@@ -471,6 +506,11 @@ def intersection_line(a: Plane, b: Plane, args, device) -> Line | None:
         for p in masked_planes:
             in_mask |= sample_image(p.mask, voxel_grid(p, pts), "nearest")[0] > 0.5
         valid &= in_mask
+    elif cylinder is not None:
+        c0, ell, radius = cylinder
+        rel = x0[None] + t[:, None] * d[None] - np.asarray(c0)[None]
+        perp = rel - (rel @ ell)[:, None] * np.asarray(ell)[None]
+        valid &= torch.from_numpy((perp * perp).sum(1) <= radius ** 2).to(device)
 
     n_points = int(valid.sum().item())
     if n_points < args.min_line_mm / args.line_step_mm:
@@ -1057,7 +1097,9 @@ def heart_axis(sax_planes: list[Plane], lax_planes: list[Plane]) -> tuple[np.nda
     With two non-parallel single-slice long-axis views (the UKBB 2Ch / 3Ch / 4Ch views; images of one slice that are
     not SAX): their crossing line (long_axis_line). Otherwise, as no long axis can be derived, the line through the
     centre of the first stack along its normal: the SAX image if there is one (its normal approximates the long axis),
-    else the image found first (the loader's order). None without planes."""
+    else the image found first (the loader's order). None without planes. Aortic slices (is_aorta) are left out: they do
+    not contain the LV long axis."""
+    lax_planes = [p for p in lax_planes if not is_aorta(p.image)]
     count = {}
     for p in lax_planes:
         count[p.image] = count.get(p.image, 0) + 1
@@ -1088,7 +1130,8 @@ def candidate_pairs(planes: list[Plane], args) -> list[tuple[Plane, Plane]]:
     round(pair spacing / slice spacing), slices of rank i and j along their stacks pair when (i + j) % k == 0: every
     slice keeps partners k slices apart in the other stack, at a different phase than its neighbours, so every slice
     still has lines. Single slices (e.g. the UKBB LAX views) are never thinned. Whether a candidate's line lies inside
-    both images (and the masks) is decided by intersection_line."""
+    both images (and the masks) is decided by intersection_line. Aortic slices (is_aorta) pair like any LAX view (their
+    masking: see build_lines)."""
     cos_max = math.cos(math.radians(getattr(args, "min_pair_angle_deg", 20.0)))
     spacing_opt = getattr(args, "pair_spacing_mm", -1.0)
     by_image = {}
@@ -1117,12 +1160,23 @@ def candidate_pairs(planes: list[Plane], args) -> list[tuple[Plane, Plane]]:
 
 def build_lines(planes: list[Plane], args, device) -> list[tuple[int, int, Line]]:
     """(index a, index b, Line) of every candidate pair (candidate_pairs) whose line lies inside both images and the
-    masks over at least --min-line-mm (intersection_line), at the planes' current masks."""
+    masks over at least --min-line-mm (intersection_line), at the planes' current masks.
+
+    An aortic slice (is_aorta) has no segmentation: its lines with a LAX view are masked by that view's dilated heart
+    mask (like every LAX-LAX line); its lines with a SAX slice, where neither plane has a mask, by the cylinder of the
+    SAX-SAX terms instead: the points within --sax-sax-radius-mm of the LV long axis (heart_axis, acquired geometry),
+    i.e. a disk on the SAX slice around the heart rather than the whole image overlap."""
     index = {p.key: i for i, p in enumerate(planes)}
+    cylinder = None
+    if any(is_aorta(p.image) for p in planes):
+        axis = heart_axis([p for p in planes if p.image == "SAX"], [p for p in planes if p.image != "SAX"])
+        if axis is not None:
+            cylinder = (axis[0], axis[1] / np.linalg.norm(axis[1]), float(getattr(args, "sax_sax_radius_mm", 120.0)))
     lines = []
     with torch.no_grad():
         for a, b in candidate_pairs(planes, args):
-            line = intersection_line(a, b, args, device)
+            sax_ao = (a.image == "SAX") != (b.image == "SAX") and (is_aorta(a.image) or is_aorta(b.image))
+            line = intersection_line(a, b, args, device, cylinder if sax_ao else None)
             if line is not None:
                 lines.append((index[a.key], index[b.key], line))
     return lines
@@ -1979,7 +2033,7 @@ def process_subject(subject: Subject, args, device, on_lines=None) -> tuple:
             result = align(sampler, args, annealed_stages(data, planes, sax_planes, lax_planes, sampler, args, device),
                            pose_model=model)
             theta = result["theta_deg"].cpu().numpy().astype(np.float64)
-            t_rel = relative_translation(result["t"], [i for i, p in enumerate(planes) if p.image != "SAX" and n_pairs[i] > 0])
+            t_rel = relative_translation(result["t"], lax_reference_rows(planes, n_pairs))
         Rs = rotation_matrices(theta)
         details = [dict(subject_id=sid, image=p.image, slice=p.slice_idx, n_pairs=n_pairs[i]) for i, p in enumerate(planes)]
         return None, details, [], [(p, Rs[i], t_rel[i]) for i, p in enumerate(planes)], None
@@ -2040,7 +2094,7 @@ def process_subject(subject: Subject, args, device, on_lines=None) -> tuple:
                           sax_rel_tilt_max_deg=float(tilt.max()) if tilt.size else nan,
                           sax_cross_dissim_max=float(dissim.max()) if dissim.size else nan)
         theta = result["theta_deg"].cpu().numpy().astype(np.float64)
-        lax_rows = [i for i, p in enumerate(planes) if p.image != "SAX" and n_pairs[i] > 0]
+        lax_rows = lax_reference_rows(planes, n_pairs)
         t_rel = relative_translation(result["t"], lax_rows)
         if result["snapshots"]:
             snaps = result["snapshots"] + [("best", result["theta_deg"], result["t"])]
@@ -2955,6 +3009,15 @@ def build_parser(description: str) -> argparse.ArgumentParser:
     ap.add_argument("--eval-every", type=int, default=10, help="With --pair-keep < 1: evaluate the full objective every N steps to track the best pose")
     ap.add_argument("--seed", type=int, default=0, help="Seed for the line dropping")
 
+    # ###################    IMAGES    ##################################################
+    ap.add_argument("--use-ao", type=str2bool, default=True, metavar="BOOL",
+                    help="Use aortic slices when present (UKBB ao.nii.gz: one axial slice through the ascending aorta, "
+                         "no segmentation) as LAX views: SAX-LAX lines with the SAX slices, LAX-LAX lines with the "
+                         "other LAX views, part of the LAX reference frame and statistics; never used for the LV long "
+                         "axis. Its LAX-LAX lines are masked by the other view's dilated heart mask, its SAX-LAX lines "
+                         "by the SAX-SAX cylinder (within --sax-sax-radius-mm of the LV long axis). false: left out of the alignment (written with its acquired geometry). Subjects "
+                         "without one are unaffected. Default: %(default)s")
+
     # ###################    POSE MODEL PARAMS    ########################################
     ap.add_argument("--dof", type=int, choices=[3, 4, 6], default=6,
                     help="Degrees of freedom per slice. 3: translation only. 4: translation + rotation about the slice's "
@@ -3152,7 +3215,9 @@ def build_parser(description: str) -> argparse.ArgumentParser:
                     help="--sax-sax-falloff "
                          "gaussian: its sigma (mm); "
                          "threshold: the radius (mm) around the axis. Also "
-                         "the extent of the 'used' part of the lines in sax_lines.csv. Default: %(default)s")
+                         "the extent of the 'used' part of the lines in sax_lines.csv, and the radius of the cylinder "
+                         "around the LV long axis that masks the lines of an aortic slice with the SAX slices (always "
+                         "a hard cut, like a heart mask). Default: %(default)s")
 
     # ###################    SEGMENTATION METRICS (REPORTING ONLY, WITH --logging)    ####
     g = ap.add_argument_group("segmentation metrics (reporting only, with --logging; images with segmentations)")
