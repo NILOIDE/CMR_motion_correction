@@ -1449,14 +1449,56 @@ class SaxNeighbourLines:
         NaN where there is none (the slices do not cross, or not inside the images). Also the QC values: point weight
         sum, NCC and dissimilarity (1 - NCC) along the line, the smallest gap between the slices on the barrier disk
         and their relative tilt; crossing_in_heart = 1 where that gap is negative (the slices cross inside the disk)."""
+        return self._rows(self._packed(theta_deg, t), shift)
+
+    @torch.no_grad()
+    def segment_rows_many(self, poses: list[tuple[torch.Tensor, torch.Tensor]], shifts: list[np.ndarray]) -> list[list[dict]]:
+        """segment_rows of several poses (theta_deg, t) at once: the S poses of the N planes are evaluated as one set
+        of S x N planes (see _stacked), in one pass over the GPU and one transfer (~20x faster than one call per
+        pose). Equal to segment_rows up to float32 rounding (the batched kernels round differently): relative ~1e-5,
+        more in absolute terms where nearly parallel neighbours cross far away (an ill-conditioned crossing point)."""
+        if not poses:
+            return []
+        S, P = len(poses), self.P
+        packed = self._stacked(S)._packed(torch.cat([th for th, _ in poses]), torch.cat([tt for _, tt in poses]))
+        return [self._rows(packed[k * P:(k + 1) * P], shifts[k]) for k in range(S)]
+
+    def _stacked(self, S: int) -> "SaxNeighbourLines":
+        """A view of these pairs repeated S times over S copies of the planes (pair k of copy s joins planes
+        IA[k] + s N and IB[k] + s N): evaluates S poses at once. Shares the images (and their blur)."""
+        cache = self.__dict__.setdefault("_stacked_cache", {})
+        if S not in cache:
+            import copy
+            from types import SimpleNamespace
+            smp, iv = self.sampler, self.sampler.img
+            N = smp.C.shape[0]
+            off = (torch.arange(S, device=self.device) * N)[:, None]
+            rp = lambda x: x.repeat(S, *([1] * (x.dim() - 1)))  # noqa: E731
+            st = copy.copy(self)
+            st.__dict__.pop("_stacked_cache", None)
+            st.IA, st.IB = (self.IA[None] + off).reshape(-1), (self.IB[None] + off).reshape(-1)
+            st.L0p, st.ellp, st.stack_sign, st.margins = rp(self.L0p), rp(self.ellp), rp(self.stack_sign), rp(self.margins)
+            st.size = [rp(x) for x in self.size]
+            st.U, st.V = rp(self.U), rp(self.V)
+            st.pairs, st.images, st.P = self.pairs * S, self.images * S, self.P * S
+            st.sampler = SimpleNamespace(C=rp(smp.C), O=rp(smp.O), Nrm=rp(smp.Nrm), inv_rot=rp(smp.inv_rot),
+                                         inv_trans=rp(smp.inv_trans),
+                                         img=SimpleNamespace(depth=rp(iv.depth), Wmax=iv.Wmax, Hmax=iv.Hmax, sample=iv.sample))
+            cache[S] = st
+        return cache[S]
+
+    def _packed(self, theta_deg: torch.Tensor, t: torch.Tensor) -> np.ndarray:
+        """segment_rows' values of every pair, packed into one host array (P, 12 + 2 L): one transfer, one GPU sync."""
         g = self.geometry(theta_deg, t)
         c, n, _ = self.scores(theta_deg, t, g)
         gp = self.gaps(theta_deg, t)
-        # everything to the host in one transfer (one GPU sync instead of one per tensor)
+        return torch.cat([gp["gap"].flatten(1).min(1).values[:, None], gp["rel_tilt"][:, None], g["x0"], g["d"],
+                          g["active"].float()[:, None], g["axis_dist"][:, None], c[:, None], n[:, None],
+                          g["in_img"].float(), g["in_radius"].float()], 1).cpu().numpy()
+
+    def _rows(self, packed: np.ndarray, shift: np.ndarray) -> list[dict]:
+        """segment_rows from _packed values."""
         L = self.T.numel()
-        packed = torch.cat([gp["gap"].flatten(1).min(1).values[:, None], gp["rel_tilt"][:, None], g["x0"], g["d"],
-                            g["active"].float()[:, None], g["axis_dist"][:, None], c[:, None], n[:, None],
-                            g["in_img"].float(), g["in_radius"].float()], 1).cpu().numpy()
         gap_min, tilt, x0, d = packed[:, 0], packed[:, 1], packed[:, 2:5].astype(np.float64) - shift, packed[:, 5:8]
         active, dist, c, n = packed[:, 8] > 0.5, packed[:, 9], packed[:, 10], packed[:, 11]
         in_img, used = packed[:, 12:12 + L] > 0.5, packed[:, 12 + L:12 + 2 * L] > 0.5
@@ -1600,6 +1642,7 @@ OPTIMIZERS = ("adam", "nadam", "radam", "adamax", "rmsprop", "adagrad", "sgd")
 # methods take steps of about lr per iteration whatever the gradient scale; Adagrad's steps shrink like 1/sqrt(step),
 # so it needs a larger lr; plain SGD steps are lr * gradient, and the NCC objective's gradients are small (see --lr).
 LR_END_FRACTION = 0.5                    # default end learning rate of the linear schedule, as a fraction of the start
+DRAW_AHEAD = 64                          # batched line dropping: steps whose kept lines are drawn at once
 DEFAULT_LR = {"adam": (0.2, 0.04), "nadam": (0.2, 0.04), "radam": (0.2, 0.04), "adamax": (0.2, 0.04),
               "rmsprop": (0.2, 0.04), "adagrad": (1.0, 0.2), "sgd": (80.0, 20.0)}
 
@@ -1882,6 +1925,7 @@ def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]
     gens = [torch.Generator(device=device)]                 # one for the run (or batch), as before
     gens[0].manual_seed(getattr(args, "seed", 0))
     draw_maps = {}                                           # per sampler: (subject of every line, kept positions)
+    draw_cache = {}                                          # per sampler: [draws of the next steps, next one]
     eval_every = max(1, getattr(args, "eval_every", 10))
     blocks = {}                                              # per sampler: (offset, lines, kept) of every subject
 
@@ -1911,11 +1955,15 @@ def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]
         # keeps each subject's lines in its own block (the lines are ordered by subject), shuffled within it; the
         # first kept-count of each block are taken (a randperm per subject and step cost ~0.4 s per subject). The
         # 0.5 keeps rounding from carrying a key into the next block; float64 keys make ties rare and the stable sort
-        # orders the remaining ones the same way every run (an unstable one made batched runs irreproducible)
-        lg_f, keep_pos = draw_maps[id(smp)]
-        key = lg_f + 0.5 * torch.rand(smp.M, generator=gens[0], device=device, dtype=torch.float64)
-        order = torch.argsort(key, stable=True)
-        return order[keep_pos]
+        # orders the remaining ones the same way every run (an unstable one made batched runs irreproducible). The
+        # draws of DRAW_AHEAD steps are made at once (one sort per DRAW_AHEAD steps instead of one per step).
+        cache = draw_cache.get(id(smp))
+        if cache is None or cache[1] == len(cache[0]):
+            lg_f, keep_pos = draw_maps[id(smp)]
+            key = lg_f + 0.5 * torch.rand(DRAW_AHEAD, smp.M, generator=gens[0], device=device, dtype=torch.float64)
+            cache = draw_cache[id(smp)] = [torch.argsort(key, dim=1, stable=True)[:, keep_pos], 0]
+        cache[1] += 1
+        return cache[0][cache[1] - 1]
 
     # learning rates as device tensors (updated in place each step; captured graphs read them)
     lr_t = torch.tensor(float(args.lr), **f32)
@@ -2183,12 +2231,16 @@ def build_history(sid, data, planes, n_pairs, sampler, snapshots, best_step, lax
     snapshots at once), else sampler.evaluate."""
     nan = float("nan")
     plane_rows, step_rows, sax_line_rows, axis_rows = [], [], [], []
-    for step, th, tt in snapshots:
+    if sampler.sax_pairs is not None:                 # every snapshot's neighbouring-slice rows at once
+        shifts = [tt.detach().cpu().numpy().astype(np.float64)[lax_rows].mean(0) if lax_rows else np.zeros(3)
+                  for _, _, tt in snapshots]
+        seg_rows = sampler.sax_pairs.segment_rows_many([(th, tt) for _, th, tt in snapshots], shifts)
+    for k_snap, (step, th, tt) in enumerate(snapshots):
         is_best = step == "best"
         step_no = best_step if is_best else step
         if sampler.sax_pairs is not None:
-            shift = tt.detach().cpu().numpy().astype(np.float64)[lax_rows].mean(0) if lax_rows else np.zeros(3)
-            for r in sampler.sax_pairs.segment_rows(th, tt, shift):
+            shift = shifts[k_snap]
+            for r in seg_rows[k_snap]:
                 sax_line_rows.append(dict(subject_id=sid, step=step_no, fraction=step_no / args.steps, is_best=int(is_best),
                                           **r))
             sp = sampler.sax_pairs
@@ -2294,15 +2346,18 @@ def lines_to(lines: list, device) -> list:
             for ia, ib, line in lines]
 
 
-def prepare_lines(data: dict, args) -> dict:
+def prepare_lines(data: dict, args, on_lines=None) -> dict:
     """The intersection lines of a prepared subject (prepare_subject), built on the CPU: the nominal ones (build_lines)
     and those of every mask-annealing stage (annealed_stage_lines). They depend only on the acquired geometry and the
     masks, and come out identical to those built on the GPU (checked on 30 subjects) -- but ~3x faster, as they are
-    many tiny tensor operations; run() builds them in its worker processes (load_job), next to prepare_subject."""
+    many tiny tensor operations; run() builds them in its worker processes (load_job), next to prepare_subject.
+    `on_lines(planes, lines)`: called with the nominal lines (as by prepare_alignment), e.g. to write them."""
     cpu = torch.device("cpu")
-    sax_planes, lax_planes = build_planes(data, args, cpu, with_seg=False)
+    sax_planes, lax_planes = build_planes(data, args, cpu, with_seg=on_lines is not None)  # (the overlay shows the segs)
     planes = sax_planes + lax_planes
     lines = build_lines(planes, args, cpu)
+    if on_lines is not None and lines:
+        on_lines(planes, lines)
     return dict(lines=lines, stage_lines=annealed_stage_lines(data, planes, lax_planes, args, cpu) if lines else None)
 
 
@@ -3334,7 +3389,15 @@ def load_job(load, is_complete, subj_dir: Path, out_dir: Path, args):
         return SKIPPED_JOB
     subject = load(subj_dir, args)
     data = prepare_subject(subject, args) if subject.slices and subject.status == "ok" else None
-    pre = prepare_lines(data, args) if data is not None and (data["sax"] or data["lax"]) else None
+    on_lines = None
+    if getattr(args, "logging", True):              # the nominal lines (lines.csv) and their mask overlay, written here
+        def on_lines(planes, lines):
+            metrics_dir = out_dir / "metrics"
+            metrics_dir.mkdir(parents=True, exist_ok=True)
+            save_line_geometry(planes, lines, metrics_dir, args.line_extent_mm, args.line_step_mm)
+            save_mask_plot(mask_plot_data(planes, lines, args.line_extent_mm, args.line_step_mm), subj_dir.name,
+                           args.mask_dilation_mm, metrics_dir / "mask_overlay.png", args.line_extent_mm)
+    pre = prepare_lines(data, args, on_lines) if data is not None and (data["sax"] or data["lax"]) else None
     light = Subject(subject.subject_id, [dataclasses.replace(s, data=None, seg=None) for s in subject.slices],
                     subject.status)
     return light, data, pre
@@ -3969,7 +4032,8 @@ def run(ap: argparse.ArgumentParser, args, load, save, is_complete) -> tuple[Pat
                 todo = [e for e in entries if e["status"] == "ok"]
                 if todo:                                  # aligned together (--batch-size; alone when 1)
                     outs = process_subjects([e["subject"] for e in todo], args, device,
-                                            [lines_callback(e["subj"].name, e["metrics_dir"]) if args.logging else None
+                                            [lines_callback(e["subj"].name, e["metrics_dir"])
+                                             if args.logging and e["pre"] is None else None    # (else written by load_job)
                                              for e in todo], [e["data"] for e in todo], [e["pre"] for e in todo])
                     for e, o in zip(todo, outs):
                         e["out"] = o
