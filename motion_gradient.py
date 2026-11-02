@@ -3793,7 +3793,7 @@ def build_parser(description: str) -> argparse.ArgumentParser:
                          "themselves, i.e. its raw intensities, with no band across the other slice's profile. Overrides "
                          "--n-band (set to 1) and --psf-scale-start (set to 1, no PSF annealing); --psf-model and "
                          "--psf-tbw have no effect. In-plane --blur-sigma annealing still applies if set.")
-    ap.add_argument("--coarse-frac", type=float, default=0.0,
+    ap.add_argument("--coarse-frac", type=float, default=0.5,
                     help="Fraction of the run (from the start) sampled coarsely: only every --coarse-frame-stride-th "
                          "cine frame and every --coarse-point-stride-th line point, which makes those steps several "
                          "times cheaper. The early steps make the large moves, on blurred images and dilated masks; the "
@@ -3943,7 +3943,7 @@ def build_parser(description: str) -> argparse.ArgumentParser:
                    help="Worker processes for the CPU work around the alignment: loading and preparing subjects "
                         "(masks, distance maps), writing the aligned images and the per-subject metrics and figures. "
                         "Up to about the number of CPU cores (each holds a few subjects in memory). Default: %(default)s")
-    g.add_argument("--batch-size", type=int, default=1,
+    g.add_argument("--batch-size", type=int, default=0,
                    help="Subjects aligned together in one optimization (align_batch): their planes and lines share the "
                         "samplers, so each step samples all of them at once, while every term stays per subject (the "
                         "result of each is that of a solo run, up to floating-point rounding). Raises GPU utilization "
@@ -3952,7 +3952,8 @@ def build_parser(description: str) -> argparse.ArgumentParser:
                         "subject takes, which bounds the batch size (80%% of the GPU memory free at the start, at most "
                         "64); from there it doubles while that makes the alignment per subject >10%% faster, then "
                         "stays (a GPU gains nothing from batches beyond the size that saturates it). A batch that "
-                        "still runs out of memory is split in halves, and later batches shrink. Default: %(default)s")
+                        "still runs out of memory is split in halves, and later batches shrink. On the CPU, or with "
+                        "the terms above, 0 means 1. Default: %(default)s")
     g.add_argument("--no-overlap", action="store_true",
                    help="With --logging on a GPU, a batch's metrics and history are computed in a background thread "
                         "while the next batch aligns (the GPU would otherwise idle meanwhile); this computes them "
