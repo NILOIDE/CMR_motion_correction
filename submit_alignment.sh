@@ -43,6 +43,7 @@ srun python -u moco_nifti.py \
     --skip-processed \
     --logging true \
     --workers "$SLURM_CPUS_PER_TASK" \
+    --batch-size 0 \
     --device cuda \
     --sample-dtype float16 \
     "$@"

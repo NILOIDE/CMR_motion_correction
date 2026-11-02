@@ -136,7 +136,7 @@ from collections import deque
 import dataclasses
 import multiprocessing
 import os
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from itertools import combinations
@@ -832,6 +832,20 @@ class ImageVolume:
         out = F.conv2d(out, k[:, 1][:, None, None, :], groups=G * Fn)          # along image axis 1 (W)
         return out.reshape(G, Fn, H, W)
 
+    def frame_subset(self, stride: int) -> "ImageVolume":
+        """Every `stride`-th frame of the images (frames 0, stride, 2 stride, ...), as a volume of its own with its own
+        blur (for the coarse early steps, --coarse-frame-stride); images only (no segmentations). Made once per stride
+        and shared by the samplers of this volume."""
+        cache = self.__dict__.setdefault("_subsets", {})
+        if stride not in cache:
+            import copy
+            sub = copy.copy(self)
+            sub.__dict__.pop("_subsets", None)
+            sub.raw = self.raw[:, ::stride].contiguous()
+            sub.vol, sub.seg, sub.nf, sub.cur_sigma = sub.raw, None, sub.raw.shape[1], 0.0
+            cache[stride] = sub
+        return cache[stride]
+
     def sample(self, grid: torch.Tensor, kind: str = "img", mode: str = "bilinear") -> torch.Tensor:
         """grid_sample of vol (kind 'img') or seg at grid (1, Do, Ho, Wo, 3) (float32; cast to the volume's precision)
         -> (F, Do, Ho, Wo), in the volume's precision."""
@@ -908,6 +922,7 @@ class LineSampler:
         # the planes' images (shared between the samplers of one subject, e.g. the mask-annealing stages)
         self.img = images if images is not None else ImageVolume(planes, device, self.lp or torch.float32)
         self.eval_chunk = 1024                           # lines per chunk when sampling all lines without gradients
+        self.point_stride = 1                            # the line points are every point_stride-th of --line-step-mm
 
         # which labels each plane's segmentation contains anywhere, per frame: (N, F, max_label + 1)
         max_label = max([int(p.seg.max()) for p in planes if p.seg is not None] + [0])
@@ -931,6 +946,24 @@ class LineSampler:
             ma, mb = (a == lab) & valid_pt, (b == lab) & valid_pt                                # (M, F, L)
             counted = allowed & pres_a[..., lab] & pres_b[..., lab] & (ma.any(-1) | mb.any(-1))  # (M, F)
             yield lab, counted, ma, mb
+
+    def coarse(self, frame_stride: int, point_stride: int) -> "LineSampler":
+        """A cheaper version of this sampler for the early steps (--coarse-frac): the same lines and poses, but only
+        every frame_stride-th cine frame (ImageVolume.frame_subset) and every point_stride-th point of each line. The
+        cost of a step (sampling and its gradient) scales with frames x points; the objective is the same similarity on
+        a subsample, so the early, large moves -- which the blur and the dilated masks make smooth anyway -- are about
+        the same. Shares everything else (geometry, PSF scale) with this sampler."""
+        import copy
+        c = copy.copy(self)
+        if point_stride > 1:
+            c.T, c.W = self.T[:, ::point_stride].contiguous(), self.W[:, ::point_stride].contiguous()
+            c.W_loss = self.W_loss[:, ::point_stride].contiguous()
+            c.Lmax, c.point_stride = c.T.shape[1], self.point_stride * point_stride
+        if frame_stride > 1:
+            c.img = self.img.frame_subset(frame_stride)
+            c.nf = c.img.nf
+            c.label_present = self.label_present[:, ::frame_stride]
+        return c
 
     def set_blur(self, sigma_mm: float) -> None:
         """In-plane Gaussian blur (sigma in mm) of the images that are sampled (see ImageVolume.set_blur)."""
@@ -1057,7 +1090,8 @@ class LineSampler:
             return l1_similarity(a, b, W)
         if args.metric == "ngf":
             return ngf_similarity(a, b, W, args.grad_eps)
-        return lncc_similarity(a, b, W, max(3, int(round(args.lncc_window_mm / args.line_step_mm))), args.lncc_min_std)
+        step = args.line_step_mm * self.point_stride                      # (coarse samplers: sparser points)
+        return lncc_similarity(a, b, W, max(3, int(round(args.lncc_window_mm / step))), args.lncc_min_std)
 
     def dice_lines(self, theta_deg, t, labels: list[int], labels_sax: list[int], prof=None) -> torch.Tensor:
         """Mean Dice over the counted labels (see counted_labels) along each line -> (M,).
@@ -1794,13 +1828,22 @@ def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]
         torch.cuda.empty_cache()
     stages = sorted(stages or [(0, final_sampler)], key=lambda s: s[0])
     anneal_end = stages[-1][0]
+    # coarse early steps (--coarse-frac): the first steps sample every --coarse-frame-stride-th frame and every
+    # --coarse-point-stride-th line point (LineSampler.coarse), a fraction of a full step's cost
+    coarse_steps = int(round(getattr(args, "coarse_frac", 0.0) * args.steps))
+    fs, ps = max(1, getattr(args, "coarse_frame_stride", 1)), max(1, getattr(args, "coarse_point_stride", 1))
+    coarse = ({id(smp): smp.coarse(fs, ps) for _, smp in stages}
+              if coarse_steps > 0 and (fs > 1 or ps > 1) else {})
+    if not coarse:
+        coarse_steps = 0
+    all_samplers = [smp for _, smp in stages] + list(coarse.values())
 
     def sampler_at(step):
         active = stages[0][1]
         for start, smp in stages:
             if step >= start:
                 active = smp
-        return active
+        return coarse.get(id(active), active) if step < coarse_steps else active
 
     f32 = dict(dtype=torch.float32, device=device)
     batched = groups is not None
@@ -1929,7 +1972,7 @@ def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]
     eval_every = max(1, getattr(args, "eval_every", 10))
     blocks = {}                                              # per sampler: (offset, lines, kept) of every subject
 
-    for _, smp in stages:
+    for smp in all_samplers:
         lg = pg[smp.IA]
         line_group[id(smp)] = lg
         counts = torch.bincount(lg, minlength=G).tolist()
@@ -1985,7 +2028,7 @@ def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]
     psf_steps = int(round(getattr(args, "psf_anneal_frac", 0.6) * args.steps)) if psf_s0 > 1.0 else 0
     # from here on a subject's objective is the nominal one (its own mask annealing may end earlier, or not exist)
     ends = list(anneal_ends) if batched and anneal_ends is not None else [anneal_end] * G
-    track_from = [max(e, blur_steps, psf_steps) for e in ends]
+    track_from = [max(e, blur_steps, psf_steps, coarse_steps) for e in ends]
 
     # device-side bookkeeping: best pose so far, per subject (no host sync per step)
     best_obj = torch.full((G,), -float("inf"), **f32)
@@ -2000,8 +2043,8 @@ def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]
             flags[key] = torch.tensor([float(v) for v in key], **f32)
         return flags[key]
 
-    sel_bufs = {id(smp): torch.arange(n_keep(smp), device=device) for _, smp in stages} if stochastic else {}
-    for _, smp in stages:                                # the full-objective evaluations stay within a step's memory
+    sel_bufs = {id(smp): torch.arange(n_keep(smp), device=device) for smp in all_samplers} if stochastic else {}
+    for smp in all_samplers:                             # the full-objective evaluations stay within a step's memory
         smp.eval_chunk = min(smp.eval_chunk, n_keep(smp)) if stochastic else smp.eval_chunk
 
     def update_best(o):
@@ -2101,7 +2144,7 @@ def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]
                 body(smp)
         torch.cuda.current_stream().wait_stream(side)
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
+        with torch.cuda.graph(graph, capture_error_mode="thread_local"):   # (run() may finish a batch meanwhile)
             body(smp)
         with torch.no_grad():
             for p, v in zip(params, saved_p):
@@ -2180,7 +2223,7 @@ def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]
             step_buf.fill_(float(args.steps))
             track_buf.copy_(flag(final))
             update_best(objective(pose_theta(), t))
-    for _, smp in stages:
+    for smp in all_samplers:
         smp.set_blur(0.0)
         smp.set_psf_scale(1.0)
     skipped = [int(x) for x in n_skipped.tolist()]
@@ -2457,14 +2500,10 @@ def align_batch(ctxs: list[dict], args, device) -> list[dict]:
         stages.append((max(ends), final))
     res = align(final, args, stages or None, groups=groups, models=[c["model"] for c in ctxs], anneal_ends=ends)
     # with logging, the reported metrics of every subject (acquired pose, saved pose, every history snapshot) are
-    # evaluated here for the whole batch at once -- they are per line, so the shared sampler gives each subject's
-    # own values -- instead of one evaluation per subject and snapshot in finish_alignment / build_history
-    metrics = None
-    if getattr(args, "logging", True):
-        labels, labels_sax, has_seg = label_settings(args, planes)
-        zeros = torch.zeros(len(planes), 3, device=device)
-        poses = [(zeros, zeros), (res["theta_deg"], res["t"])] + [(th, tt) for _, th, tt in res["snapshots"]]
-        metrics = [final.evaluate(th, tt, args, labels, labels_sax, has_seg) for th, tt in poses]
+    # evaluated for the whole batch at once -- they are per line, so the shared sampler gives each subject's own
+    # values -- instead of one evaluation per subject and snapshot; on first use in finish_alignment (batch_metrics),
+    # so that run() can do it while the next batch aligns
+    shared = dict(final=final, planes=planes, res=res, metrics=None) if getattr(args, "logging", True) else None
     out, m0 = [], 0
     for g, c in enumerate(ctxs):
         lo, hi = offsets[g], offsets[g] + len(c["planes"])
@@ -2474,12 +2513,29 @@ def align_batch(ctxs: list[dict], args, device) -> list[dict]:
                   flush=True)
         r = dict(theta_deg=res["theta_deg"][lo:hi].clone(), t=res["t"][lo:hi].clone(), best_step=res["best_step"][g],
                  snapshots=[(step, th[lo:hi], tt[lo:hi]) for step, th, tt in res["snapshots"]])
-        if metrics is not None:                      # this subject's lines: m0 .. m1 of the shared sampler
-            mine = [{k: v[m0:m1] for k, v in lm.items()} for lm in metrics]
-            r["line_metrics"] = dict(zero=mine[0], final=mine[1], snapshots=mine[2:])
+        if shared is not None:                       # this subject's lines: m0 .. m1 of the shared sampler
+            r["batch_metrics"] = (shared, m0, m1)
         out.append(r)
         m0 = m1
     return out
+
+
+def batch_metrics(result: dict, args) -> dict | None:
+    """The per-line metrics (acquired pose, saved pose, every snapshot) of a subject aligned in a batch (align_batch):
+    its share of the whole batch's evaluation, which is done on the first call for any of its subjects. None for a
+    subject aligned alone."""
+    bm = result.get("batch_metrics")
+    if bm is None:
+        return None
+    shared, m0, m1 = bm
+    if shared["metrics"] is None:
+        final, planes, res = shared["final"], shared["planes"], shared["res"]
+        labels, labels_sax, has_seg = label_settings(args, planes)
+        zeros = torch.zeros(len(planes), 3, device=final.device)
+        poses = [(zeros, zeros), (res["theta_deg"], res["t"])] + [(th, tt) for _, th, tt in res["snapshots"]]
+        shared["metrics"] = [final.evaluate(th, tt, args, labels, labels_sax, has_seg) for th, tt in poses]
+    mine = [{k: v[m0:m1] for k, v in lm.items()} for lm in shared["metrics"]]
+    return dict(zero=mine[0], final=mine[1], snapshots=mine[2:])
 
 
 def finish_alignment(ctx: dict, result: dict | None, args, device) -> tuple:
@@ -2512,7 +2568,7 @@ def finish_alignment(ctx: dict, result: dict | None, args, device) -> tuple:
         n_points = [float(sampler.npts[idx].sum()) for idx in sampler.plane_lines]
         labels, labels_sax, has_seg = label_settings(args, planes)
         zeros = torch.zeros(N, 3, device=device)
-        lmet = result.get("line_metrics")            # evaluated for the whole batch (align_batch), else here
+        lmet = batch_metrics(result, args)           # evaluated for the whole batch (align_batch), else here
         line_zero = lmet["zero"] if lmet else sampler.evaluate(zeros, zeros, args, labels, labels_sax, has_seg)
         line_final = (lmet["final"] if lmet
                       else sampler.evaluate(result["theta_deg"], result["t"], args, labels, labels_sax, has_seg))
@@ -2640,6 +2696,15 @@ def process_subjects(subjects: list[Subject], args, device, on_lines: list | Non
     subject failing to prepare or finish fails alone; if the shared optimization fails (e.g. out of GPU memory), its
     subjects are aligned one at a time instead. Without batchable(args), every subject is aligned alone. `datas`: each
     subject's prepare_subject() and `pres` its prepare_lines() if already computed (run(): in the worker processes)."""
+    ctxs, results = align_subjects(subjects, args, device, on_lines, datas, pres)
+    return finish_subjects(ctxs, results, args, device)
+
+
+def align_subjects(subjects: list[Subject], args, device, on_lines: list | None = None, datas: list | None = None,
+                   pres: list | None = None, stats: dict | None = None) -> tuple[list, dict]:
+    """process_subjects' first half: every subject prepared (its prepare_alignment() context, or the exception it
+    raised) and aligned ({id(context): its align() result, or the exception}). A batch that runs out of GPU memory is
+    split in halves (stats["oom"] counts it); one failing otherwise is aligned one subject at a time."""
     ctxs = []
     for i, s in enumerate(subjects):
         try:
@@ -2649,30 +2714,64 @@ def process_subjects(subjects: list[Subject], args, device, on_lines: list | Non
             ctxs.append(e)
     live = [c for c in ctxs if not isinstance(c, Exception) and c["lines"]]
     results = {}
-    if len(live) > 1 and batchable(args):
+
+    def together(group):
+        if len(group) < 2:
+            return
         try:
-            results = {id(c): r for c, r in zip(live, align_batch(live, args, device))}
+            results.update({id(c): r for c, r in zip(group, align_batch(group, args, device))})
+        except torch.cuda.OutOfMemoryError:
+            if stats is not None:
+                stats["oom"] = stats.get("oom", 0) + 1
+            print(f"\n[batch] {len(group)} subjects ran out of GPU memory together; splitting the batch", flush=True)
+            torch.cuda.empty_cache()
+            together(group[:len(group) // 2])
+            together(group[len(group) // 2:])
         except Exception as e:  # noqa: BLE001
-            print(f"\n[batch] aligning {len(live)} subjects together failed ({type(e).__name__}: {e}); "
+            print(f"\n[batch] aligning {len(group)} subjects together failed ({type(e).__name__}: {e}); "
                   f"aligning them one at a time", flush=True)
             if device.type == "cuda":
                 torch.cuda.empty_cache()
-            results = {}
+
+    if batchable(args):
+        together(live)
+    for c in live:                                   # alone: not batchable, a single one, or its batch failed
+        if id(c) not in results:
+            try:
+                results[id(c)] = align_one(c, args, device)
+            except Exception as e:  # noqa: BLE001
+                results[id(c)] = e
+    return ctxs, results
+
+
+def finish_subjects(ctxs: list, results: dict, args, device) -> list:
+    """process_subjects' second half: per subject (align_subjects) its result tuple (finish_alignment), or the
+    exception it raised."""
     out = []
     for c in ctxs:
         if isinstance(c, Exception):
             out.append(c)
             continue
         try:
-            r = None
-            if c["lines"]:
-                r = results.get(id(c))
-                if r is None:
-                    r = align_one(c, args, device)
+            r = results.get(id(c)) if c["lines"] else None
+            if isinstance(r, Exception):
+                raise r
             out.append(finish_alignment(c, r, args, device))
         except Exception as e:  # noqa: BLE001
             out.append(e)
     return out
+
+
+def finish_on_stream(ctxs: list, results: dict, args, device, stream) -> tuple[list, float]:
+    """finish_subjects on its own CUDA stream (run(): in a background thread, while the next batch aligns on the
+    main stream). The caller makes `stream` wait for the main stream first; the stream is synchronized before
+    returning, so nothing of these subjects is still in use on the GPU once their memory is released. Returns the
+    results and the seconds taken."""
+    t0 = time.time()
+    with torch.cuda.stream(stream):
+        out = finish_subjects(ctxs, results, args, device)
+    stream.synchronize()
+    return out, time.time() - t0
 
 
 RELMOTION_COLUMNS = ["subject_id", "kind", "slice_a", "slice_b", "n_pairs", "dx_mm", "dy_mm", "dz_mm",
@@ -3372,7 +3471,7 @@ def fmt_row(row: dict) -> dict:
 
 # arguments that only affect input/output/bookkeeping, not the result, and are therefore left out of run names
 NAME_EXCLUDED = {"root", "out_root", "run_name", "logging", "history_every", "no_cuda_graph", "max_subjects", "skip_processed",
-                 "device", "workers", "step_progress"}
+                 "device", "workers", "step_progress", "no_overlap"}
 HISTORY_EVERY = 0.02    # with --logging: pose/metric snapshot every this fraction of the run (plus step 0 and the best pose)
 def _worker_init():
     """Worker processes of run(): one thread each (the run has as many processes as --workers), no GPU."""
@@ -3409,6 +3508,10 @@ def save_job(load, save, subj_dir: Path, affines: list, out_dir: Path, args) -> 
     save(load(subj_dir, args), affines, out_dir, args)
 
 
+AUTO_BATCH_PROBE = 4     # --batch-size 0: subjects in the first batch, which measures the GPU memory one takes
+AUTO_BATCH_FILL = 0.8    # ... the share of the GPU memory free at the start that a batch may fill
+AUTO_BATCH_MAX = 64      # ... at most this many subjects per batch
+AUTO_BATCH_GAIN = 0.1    # ... the batch size doubles while the alignment time per subject drops by more than this
 RESCAN_SECONDS = 30.0   # how often --root is rescanned for new subjects while others are still queued
 SKIPPED_JOB = "__skipped__"   # load_job(): the subject was found complete (--skip-processed)
 
@@ -3690,6 +3793,16 @@ def build_parser(description: str) -> argparse.ArgumentParser:
                          "themselves, i.e. its raw intensities, with no band across the other slice's profile. Overrides "
                          "--n-band (set to 1) and --psf-scale-start (set to 1, no PSF annealing); --psf-model and "
                          "--psf-tbw have no effect. In-plane --blur-sigma annealing still applies if set.")
+    ap.add_argument("--coarse-frac", type=float, default=0.0,
+                    help="Fraction of the run (from the start) sampled coarsely: only every --coarse-frame-stride-th "
+                         "cine frame and every --coarse-point-stride-th line point, which makes those steps several "
+                         "times cheaper. The early steps make the large moves, on blurred images and dilated masks; the "
+                         "best pose is only tracked after it. 0 = off. Default: %(default)s")
+    ap.add_argument("--coarse-frame-stride", type=int, default=4,
+                    help="--coarse-frac: use every n-th cine frame (UKBB: 50 -> 13 frames at 4). Default: %(default)s")
+    ap.add_argument("--coarse-point-stride", type=int, default=2,
+                    help="--coarse-frac: use every n-th intersection-line point (--line-step-mm x n apart). "
+                         "Default: %(default)s")
 
     # ###################    POSE REGULARIZATION PARAMS    ###############################
     ap.add_argument("--gauge", type=float, default=1e-2, help="Penalty weight on the mean pose (removes global drift)")
@@ -3835,7 +3948,15 @@ def build_parser(description: str) -> argparse.ArgumentParser:
                         "samplers, so each step samples all of them at once, while every term stays per subject (the "
                         "result of each is that of a solo run, up to floating-point rounding). Raises GPU utilization "
                         "and throughput; GPU memory grows about linearly with it. Not with --sax-sax-weight / "
-                        "--sax-gap-reg (then 1). Default: %(default)s")
+                        "--sax-gap-reg (then 1). 0 = automatic: the first batch (4 subjects) measures the GPU memory a "
+                        "subject takes, which bounds the batch size (80%% of the GPU memory free at the start, at most "
+                        "64); from there it doubles while that makes the alignment per subject >10%% faster, then "
+                        "stays (a GPU gains nothing from batches beyond the size that saturates it). A batch that "
+                        "still runs out of memory is split in halves, and later batches shrink. Default: %(default)s")
+    g.add_argument("--no-overlap", action="store_true",
+                   help="With --logging on a GPU, a batch's metrics and history are computed in a background thread "
+                        "while the next batch aligns (the GPU would otherwise idle meanwhile); this computes them "
+                        "before the next batch starts instead (same results; for debugging)")
     g.add_argument("--no-cuda-graph", action="store_true",
                    help="Run each optimization step eagerly instead of replaying a captured CUDA graph (same result, "
                         "slower; for debugging)")
@@ -3939,7 +4060,21 @@ def run(ap: argparse.ArgumentParser, args, load, save, is_complete) -> tuple[Pat
             pbar = tqdm(total=min(len(subjects), args.max_subjects) if capped else len(subjects), unit="subj")
             last_scan = time.time()
 
-            batch_size = max(1, getattr(args, "batch_size", 1))
+            # --batch-size 0: the first batch (AUTO_BATCH_PROBE subjects) measures the GPU memory a subject takes,
+            # which bounds the batch size (AUTO_BATCH_FILL of the memory free now); from there the batch size doubles
+            # as long as that speeds up the alignment per subject (by AUTO_BATCH_GAIN), else it goes back and stays.
+            # Beyond the size that saturates the GPU, a larger batch only costs memory and a longer last batch.
+            auto_batch = getattr(args, "batch_size", 1) == 0 and device.type == "cuda" and batchable(args)
+            batch_size = AUTO_BATCH_PROBE if auto_batch else max(1, getattr(args, "batch_size", 1))
+            free0 = torch.cuda.mem_get_info(device)[0] if auto_batch else 0
+            probing, tuning, mem_max, tune_best = auto_batch, auto_batch, AUTO_BATCH_MAX, None
+            align_stats = {}                                  # OOM splits (align_subjects)
+            # with logging on a GPU, a batch's metrics and history (finish_subjects) are computed in a background
+            # thread on a CUDA stream of its own while the next batch aligns
+            overlap = args.logging and device.type == "cuda" and not getattr(args, "no_overlap", False)
+            finisher = ThreadPoolExecutor(max_workers=1) if overlap else None
+            finish_stream = torch.cuda.Stream(device) if overlap else None
+            pending = None                                    # the batch being finished in the background
 
             def top_up():
                 """Keep 2 x --workers (at least 2 x --batch-size) subjects loading ahead. When the known subjects run out, rescan --root for
@@ -3981,64 +4116,20 @@ def run(ap: argparse.ArgumentParser, args, load, save, is_complete) -> tuple[Pat
                     except Exception as err2:  # noqa: BLE001
                         return err2
 
-            top_up()
-            while queue:
-                # the next --batch-size loaded subjects (those found complete are skipped as they come up)
-                batch = []
-                while queue and len(batch) < batch_size:
-                    subj, fut = queue.popleft()
-                    res = loaded(subj, fut)
-                    skip = isinstance(res, str) and res == SKIPPED_JOB
-                    if skip:                                      # already complete (--skip-processed)
-                        n_skipped += 1
-                        if budget >= 0:
-                            budget += 1
-                        if hasattr(pbar, "total"):
-                            if not capped:                    # (capped: another folder takes its place)
-                                pbar.total -= 1
-                            pbar.set_postfix(skipped=n_skipped)
-                        top_up()
-                        continue
-                    batch.append((subj, res))
-                    top_up()
-                if not batch:
-                    continue
-                t0 = time.time()
+            def complete(entries, todo, res, t_align):
+                """Write the results of a finished batch: `res` is (finish_subjects results, seconds), or the future of
+                finish_on_stream's."""
+                try:
+                    outs, t_finish = res.result() if hasattr(res, "result") else res
+                except Exception as err:  # noqa: BLE001
+                    traceback.print_exception(err)
+                    outs, t_finish = [err] * len(todo), 0.0
+                for e, o in zip(todo, outs):
+                    e["out"] = o
+                write_entries(entries, (t_align + t_finish) / len(entries))   # the batch's time, shared
 
-                def lines_callback(sid, out):
-                    def on_lines(planes, lines):
-                        if not lines:
-                            return
-                        out.mkdir(parents=True, exist_ok=True)
-                        save_line_geometry(planes, lines, out, args.line_extent_mm, args.line_step_mm)
-                        viz = mask_plot_data(planes, lines, args.line_extent_mm, args.line_step_mm)
-                        save_jobs.append((sid, "mask plot", ex.submit(save_mask_plot, viz, sid, args.mask_dilation_mm,
-                                                                      out / "mask_overlay.png", args.line_extent_mm)))
-                    return on_lines
-
-                entries = []
-                for subj, res in batch:
-                    e = dict(subj=subj, metrics_dir=run_dir / subj.name / "metrics", subject=None, data=None,
-                             pre=None, status="ok", out=None)
-                    try:
-                        if isinstance(res, Exception):
-                            raise res
-                        e["subject"], e["data"], e["pre"] = res
-                        e["status"] = e["subject"].status if e["subject"].slices else "no_images"
-                    except Exception as err:  # noqa: BLE001
-                        traceback.print_exception(err)
-                        e["status"] = f"error: {type(err).__name__}: {err}"[:200]
-                    entries.append(e)
-                todo = [e for e in entries if e["status"] == "ok"]
-                if todo:                                  # aligned together (--batch-size; alone when 1)
-                    outs = process_subjects([e["subject"] for e in todo], args, device,
-                                            [lines_callback(e["subj"].name, e["metrics_dir"])
-                                             if args.logging and e["pre"] is None else None    # (else written by load_job)
-                                             for e in todo], [e["data"] for e in todo], [e["pre"] for e in todo])
-                    for e, o in zip(todo, outs):
-                        e["out"] = o
-                seconds = (time.time() - t0) / len(entries)      # the batch's time, shared by its subjects
-
+            def write_entries(entries, seconds):
+                """Write the rows, outputs and progress of a batch's subjects (complete)."""
                 for e in entries:
                     subj, subject, status, metrics_dir = e["subj"], e["subject"], e["status"], e["metrics_dir"]
                     summary, details, pairs, history = None, [], [], None
@@ -4095,8 +4186,116 @@ def run(ap: argparse.ArgumentParser, args, load, save, is_complete) -> tuple[Pat
                             post.update(ncc=f"{summary['ncc_mean']:.2f}", jitter=f"{summary['sax_shift_jitter_mm']:.1f}")
                         pbar.set_postfix(**post)
                         pbar.update(1)
+
+            top_up()
+            while queue:
+                # the next --batch-size loaded subjects (those found complete are skipped as they come up)
+                batch = []
+                while queue and len(batch) < batch_size:
+                    subj, fut = queue.popleft()
+                    res = loaded(subj, fut)
+                    skip = isinstance(res, str) and res == SKIPPED_JOB
+                    if skip:                                      # already complete (--skip-processed)
+                        n_skipped += 1
+                        if budget >= 0:
+                            budget += 1
+                        if hasattr(pbar, "total"):
+                            if not capped:                    # (capped: another folder takes its place)
+                                pbar.total -= 1
+                            pbar.set_postfix(skipped=n_skipped)
+                        top_up()
+                        continue
+                    batch.append((subj, res))
+                    top_up()
+                if not batch:
+                    continue
+                t0 = time.time()
+
+                def lines_callback(sid, out):
+                    def on_lines(planes, lines):
+                        if not lines:
+                            return
+                        out.mkdir(parents=True, exist_ok=True)
+                        save_line_geometry(planes, lines, out, args.line_extent_mm, args.line_step_mm)
+                        viz = mask_plot_data(planes, lines, args.line_extent_mm, args.line_step_mm)
+                        save_jobs.append((sid, "mask plot", ex.submit(save_mask_plot, viz, sid, args.mask_dilation_mm,
+                                                                      out / "mask_overlay.png", args.line_extent_mm)))
+                    return on_lines
+
+                entries = []
+                for subj, res in batch:
+                    e = dict(subj=subj, metrics_dir=run_dir / subj.name / "metrics", subject=None, data=None,
+                             pre=None, status="ok", out=None)
+                    try:
+                        if isinstance(res, Exception):
+                            raise res
+                        e["subject"], e["data"], e["pre"] = res
+                        e["status"] = e["subject"].status if e["subject"].slices else "no_images"
+                    except Exception as err:  # noqa: BLE001
+                        traceback.print_exception(err)
+                        e["status"] = f"error: {type(err).__name__}: {err}"[:200]
+                    entries.append(e)
+                todo = [e for e in entries if e["status"] == "ok"]
+                probe = probing and len(todo) > 0
+                if probe:
+                    torch.cuda.synchronize(device)
+                    base = torch.cuda.memory_allocated(device)
+                    torch.cuda.reset_peak_memory_stats(device)
+                n_oom = align_stats.get("oom", 0)
+                ctxs, results = ([], {})
+                if todo:                                  # aligned together (--batch-size; alone when 1)
+                    ctxs, results = align_subjects([e["subject"] for e in todo], args, device,
+                                                   [lines_callback(e["subj"].name, e["metrics_dir"])
+                                                    if args.logging and e["pre"] is None else None  # (else by load_job)
+                                                    for e in todo], [e["data"] for e in todo], [e["pre"] for e in todo],
+                                                   align_stats)
+                t_align = time.time() - t0
+                n_live = sum(1 for c in ctxs if not isinstance(c, Exception) and c["lines"])
+                if pending is not None:                  # the previous batch, finished meanwhile
+                    complete(*pending)
+                    pending = None
+                if overlap and todo and not probe:
+                    finish_stream.wait_stream(torch.cuda.current_stream(device))
+                    pending = (entries, todo, finisher.submit(finish_on_stream, ctxs, results, args, device,
+                                                              finish_stream), t_align)
+                else:
+                    t1 = time.time()
+                    if probe:
+                        align_peak = torch.cuda.max_memory_allocated(device) - base
+                        before = torch.cuda.memory_allocated(device)
+                        torch.cuda.reset_peak_memory_stats(device)
+                    outs = finish_subjects(ctxs, results, args, device) if todo else []
+                    if probe and n_live:                  # --batch-size 0: the memory bound, from this batch
+                        finish_peak = torch.cuda.max_memory_allocated(device) - before
+                        probing = False
+                        per = (max(0, align_peak) + (max(0, finish_peak) if overlap else 0)) / n_live
+                        mem_max = int(max(1, min(AUTO_BATCH_MAX, AUTO_BATCH_FILL * free0 // max(per, 1))))
+                        print(f"\n[batch] --batch-size 0: a subject takes ~{per / 2 ** 20:.0f} MiB of GPU memory "
+                              f"({free0 / 2 ** 30:.1f} GiB were free): at most {mem_max} per batch", flush=True)
+                    complete(entries, todo, (outs, time.time() - t1), t_align)
+                del ctxs, results
+                if tuning and not probing and n_live >= max(2, int(0.75 * batch_size)):
+                    per_t = t_align / n_live                     # alignment seconds per subject at this size
+                    if tune_best is None or per_t < tune_best[1] * (1.0 - AUTO_BATCH_GAIN):
+                        tune_best = (batch_size, per_t)
+                        nxt = min(2 * batch_size, mem_max)
+                        tuning = nxt > batch_size
+                        batch_size = nxt
+                    else:
+                        batch_size, tuning = tune_best[0], False
+                    print(f"\n[batch] --batch-size 0: {per_t:.2f} s per subject in this batch; "
+                          f"{'trying' if tuning else 'settled on'} {batch_size} subjects per batch", flush=True)
+                if auto_batch and align_stats.get("oom", 0) > n_oom and batch_size > 1:
+                    batch_size = max(1, batch_size * 3 // 4)       # a batch had to be split: smaller from now on
+                    mem_max, tuning = batch_size, False
+                    print(f"\n[batch] --batch-size 0: down to {batch_size} subjects per batch", flush=True)
                 if not queue:                              # subjects written while these were aligned
                     top_up()
+            if pending is not None:
+                complete(*pending)
+                pending = None
+            if finisher is not None:
+                finisher.shutdown(wait=True)
             for name, what, job in save_jobs:
                 try:
                     job.result()
