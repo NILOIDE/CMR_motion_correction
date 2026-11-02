@@ -3180,12 +3180,13 @@ def build_parser(description: str) -> argparse.ArgumentParser:
     ap.add_argument("--nmi-sigma", type=float, default=1.0, help="Parzen window width for mutual information, in bins")
 
     # ###################    COARSE-TO-FINE (BLUR) PARAMS    #############################
-    ap.add_argument("--blur-sigma", type=float, default=3.0,
-                    help="Coarse-to-fine: initial in-plane Gaussian sigma (mm) of the images, decayed linearly to 0 (0 = off)")
+    ap.add_argument("--blur-sigma", type=float, default=5.0,
+                    help="Coarse-to-fine: initial in-plane Gaussian sigma (mm) of the images, decayed linearly to --blur-sigma-end "
+                         "over --blur-frac of the run (0 = off). Default: %(default)s")
     ap.add_argument("--blur-frac", type=float, default=0.8,
                     help="Fraction of the steps over which the blur decays to --blur-sigma-end (> 1: it never gets "
                          "there); 0 = no decay, the blur stays at --blur-sigma for the whole run")
-    ap.add_argument("--blur-sigma-end", type=float, default=1.0,
+    ap.add_argument("--blur-sigma-end", type=float, default=2.0,
                     help="Blur sigma (mm) the coarse-to-fine blur decays to (linearly from --blur-sigma over "
                          "--blur-frac of the run) and then keeps until the end (0: unblurred at the end). Default: %(default)s")
 
