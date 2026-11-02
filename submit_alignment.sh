@@ -30,7 +30,7 @@ ALIGN_DIR="/vol/miltank/projects/ukbb/data/cardiac/slice_alignment"
 # moco_nifti.py reads the raw UKBB layout directly
 DATA_DIR="/vol/miltank/projects/ukbb/data/cardiac/cardiac_segmentations/projects/ugurlu_segmentations/data"
 OUT_ROOT="$ALIGN_DIR"
-RUN_NAME="aligned_subjects"          # outputs: $OUT_ROOT/$RUN_NAME/<subject>/
+RUN_NAME="aligned_subjects_v2"          # outputs: $OUT_ROOT/$RUN_NAME/<subject>/
 
 cd "$REPO_DIR" || { echo "Error: repository directory not found"; exit 1; }
 [ -f moco_nifti.py ] || { echo "Error: moco_nifti.py not found in $REPO_DIR (submit from the repo root)"; exit 1; }
