@@ -121,6 +121,16 @@ every stack, so also on the oblique DICOM stacks (exposed in `moco_dicom.py`). W
 dataset-level metrics (CSV) and figures (PNG) under the run directory. The method builds on the intersection-line
 intensity-matching approach of [Stolt-Ansó et al.](https://arxiv.org/pdf/2404.00767) [2].
 
+By default every plane is kept near its acquired pose, which stops single slices (most often in subjects with only LAX
+views) from flying out of the cluster: each optimizer step moves a plane at most 2 mm / 1 deg (`--max-step-mm`,
+`--max-step-deg`), dead-zone priors pull a plane back once it is more than 20 mm / 10 deg from its acquired pose
+(`--shift-prior`, `--shift-free-mm`, `--rot-prior`, `--rot-free-deg`; free below, so ordinary corrections are not
+biased), and hard limits of 50 mm / 20 deg cannot be exceeded at all (`--max-shift-mm`, `--max-rot-deg`; UKBB 99.9th
+percentiles: ~23 mm, ~8 deg). The learning rates decay linearly to 10% over the run (`--lr-schedule linear`). Each LAX heart mask
+is also extended 20 mm toward the apex along the LV long axis before it is dilated (`--apex-extend-mm`), so the apical
+SAX slices keep supervised line points as the mask shrinks, also where the apical segmentation is incomplete. Set any
+of them to 0 (`--lr-schedule constant`) for the previous behaviour.
+
 We found best results with plain SGD (the default, no momentum) rather than Adam. There is also a substantial amount
 of non-rigid deformation in the torso between acquisitions (the heart itself moves close to rigidly, but the
 surrounding anatomy does not), so the intersection-line optimization is restricted to a dilated foreground (heart)
