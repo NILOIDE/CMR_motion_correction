@@ -133,7 +133,10 @@ import sys
 import time
 import traceback
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+import dataclasses
+import multiprocessing
+import os
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from itertools import combinations
@@ -1103,12 +1106,17 @@ class LineSampler:
         return torch.where(ok.any(1), out, torch.full_like(out, float("nan")))
 
     def per_plane(self, values: torch.Tensor) -> list[float]:
-        """Line values (M,) -> npts-weighted mean per plane, ignoring NaN (one host transfer)."""
+        """Line values (M,) -> npts-weighted mean per plane, ignoring NaN (one host transfer). Summed on the host in
+        float64: a GPU index_add rounds differently from run to run (the reported metrics would vary in the last
+        digits)."""
         ok = torch.isfinite(values)
-        v = torch.where(ok, values, torch.zeros_like(values)) * self.npts
-        w = self.npts * ok
-        num = torch.zeros(self.N, device=self.device).index_add_(0, self.IA, v).index_add_(0, self.IB, v)
-        den = torch.zeros(self.N, device=self.device).index_add_(0, self.IA, w).index_add_(0, self.IB, w)
+        v = (torch.where(ok, values, torch.zeros_like(values)) * self.npts).double().cpu()
+        w = (self.npts * ok).double().cpu()
+        if getattr(self, "_host_pairs", None) is None:                  # (the plane indices, kept on the host)
+            self._host_pairs = (self.IA.cpu(), self.IB.cpu())
+        ia, ib = self._host_pairs
+        num = torch.bincount(ia, v, self.N) + torch.bincount(ib, v, self.N)
+        den = torch.bincount(ia, w, self.N) + torch.bincount(ib, w, self.N)
         return torch.where(den > 0, num / den.clamp_min(1e-12), torch.full_like(num, float("nan"))).tolist()
 
     def per_plane_max(self, values: torch.Tensor) -> list[float]:
@@ -1301,6 +1309,7 @@ class SaxNeighbourLines:
         self.IA = torch.tensor([ia for ia, _ in self.pairs], device=device)
         self.IB = torch.tensor([ib for _, ib in self.pairs], device=device)
         self.T = torch.arange(-args.line_extent_mm, args.line_extent_mm + 1e-6, args.line_step_mm, **f32)
+        self.T_np = self.T.cpu().numpy()
         axis = axes[0] if axis is None else axis
         self.L0 = torch.tensor(axis[0], **f32)                                       # recorded long axis (logging)
         self.ell = torch.tensor(axis[1] / np.linalg.norm(axis[1]), **f32)
@@ -1337,10 +1346,10 @@ class SaxNeighbourLines:
         grid = torch.cat([xy, z[..., None]], -1)
         return iv.sample(grid[None, :, :, None, :])[:, :, :, 0].float().transpose(0, 1)       # (P, F, L)
 
-    def profiles(self, theta_deg: torch.Tensor, t: torch.Tensor):
+    def profiles(self, theta_deg: torch.Tensor, t: torch.Tensor, g: dict | None = None):
         """At the given poses: both images' profiles (P, F, L) x 2, the point weights (P, L), which pairs cross at
-        all (P,) and the distance (mm) of each pair's line from the long axis (P,)."""
-        g = self.geometry(theta_deg, t)
+        all (P,) and the distance (mm) of each pair's line from the long axis (P,). g: geometry() at these poses."""
+        g = self.geometry(theta_deg, t) if g is None else g
         prof = [self._sample(side, g["vox"][side]) for side in (0, 1)]
         return prof[0], prof[1], g["w"], g["active"], g["axis_dist"]
 
@@ -1441,15 +1450,17 @@ class SaxNeighbourLines:
         sum, NCC and dissimilarity (1 - NCC) along the line, the smallest gap between the slices on the barrier disk
         and their relative tilt; crossing_in_heart = 1 where that gap is negative (the slices cross inside the disk)."""
         g = self.geometry(theta_deg, t)
-        c, n, _ = self.scores(theta_deg, t)
+        c, n, _ = self.scores(theta_deg, t, g)
         gp = self.gaps(theta_deg, t)
-        gap_min = gp["gap"].flatten(1).min(1).values.cpu().numpy()
-        tilt = gp["rel_tilt"].cpu().numpy()
-        T = self.T.cpu().numpy()
-        x0 = g["x0"].cpu().numpy().astype(np.float64) - shift
-        d, active = g["d"].cpu().numpy(), g["active"].cpu().numpy()
-        in_img, used = g["in_img"].cpu().numpy(), g["in_radius"].cpu().numpy()
-        dist, c, n = g["axis_dist"].cpu().numpy(), c.cpu().numpy(), n.cpu().numpy()
+        # everything to the host in one transfer (one GPU sync instead of one per tensor)
+        L = self.T.numel()
+        packed = torch.cat([gp["gap"].flatten(1).min(1).values[:, None], gp["rel_tilt"][:, None], g["x0"], g["d"],
+                            g["active"].float()[:, None], g["axis_dist"][:, None], c[:, None], n[:, None],
+                            g["in_img"].float(), g["in_radius"].float()], 1).cpu().numpy()
+        gap_min, tilt, x0, d = packed[:, 0], packed[:, 1], packed[:, 2:5].astype(np.float64) - shift, packed[:, 5:8]
+        active, dist, c, n = packed[:, 8] > 0.5, packed[:, 9], packed[:, 10], packed[:, 11]
+        in_img, used = packed[:, 12:12 + L] > 0.5, packed[:, 12 + L:12 + 2 * L] > 0.5
+        T = self.T_np
         nan = float("nan")
         rows = []
         for k, (ia, ib) in enumerate(self.pairs):
@@ -1471,10 +1482,10 @@ class SaxNeighbourLines:
             rows.append(row)
         return rows
 
-    def scores(self, theta_deg: torch.Tensor, t: torch.Tensor):
+    def scores(self, theta_deg: torch.Tensor, t: torch.Tensor, g: dict | None = None):
         """Per pair: NCC along its line with the point weights (0 when it does not cross), the sum of the point weights
-        and the axis distance (mm)."""
-        a, b, w, active, dist = self.profiles(theta_deg, t)
+        and the axis distance (mm). g: geometry() at these poses, if already computed."""
+        a, b, w, active, dist = self.profiles(theta_deg, t, g)
         # NCC is invariant to the scale of the weights, but ncc() floors their sum at 1 (meant for 0/1 masks), so
         # soft weights are rescaled to a maximum of 1 per line first
         wn = w / w.amax(-1, keepdim=True).clamp_min(1e-6)
@@ -1685,8 +1696,34 @@ def step_progress_bar(args):
     return tqdm(total=args.steps, desc="steps", unit="step", leave=False, position=1, dynamic_ncols=True)
 
 
+class BlockSum:
+    """Sums of values laid out block after block (sizes[g] values for block g, e.g. a batch's subjects): the values are
+    gathered into a zero-padded (G, largest block) array and summed along it. No atomic additions, so the sums are
+    bit-reproducible on the GPU (index_add is not: its float rounding varies from run to run, and an optimization
+    amplifies that). Values in the padding never reach a sum (where, not a multiplication by 0, so a non-finite value
+    of one block cannot spread to the others)."""
+
+    def __init__(self, sizes: list[int], device):
+        G, L = len(sizes), max([1] + list(sizes))
+        idx = torch.zeros(G, L, dtype=torch.long)
+        mask = torch.zeros(G, L, dtype=torch.bool)
+        o = 0
+        for g, n in enumerate(sizes):
+            idx[g, :n] = torch.arange(o, o + n)
+            mask[g, :n] = True
+            o += n
+        self.idx, self.mask = idx.to(device), mask.to(device)
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        """x (K,) or (K, d), K = sum(sizes) -> (G,) or (G, d)."""
+        v = x[self.idx]
+        m = self.mask if x.dim() == 1 else self.mask[..., None]
+        return torch.where(m, v, torch.zeros((), dtype=v.dtype, device=v.device)).sum(1)
+
+
 def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]] | None = None,
-          pose_model: str = "6dof") -> dict:
+          pose_model: str = "6dof", groups: list[int] | None = None, models: list[str] | None = None,
+          anneal_ends: list[int] | None = None) -> dict:
     """Jointly optimize a rigid pose per plane from the acquired geometry: translation plus a 3D rotation (pose_model
     6dof), plus a rotation about the plane's own normal only (inplane), or translation only (translation).
 
@@ -1694,6 +1731,15 @@ def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]
     with (anneal_end, final_sampler); `final_sampler` -- the nominal geometry -- is used from anneal_end on (or always,
     if no stages are given). The best pose is only tracked once every annealed quantity (geometry, blur, PSF width) is
     at its nominal value, on the full (all lines) objective.
+
+    Several subjects at once (align_batch): `groups` gives every plane's subject (0 .. G-1; the samplers hold the
+    subjects' planes and lines one subject after the other), `models` each subject's pose model and `anneal_ends` the
+    step its own mask annealing ends (0: none). Nothing couples the subjects: the objective is the sum of the subjects'
+    own objectives (each a mean over its own lines, with its own gauge, priors and stack terms), so every pose gets the
+    gradient it would get alone; steps with a non-finite gradient are skipped, the best pose is tracked and the lines
+    are dropped (--pair-keep) per subject: each keeps its own share of its own lines, drawn for the whole batch at once. In-plane subjects use
+    the first component of their rotation parameter as the angle about the plane normal (the others get no gradient),
+    which updates exactly as a solo in-plane run. Returns best_step and n_skipped per subject (lists) in that case.
 
     Each optimization step (objective, backward, best-pose bookkeeping, optimizer update) is captured once per geometry
     stage as a CUDA graph and replayed, which removes the per-step Python/kernel-launch overhead; all per-step inputs
@@ -1714,18 +1760,49 @@ def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]
         return active
 
     f32 = dict(dtype=torch.float32, device=device)
-    rotate = args.dof in (4, 6) and args.rot_lr > 0 and pose_model in ("6dof", "inplane")
-    inplane = rotate and pose_model == "inplane"
-    theta_deg = torch.zeros(N, 3, **f32).requires_grad_(rotate and not inplane)
-    phi = torch.zeros(N, 1, **f32).requires_grad_(inplane)          # inplane: angle (deg) about each plane's normal
+    batched = groups is not None
+    G = max(groups) + 1 if batched else 1
+    models = list(models) if batched else [pose_model]
+    single = G == 1
+    pg = torch.tensor(groups if batched else [0] * N, dtype=torch.long, device=device)      # plane -> subject
+    n_per = torch.bincount(pg, minlength=G).float()                                         # planes per subject
+    if batched and any(b < a for a, b in zip(groups, groups[1:])):
+        raise ValueError("align: the planes of a batch must be ordered by subject")
+    plane_sum = BlockSum(n_per.long().tolist(), device)                # per-subject sums over its planes
+    rot_ok = args.dof in (4, 6) and args.rot_lr > 0
+    full_g = [rot_ok and m == "6dof" for m in models]
+    inp_g = [rot_ok and m == "inplane" for m in models]
+    rotate = any(full_g) or any(inp_g)
+    all_full, all_inp = all(full_g), all(inp_g)
+    gl = groups if batched else [0] * N
+    full = torch.tensor([[float(full_g[g])] for g in gl], **f32)
+    inp = torch.tensor([[float(inp_g[g])] for g in gl], **f32)
+    # rotation parameter: the rotation vector (6dof), or in its first component the angle about the normal (inplane)
+    theta_deg = torch.zeros(N, 3, **f32).requires_grad_(rotate)
     t = torch.zeros(N, 3, **f32).requires_grad_(True)
 
     def pose_theta():
         """Rotation vectors (N, 3, deg) of the current parameters."""
-        return phi * final_sampler.Nrm if inplane else theta_deg
+        if not rotate or all_full:
+            return theta_deg
+        if all_inp:
+            return theta_deg[:, :1] * final_sampler.Nrm
+        return full * theta_deg + inp * (theta_deg[:, :1] * final_sampler.Nrm)
 
-    # SAX stack regularizers over adjacent slices (a, b = slice z, z + 1); the plane normals and centres are the same
-    # in every stage sampler
+    def gmean(x):
+        """Per-plane values (N,) -> their mean over each subject's planes (G,)."""
+        if single:
+            return x.mean()[None]
+        return plane_sum(x) / n_per
+
+    def gmean3(v):
+        """Per-plane vectors (N, 3) -> their mean over each subject's planes (G, 3)."""
+        if single:
+            return v.mean(0)[None]
+        return plane_sum(v) / n_per[:, None]
+
+    # SAX stack regularizers over adjacent slices (a, b = slice z, z + 1) of each subject; the plane normals and
+    # centres are the same in every stage sampler
     tilt_prior = getattr(args, "tilt_prior", 0.0) if rotate else 0.0
     shift_prior = getattr(args, "shift_prior", 0.0)
     shift_free = getattr(args, "shift_free_mm", 20.0)
@@ -1736,60 +1813,114 @@ def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]
     w_spacing = getattr(args, "spacing_reg", 0.0)
     w_rel_shift = getattr(args, "rel_shift_reg", 0.0)
     w_rel_rot = getattr(args, "rel_rot_reg", 0.0) if rotate else 0.0
-    sax = sorted((p.slice_idx, i) for i, p in enumerate(final_sampler.planes) if p.image == "SAX")
-    adjacent = [(i, j) for (za, i), (zb, j) in zip(sax, sax[1:]) if zb == za + 1]
-    stack_reg = bool(adjacent) and (w_tilt_hinge > 0 or w_spacing > 0 or w_rel_shift > 0 or w_rel_rot > 0)
-    if stack_reg:
+    weights = dict(tilt_hinge=w_tilt_hinge, spacing=w_spacing, rel_shift=w_rel_shift, rel_rot=w_rel_rot)
+    adj = []                                                 # per subject: (nb_a, nb_b, target) or None
+    C0, N0 = final_sampler.C, final_sampler.Nrm
+    for g in range(G):
+        sax = sorted((p.slice_idx, i) for i, p in enumerate(final_sampler.planes) if p.image == "SAX" and gl[i] == g)
+        adjacent = [(i, j) for (za, i), (zb, j) in zip(sax, sax[1:]) if zb == za + 1]
+        if not adjacent:
+            adj.append(None)
+            continue
         nb_a = torch.tensor([i for i, _ in adjacent], device=device)
         nb_b = torch.tensor([j for _, j in adjacent], device=device)
-        C0, N0 = final_sampler.C, final_sampler.Nrm
         step0 = ((C0[nb_b] - C0[nb_a]) * N0[nb_a]).sum(1)                   # acquired signed spacing along the normal
         spacing = getattr(args, "sax_spacing_mm", 10.0)
-        target = torch.sign(step0) * (spacing if spacing > 0 else step0.abs())
-
-    weights = dict(tilt_hinge=w_tilt_hinge, spacing=w_spacing, rel_shift=w_rel_shift, rel_rot=w_rel_rot)
+        adj.append((nb_a, nb_b, torch.sign(step0) * (spacing if spacing > 0 else step0.abs())))
+    stack_reg = any(a is not None for a in adj) and (w_tilt_hinge > 0 or w_spacing > 0 or w_rel_shift > 0 or w_rel_rot > 0)
 
     def stack_penalty(theta_deg, t):
-        terms = stack_terms(theta_deg, t, C0, N0, nb_a, nb_b, target, {k for k, w in weights.items() if w > 0},
-                            tilt_hinge_deg)
-        return sum(weights[k] * v for k, v in terms.items())
+        """The weighted stack terms of every subject (G,), each a mean over its own adjacent pairs."""
+        vals = []
+        for a in adj:
+            if a is None:
+                vals.append(torch.zeros((), **f32))
+                continue
+            terms = stack_terms(theta_deg, t, C0, N0, a[0], a[1], a[2], {k for k, w in weights.items() if w > 0},
+                                tilt_hinge_deg)
+            vals.append(sum(weights[k] * v for k, v in terms.items()))
+        return torch.stack(vals)
+
+    line_group = {}                                          # per sampler: the subject of every line (M,)
+    line_sums = {}                                           # per sampler: BlockSum over its lines / its kept lines
+
+    def score(smp, theta_deg, t, sel):
+        """The similarity of every subject (G,): the point-weighted mean over its own (kept) lines."""
+        if single:
+            return similarity_objective(smp, theta_deg, t, args, sel)[None]
+        c = smp.similarity_lines(theta_deg, t, args, sel=sel)
+        w = smp.npts if sel is None else smp.npts[sel]
+        bsum = line_sums[id(smp)][0 if sel is None else 1]   # the lines (kept lines) are grouped by subject
+        return bsum(c * w) / bsum(w).clamp_min(1e-12)
 
     def objective(theta_deg, t, sel=None, smp=final_sampler):
-        score = similarity_objective(smp, theta_deg, t, args, sel)
-        gauge = args.gauge * (t.mean(0).pow(2).sum() + theta_deg.mean(0).pow(2).sum())
+        """The objective of every subject (G,); the optimizer maximizes their sum."""
+        out = score(smp, theta_deg, t, sel)
+        gauge = args.gauge * (gmean3(t).pow(2).sum(1) + gmean3(theta_deg).pow(2).sum(1))
         dz = (t * smp.Nrm).sum(1)
-        prior = args.prior * (theta_deg.pow(2).sum(1) + dz.pow(2)).mean()
+        prior = args.prior * gmean(theta_deg.pow(2).sum(1) + dz.pow(2))
         if tilt_prior > 0:                     # tilt above --tilt-hinge-deg (deg^2); in-plane rotation is free
             tilt = theta_deg - (theta_deg * smp.Nrm).sum(1, keepdim=True) * smp.Nrm
             tilt_deg = tilt.pow(2).sum(1).clamp_min(1e-12).sqrt()          # = rot_tilt_deg; finite gradient at 0
-            prior = prior + tilt_prior * torch.relu(tilt_deg - tilt_hinge_deg).pow(2).mean()
+            prior = prior + tilt_prior * gmean(torch.relu(tilt_deg - tilt_hinge_deg).pow(2))
         if shift_prior > 0:                    # each plane's shift from its acquired pose beyond --shift-free-mm (mm^2)
             shift = t.pow(2).sum(1).clamp_min(1e-12).sqrt()                 # finite gradient at 0
-            prior = prior + shift_prior * torch.relu(shift - shift_free).pow(2).mean()
+            prior = prior + shift_prior * gmean(torch.relu(shift - shift_free).pow(2))
         if rot_prior > 0:                      # each plane's rotation angle beyond --rot-free-deg (deg^2)
             angle = theta_deg.pow(2).sum(1).clamp_min(1e-12).sqrt()
-            prior = prior + rot_prior * torch.relu(angle - rot_free).pow(2).mean()
-        return score - gauge - prior - (stack_penalty(theta_deg, t) if stack_reg else 0.0) - sax_pair_penalty(smp, theta_deg, t)
+            prior = prior + rot_prior * gmean(torch.relu(angle - rot_free).pow(2))
+        out = out - gauge - prior - (stack_penalty(theta_deg, t) if stack_reg else 0.0)
+        if single:                             # (batches are only formed without these terms, see batchable)
+            out = out - sax_pair_penalty(smp, theta_deg, t)
+        return out
 
     # stochastic line-pair dropping: each step samples only a random subset of round(--pair-keep x M) of the
-    # intersection lines (at least one), so memory and time per step scale with the kept lines; a fixed subset size
-    # keeps the shapes static for the CUDA graphs
+    # intersection lines (at least one) -- per subject, from its own lines and its own generator -- so memory and time
+    # per step scale with the kept lines; a fixed subset size keeps the shapes static for the CUDA graphs
     keep_frac = getattr(args, "pair_keep", 1.0)
     stochastic = keep_frac < 1.0
-    gen = torch.Generator(device=device)
-    gen.manual_seed(getattr(args, "seed", 0))
+    gens = [torch.Generator(device=device)]                 # one for the run (or batch), as before
+    gens[0].manual_seed(getattr(args, "seed", 0))
+    draw_maps = {}                                           # per sampler: (subject of every line, kept positions)
     eval_every = max(1, getattr(args, "eval_every", 10))
+    blocks = {}                                              # per sampler: (offset, lines, kept) of every subject
+
+    for _, smp in stages:
+        lg = pg[smp.IA]
+        line_group[id(smp)] = lg
+        counts = torch.bincount(lg, minlength=G).tolist()
+        offs = [0]
+        for c in counts[:-1]:
+            offs.append(offs[-1] + c)
+        if not single and not bool((lg[1:] >= lg[:-1]).all()):
+            raise ValueError("align: the lines of a batch must be ordered by subject")
+        blocks[id(smp)] = [(o, m, max(1, min(m, int(round(keep_frac * m))))) for o, m in zip(offs, counts)]
+        line_sums[id(smp)] = (BlockSum(counts, device), BlockSum([k for _, _, k in blocks[id(smp)]], device))
+        draw_maps[id(smp)] = (lg.double(), torch.cat([torch.arange(o, o + k, device=device)
+                                                     for o, _, k in blocks[id(smp)]]))
 
     def n_keep(smp):
-        return max(1, min(smp.M, int(round(keep_frac * smp.M))))
+        if single:
+            return max(1, min(smp.M, int(round(keep_frac * smp.M))))
+        return sum(k for _, _, k in blocks[id(smp)])
 
     def draw_keep(smp):
-        return torch.randperm(smp.M, generator=gen, device=device)[:n_keep(smp)]
+        if single:
+            return torch.randperm(smp.M, generator=gens[0], device=device)[:n_keep(smp)]
+        # every subject's own lines in random order with one draw for the whole batch: sorting subject + U(0, 0.5)
+        # keeps each subject's lines in its own block (the lines are ordered by subject), shuffled within it; the
+        # first kept-count of each block are taken (a randperm per subject and step cost ~0.4 s per subject). The
+        # 0.5 keeps rounding from carrying a key into the next block; float64 keys make ties rare and the stable sort
+        # orders the remaining ones the same way every run (an unstable one made batched runs irreproducible)
+        lg_f, keep_pos = draw_maps[id(smp)]
+        key = lg_f + 0.5 * torch.rand(smp.M, generator=gens[0], device=device, dtype=torch.float64)
+        order = torch.argsort(key, stable=True)
+        return order[keep_pos]
 
     # learning rates as device tensors (updated in place each step; captured graphs read them)
     lr_t = torch.tensor(float(args.lr), **f32)
     lr_r = torch.tensor(float(args.rot_lr), **f32)
-    param_groups = [{"params": [t], "lr": lr_t}] + ([{"params": [phi if inplane else theta_deg], "lr": lr_r}] if rotate else [])
+    param_groups = [{"params": [t], "lr": lr_t}] + ([{"params": [theta_deg], "lr": lr_r}] if rotate else [])
     opt = make_optimizer(param_groups, args, device)
 
     def lr_at(step, start, end):
@@ -1804,26 +1935,37 @@ def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]
     blur_quantum = 0.2                                     # mm; the blur is only recomputed when sigma moves this much
     psf_s0 = getattr(args, "psf_scale_start", 1.0)
     psf_steps = int(round(getattr(args, "psf_anneal_frac", 0.6) * args.steps)) if psf_s0 > 1.0 else 0
-    track_from = max(anneal_end, blur_steps, psf_steps)    # from here on the objective is the nominal one
+    # from here on a subject's objective is the nominal one (its own mask annealing may end earlier, or not exist)
+    ends = list(anneal_ends) if batched and anneal_ends is not None else [anneal_end] * G
+    track_from = [max(e, blur_steps, psf_steps) for e in ends]
 
-    # device-side bookkeeping: best pose so far (no host sync per step)
-    best_obj = torch.tensor(-float("inf"), **f32)
-    best_th, best_t = theta_deg.detach().clone(), t.detach().clone()
-    best_step = torch.zeros((), **f32)
-    step_buf, track_buf = torch.zeros((), **f32), torch.zeros((), **f32)
+    # device-side bookkeeping: best pose so far, per subject (no host sync per step)
+    best_obj = torch.full((G,), -float("inf"), **f32)
+    best_th, best_t = torch.zeros(N, 3, **f32), t.detach().clone()
+    best_step = torch.zeros(G, **f32)
+    step_buf, track_buf = torch.zeros((), **f32), torch.zeros(G, **f32)
+    flags = {}                                             # cached (G,) 0/1 tensors for track_buf
+
+    def flag(values):
+        key = tuple(bool(v) for v in values)
+        if key not in flags:
+            flags[key] = torch.tensor([float(v) for v in key], **f32)
+        return flags[key]
+
     sel_bufs = {id(smp): torch.arange(n_keep(smp), device=device) for _, smp in stages} if stochastic else {}
     for _, smp in stages:                                # the full-objective evaluations stay within a step's memory
         smp.eval_chunk = min(smp.eval_chunk, n_keep(smp)) if stochastic else smp.eval_chunk
 
     def update_best(o):
-        better = (o > best_obj) & (track_buf > 0)
+        better = (o > best_obj) & (track_buf > 0)                          # (G,)
+        bp = better[pg][:, None]                                           # (N, 1)
         best_obj.copy_(torch.where(better, o, best_obj))
-        best_th.copy_(torch.where(better, pose_theta().detach(), best_th))
-        best_t.copy_(torch.where(better, t.detach(), best_t))
+        best_th.copy_(torch.where(bp, pose_theta().detach(), best_th))
+        best_t.copy_(torch.where(bp, t.detach(), best_t))
         best_step.copy_(torch.where(better, step_buf, best_step))
 
     params_all = [p for g in param_groups for p in g["params"]]
-    n_skipped = torch.zeros((), **f32)                   # steps skipped for a non-finite gradient
+    n_skipped = torch.zeros(G, **f32)                    # steps skipped for a non-finite gradient, per subject
     # step cap (--max-step-mm / --max-step-deg): after each optimizer step, a plane whose translation moved more than
     # the cap (Euclidean, mm), or whose rotation vector changed more than the cap (deg; for --pose inplane its angle),
     # is moved back along its step to the cap. One large gradient (a degenerate line, a mask-annealing switch) can then
@@ -1833,8 +1975,7 @@ def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]
     if getattr(args, "max_step_mm", 0.0) > 0:
         caps.append((t, torch.zeros_like(t), float(args.max_step_mm)))
     if rotate and getattr(args, "max_step_deg", 0.0) > 0:
-        rp = phi if inplane else theta_deg
-        caps.append((rp, torch.zeros_like(rp), float(args.max_step_deg)))
+        caps.append((theta_deg, torch.zeros_like(theta_deg), float(args.max_step_deg)))
 
     def cap_steps():
         with torch.no_grad():
@@ -1850,7 +1991,7 @@ def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]
     if getattr(args, "max_shift_mm", 0.0) > 0:
         limits.append((t, float(args.max_shift_mm)))
     if rotate and getattr(args, "max_rot_deg", 0.0) > 0:
-        limits.append((phi if inplane else theta_deg, float(args.max_rot_deg)))
+        limits.append((theta_deg, float(args.max_rot_deg)))
 
     def apply_limits():
         with torch.no_grad():
@@ -1860,21 +2001,29 @@ def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]
 
     def body(smp):
         opt.zero_grad(set_to_none=False)
-        obj = objective(pose_theta(), t, sel_bufs.get(id(smp)), smp)
+        obj = objective(pose_theta(), t, sel_bufs.get(id(smp)), smp)       # (G,)
         # loss scaling: with --sample-dtype float16 / bfloat16 the backward pass of the image sampling runs in half
         # precision, where each sample's share of the gradient (~1e-5: the objective averages thousands of line points)
         # underflows -- the gradient came out ~100x too small and pointing nowhere (cosine 0.01 with the float32
         # gradient on a DICOM subject), so the poses random-walked and the metrics fell. Scaled by GRAD_SCALE (a power
         # of two, exact) it matches float32 (cosine 0.997); the scale is divided out before the update.
-        (-obj * GRAD_SCALE).backward()
+        (-obj.sum() * GRAD_SCALE).backward()
         with torch.no_grad():
-            # a step whose gradient is not finite (a half-precision overflow, or a degenerate line) is skipped: its
-            # gradient is zeroed (as AMP's GradScaler does) instead of turning every pose into NaN for the rest of the
-            # run; counted in n_skipped (no host sync inside the CUDA graph)
+            # a step whose gradient is not finite (a half-precision overflow, or a degenerate line) is skipped -- per
+            # subject: its gradient is zeroed (as AMP's GradScaler does) instead of turning every pose into NaN for the
+            # rest of the run; counted in n_skipped (no host sync inside the CUDA graph)
             grads = [p.grad for p in params_all if p.grad is not None]
-            finite = torch.stack([torch.isfinite(g).all() for g in grads]).all() & torch.isfinite(obj)
+            if single:
+                finite = (torch.stack([torch.isfinite(g).all() for g in grads]).all() & torch.isfinite(obj).all()).reshape(1)
+                ok = finite.reshape(1, 1)
+            else:
+                bad = torch.zeros(N, dtype=torch.bool, device=device)
+                for g in grads:
+                    bad = bad | ~torch.isfinite(g).all(1)
+                finite = (plane_sum(bad.float()) == 0) & torch.isfinite(obj)
+                ok = finite[pg][:, None]
             for g in grads:
-                g.copy_(torch.where(finite, torch.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0) / GRAD_SCALE,
+                g.copy_(torch.where(ok, torch.nan_to_num(g, nan=0.0, posinf=0.0, neginf=0.0) / GRAD_SCALE,
                                     torch.zeros_like(g)))
             n_skipped.add_((~finite).float())
         update_best(torch.where(finite, obj.detach(), best_obj))   # pose *before* this update, as before
@@ -1956,19 +2105,19 @@ def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]
             lr_t.fill_(lr_at(step, args.lr, LR_END_FRACTION * args.lr if args.lr_end is None else args.lr_end))
             lr_r.fill_(lr_at(step, args.rot_lr,
                              LR_END_FRACTION * args.rot_lr if args.rot_lr_end is None else args.rot_lr_end))
-            nominal = step >= track_from
+            nominal = [step >= tf for tf in track_from]
             step_buf.fill_(float(step))
             if stochastic:
                 sel_bufs[id(smp)].copy_(draw_keep(smp))
                 # the dropped-line objective is not comparable between steps: track the best periodically on the
                 # full objective (eagerly, before the update), and never inside the graph
-                if nominal and (step % eval_every == 0 or step == args.steps - 1):
-                    track_buf.fill_(1.0)
+                if any(nominal) and (step % eval_every == 0 or step == args.steps - 1):
+                    track_buf.copy_(flag(nominal))
                     with torch.no_grad():
                         update_best(objective(pose_theta(), t))
                 track_buf.fill_(0.0)
             else:
-                track_buf.fill_(1.0 if nominal else 0.0)
+                track_buf.copy_(flag(nominal))
             run_step(smp)
             if bar is not None:
                 bar.update()
@@ -1978,16 +2127,22 @@ def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]
         # the final parameters are also a candidate (scored with the blur / PSF of the last step, so that a constant
         # --blur-frac 0 blur is comparable to the tracked steps); they are the only one when an annealing schedule
         # (e.g. --psf-anneal-frac > 1) outlasts the run, as nothing was tracked then
-        if (stochastic and track_from <= args.steps) or track_from >= args.steps:
+        final = [(stochastic and tf <= args.steps) or tf >= args.steps for tf in track_from]
+        if any(final):
             step_buf.fill_(float(args.steps))
-            track_buf.fill_(1.0)
+            track_buf.copy_(flag(final))
             update_best(objective(pose_theta(), t))
     for _, smp in stages:
         smp.set_blur(0.0)
         smp.set_psf_scale(1.0)
-    if int(n_skipped.item()):
-        print(f"\n[align] {int(n_skipped.item())} of {args.steps} steps skipped (non-finite gradient)", flush=True)
-    return dict(theta_deg=best_th.clone(), t=best_t.clone(), best_step=int(best_step.item()), snapshots=snapshots)
+    skipped = [int(x) for x in n_skipped.tolist()]
+    steps_found = [int(x) for x in best_step.tolist()]
+    if not batched:
+        if skipped[0]:
+            print(f"\n[align] {skipped[0]} of {args.steps} steps skipped (non-finite gradient)", flush=True)
+        return dict(theta_deg=best_th.clone(), t=best_t.clone(), best_step=steps_found[0], snapshots=snapshots)
+    return dict(theta_deg=best_th.clone(), t=best_t.clone(), best_step=steps_found, snapshots=snapshots,
+                n_skipped=skipped)
 
 
 # --------------------------------------------------------------------------------------
@@ -2019,10 +2174,13 @@ SAX_LINE_COLUMNS = ["subject_id", "step", "fraction", "is_best", "image_a", "sli
 LONG_AXIS_COLUMNS = ["subject_id", "step", "fraction", "is_best", "p_x", "p_y", "p_z", "d_x", "d_y", "d_z", "radius_mm"]
 
 
-def build_history(sid, data, planes, n_pairs, sampler, snapshots, best_step, lax_rows, args, labels, labels_sax, has_seg) -> dict:
+def build_history(sid, data, planes, n_pairs, sampler, snapshots, best_step, lax_rows, args, labels, labels_sax, has_seg,
+                  line_metrics: list | None = None) -> dict:
     """Affines, poses and metrics of every pose snapshot. Snapshot step 'best' is the pose that is saved/reported,
     re-labelled with the step it was found at; step 0 is the acquired geometry (identity pose). With --sax-sax-weight
-    also the neighbouring-SAX-slice crossing lines of every snapshot ('sax_lines', see SaxNeighbourLines.segment_rows)."""
+    also the neighbouring-SAX-slice crossing lines of every snapshot ('sax_lines', see SaxNeighbourLines.segment_rows).
+    `line_metrics`: the per-line metrics of every snapshot if already evaluated (align_batch evaluates a whole batch's
+    snapshots at once), else sampler.evaluate."""
     nan = float("nan")
     plane_rows, step_rows, sax_line_rows, axis_rows = [], [], [], []
     for step, th, tt in snapshots:
@@ -2039,7 +2197,8 @@ def build_history(sid, data, planes, n_pairs, sampler, snapshots, best_step, lax
             axis_rows.append(dict(subject_id=sid, step=step_no, fraction=step_no / args.steps, is_best=int(is_best),
                                   p_x=float(L0[0]), p_y=float(L0[1]), p_z=float(L0[2]),
                                   d_x=float(ell[0]), d_y=float(ell[1]), d_z=float(ell[2]), radius_mm=sp.radius))
-        lm = sampler.evaluate(th, tt, args, labels, labels_sax, has_seg)
+        lm = (line_metrics[len(step_rows)] if line_metrics is not None
+              else sampler.evaluate(th, tt, args, labels, labels_sax, has_seg))
         with torch.no_grad():
             # the optimized similarity on the mask points
             sim = (lm["nmi"] if args.metric == "nmi" else lm["ncc"] if args.metric == "ncc"
@@ -2082,13 +2241,11 @@ def build_history(sid, data, planes, n_pairs, sampler, snapshots, best_step, lax
     return dict(planes=plane_rows, steps=step_rows, sax_lines=sax_line_rows, long_axis=axis_rows)
 
 
-def annealed_stages(data, planes, sax_planes, lax_planes, final_sampler, args, device) -> list | None:
-    """(start_step, LineSampler) stages for mask-dilation annealing, ending with the nominal sampler.
-
-    The mask dilation goes linearly from --mask-dilation-start-mm to --mask-dilation-mm over the first
-    --mask-anneal-frac of the run, in --anneal-stages discrete steps; the lines are rebuilt at each step.
-    Returns None when mask annealing is off.
-    """
+def annealed_stage_lines(data, planes, lax_planes, args, device) -> tuple[list, int] | None:
+    """The intersection lines of every mask-annealing stage: ([(start_step, lines), ...], anneal_end), or None when
+    mask annealing is off. The mask dilation goes linearly from --mask-dilation-start-mm to --mask-dilation-mm over the
+    first --mask-anneal-frac of the run, in --anneal-stages discrete steps; the lines are rebuilt at each step (a stage
+    without any line is left out; the stage before it then lasts longer)."""
     dil0 = getattr(args, "mask_dilation_start_mm", None)
     n_stages = max(1, getattr(args, "anneal_stages", 6))
     anneal_end = int(round(getattr(args, "mask_anneal_frac", 0.8) * args.steps)) if dil0 is not None else 0
@@ -2099,7 +2256,7 @@ def annealed_stages(data, planes, sax_planes, lax_planes, final_sampler, args, d
     if not dists:                                        # no masked image (segmentation or center disc): nothing to anneal
         return None
     nominal_masks = {p.key: p.mask for p in lax_planes}
-    stages = []
+    out = []
     try:
         for k, start in enumerate(starts):
             dil = dil0 + (args.mask_dilation_mm - dil0) * k / n_stages
@@ -2108,33 +2265,59 @@ def annealed_stages(data, planes, sax_planes, lax_planes, final_sampler, args, d
                     p.mask = (dists[p.image][:, :, p.slice_idx] <= dil).float()[None, None]
             lines = build_lines(planes, args, device)
             if lines:
-                smp = new_sampler(planes, lines, args, device, images=final_sampler.img)
-                attach_sax_pairs(smp, planes, sax_planes, lax_planes, args, device)
-                stages.append((start, smp))
+                out.append((start, lines))
     finally:
         for p in lax_planes:
             p.mask = nominal_masks[p.key]
-    return stages + [(anneal_end, final_sampler)]
+    return out, anneal_end
 
 
-def process_subject(subject: Subject, args, device, on_lines=None) -> tuple:
-    """Align one subject (its slices as handed over by a loader, see SliceImage). Returns the summary row, the
-    per-plane rows, the per-line-pair rows, the per-plane poses (plane, R, t; see corrected_affines) and the
-    pose/metric history (dict with 'planes' and 'steps' row lists, empty unless args.history_every > 0, i.e. with --logging).
+def annealed_stages(data, planes, sax_planes, lax_planes, final_sampler, args, device, stage_lines=None) -> list | None:
+    """(start_step, LineSampler) stages for mask-dilation annealing, ending with the nominal sampler (see
+    annealed_stage_lines; `stage_lines`: its result if already computed). Returns None when mask annealing is off."""
+    sl = annealed_stage_lines(data, planes, lax_planes, args, device) if stage_lines is None else stage_lines
+    if sl is None:
+        return None
+    stages = []
+    for start, lines in sl[0]:
+        smp = new_sampler(planes, lines, args, device, images=final_sampler.img)
+        attach_sax_pairs(smp, planes, sax_planes, lax_planes, args, device)
+        stages.append((start, smp))
+    return stages + [(sl[1], final_sampler)]
 
-    `on_lines(planes, lines)` is called once the intersection lines are known, before alignment.
-    Without args.logging only the poses are computed: no metrics are evaluated, the segmentations stay off the GPU and
-    the summary / per-pair rows and the history are None / empty (the per-plane rows only hold n_pairs).
-    """
-    data = prepare_subject(subject, args)
-    sid = data["subject_id"]
-    nan = float("nan")
+
+def lines_to(lines: list, device) -> list:
+    """(index a, index b, Line) triples with the Line tensors moved to `device`."""
+    def move(x):
+        return None if x is None else x.to(device)
+    return [(ia, ib, dataclasses.replace(line, t=move(line.t), w=move(line.w), w_loss=move(line.w_loss)))
+            for ia, ib, line in lines]
+
+
+def prepare_lines(data: dict, args) -> dict:
+    """The intersection lines of a prepared subject (prepare_subject), built on the CPU: the nominal ones (build_lines)
+    and those of every mask-annealing stage (annealed_stage_lines). They depend only on the acquired geometry and the
+    masks, and come out identical to those built on the GPU (checked on 30 subjects) -- but ~3x faster, as they are
+    many tiny tensor operations; run() builds them in its worker processes (load_job), next to prepare_subject."""
+    cpu = torch.device("cpu")
+    sax_planes, lax_planes = build_planes(data, args, cpu, with_seg=False)
+    planes = sax_planes + lax_planes
+    lines = build_lines(planes, args, cpu)
+    return dict(lines=lines, stage_lines=annealed_stage_lines(data, planes, lax_planes, args, cpu) if lines else None)
+
+
+def prepare_alignment(subject: Subject, args, device, on_lines=None, data: dict | None = None,
+                      pre: dict | None = None) -> dict:
+    """Everything one subject's alignment needs (process_subject's first half): its planes, intersection lines and
+    pose model, the sampler of its nominal geometry and the lines of its mask-annealing stages. `data`: the subject's
+    prepare_subject() if already computed (run() does it in its worker processes, see load_job); `pre`: its
+    prepare_lines() if already computed (idem)."""
+    data = prepare_subject(subject, args) if data is None else data
     log = getattr(args, "logging", True)
     sax_planes, lax_planes = build_planes(data, args, device, with_seg=log)
     planes = sax_planes + lax_planes
-    index = {p.key: i for i, p in enumerate(planes)}
-
-    lines, n_pairs = build_lines(planes, args, device), [0] * len(planes)
+    lines = build_lines(planes, args, device) if pre is None else lines_to(pre["lines"], device)
+    n_pairs = [0] * len(planes)
     for ia, ib, _ in lines:
         n_pairs[ia] += 1
         n_pairs[ib] += 1
@@ -2145,15 +2328,116 @@ def process_subject(subject: Subject, args, device, on_lines=None) -> tuple:
         per_image[p.image] = per_image.get(p.image, 0) + 1
     model = (pose_model(len(sax_planes), len(per_image), args.dof, sum(n > 1 for n in per_image.values()))
              if lines else "none")
+    ctx = dict(data=data, sid=data["subject_id"], log=log, sax_planes=sax_planes, lax_planes=lax_planes, planes=planes,
+               lines=lines, n_pairs=n_pairs, model=model, sampler=None, stage_lines=None)
+    if lines:
+        sampler = new_sampler(planes, lines, args, device)
+        attach_sax_pairs(sampler, planes, sax_planes, lax_planes, args, device)
+        ctx["sampler"] = sampler
+        if pre is None:
+            ctx["stage_lines"] = annealed_stage_lines(data, planes, lax_planes, args, device)
+        elif pre["stage_lines"] is not None:
+            ctx["stage_lines"] = ([(start, lines_to(ls, device)) for start, ls in pre["stage_lines"][0]],
+                                  pre["stage_lines"][1])
+    return ctx
 
+
+def align_one(ctx: dict, args, device) -> dict:
+    """align() of one prepared subject (prepare_alignment)."""
+    stages = annealed_stages(ctx["data"], ctx["planes"], ctx["sax_planes"], ctx["lax_planes"], ctx["sampler"], args,
+                             device, stage_lines=ctx["stage_lines"])
+    return align(ctx["sampler"], args, stages, pose_model=ctx["model"])
+
+
+def label_settings(args, planes) -> tuple[list[int], list[int], bool]:
+    """(labels compared on LAX-LAX lines, on SAX-LAX lines, whether any plane has a segmentation) of the Dice /
+    Hausdorff metrics (loader options; no labels = no label metrics)."""
+    labels = [int(x) for x in getattr(args, "seg_labels", "").split(",") if x.strip()]
+    labels_sax = [int(x) for x in getattr(args, "sax_seg_labels", "").split(",") if x.strip()]
+    return labels, labels_sax, any(p.seg is not None for p in planes)
+
+
+def batchable(args) -> bool:
+    """Whether subjects can share one optimization (align_batch): not with the neighbouring-slice crossing terms
+    (--sax-sax-weight, --sax-gap-reg), which are normalized over a whole sampler; those runs align one at a time."""
+    return not ((getattr(args, "sax_sax_weight", 0.0) > 0 and args.dof == 6) or getattr(args, "sax_gap_reg", 0.0) > 0)
+
+
+def align_batch(ctxs: list[dict], args, device) -> list[dict]:
+    """Align several prepared subjects (prepare_alignment) in one optimization: their planes and lines are put one
+    subject after the other into shared samplers (one per mask-annealing stage), so every step samples all of them in
+    one go, and align() keeps every term per subject (see there). Returns one align() result per subject, as a solo
+    run would. The stages start where any subject's start; a subject uses its own latest stage started by then (its
+    nominal lines, if it has no mask annealing), exactly as in a solo run."""
+    planes, groups, offsets = [], [], []
+    for g, c in enumerate(ctxs):
+        offsets.append(len(planes))
+        planes += c["planes"]
+        groups += [g] * len(c["planes"])
+
+    def merged(lines_of):
+        out = []
+        for g, c in enumerate(ctxs):
+            off = offsets[g]
+            out += [(ia + off, ib + off, line) for ia, ib, line in lines_of(c)]
+        return out
+
+    final = new_sampler(planes, merged(lambda c: c["lines"]), args, device)
+    ends = [c["stage_lines"][1] if c["stage_lines"] else 0 for c in ctxs]
+    starts = sorted({s for c in ctxs if c["stage_lines"] for s, _ in c["stage_lines"][0]})
+
+    def lines_at(c, s):
+        if not c["stage_lines"]:
+            return c["lines"]
+        own = c["stage_lines"][0]
+        active = own[0][1]
+        for start, lines in own:
+            if s >= start:
+                active = lines
+        return active
+
+    stages = [(s, new_sampler(planes, merged(lambda c, s=s: lines_at(c, s)), args, device, images=final.img))
+              for s in starts]
+    if stages:
+        stages.append((max(ends), final))
+    res = align(final, args, stages or None, groups=groups, models=[c["model"] for c in ctxs], anneal_ends=ends)
+    # with logging, the reported metrics of every subject (acquired pose, saved pose, every history snapshot) are
+    # evaluated here for the whole batch at once -- they are per line, so the shared sampler gives each subject's
+    # own values -- instead of one evaluation per subject and snapshot in finish_alignment / build_history
+    metrics = None
+    if getattr(args, "logging", True):
+        labels, labels_sax, has_seg = label_settings(args, planes)
+        zeros = torch.zeros(len(planes), 3, device=device)
+        poses = [(zeros, zeros), (res["theta_deg"], res["t"])] + [(th, tt) for _, th, tt in res["snapshots"]]
+        metrics = [final.evaluate(th, tt, args, labels, labels_sax, has_seg) for th, tt in poses]
+    out, m0 = [], 0
+    for g, c in enumerate(ctxs):
+        lo, hi = offsets[g], offsets[g] + len(c["planes"])
+        m1 = m0 + len(c["lines"])
+        if res["n_skipped"][g]:
+            print(f"\n[align] {c['sid']}: {res['n_skipped'][g]} of {args.steps} steps skipped (non-finite gradient)",
+                  flush=True)
+        r = dict(theta_deg=res["theta_deg"][lo:hi].clone(), t=res["t"][lo:hi].clone(), best_step=res["best_step"][g],
+                 snapshots=[(step, th[lo:hi], tt[lo:hi]) for step, th, tt in res["snapshots"]])
+        if metrics is not None:                      # this subject's lines: m0 .. m1 of the shared sampler
+            mine = [{k: v[m0:m1] for k, v in lm.items()} for lm in metrics]
+            r["line_metrics"] = dict(zero=mine[0], final=mine[1], snapshots=mine[2:])
+        out.append(r)
+        m0 = m1
+    return out
+
+
+def finish_alignment(ctx: dict, result: dict | None, args, device) -> tuple:
+    """process_subject's second half: metrics, history and rows of a prepared subject (prepare_alignment) aligned to
+    `result` (align(); None when it has no lines)."""
+    data, sid, log = ctx["data"], ctx["sid"], ctx["log"]
+    planes, lines, n_pairs, model = ctx["planes"], ctx["lines"], ctx["n_pairs"], ctx["model"]
+    sax_planes, lax_planes = ctx["sax_planes"], ctx["lax_planes"]
+    nan = float("nan")
     N = len(planes)
     if not log:                                      # alignment only
         theta, t_rel = np.zeros((N, 3)), np.zeros((N, 3))
         if lines:
-            sampler = new_sampler(planes, lines, args, device)
-            attach_sax_pairs(sampler, planes, sax_planes, lax_planes, args, device)
-            result = align(sampler, args, annealed_stages(data, planes, sax_planes, lax_planes, sampler, args, device),
-                           pose_model=model)
             theta = result["theta_deg"].cpu().numpy().astype(np.float64)
             t_rel = relative_translation(result["t"], lax_reference_rows(planes, n_pairs))
         Rs = rotation_matrices(theta)
@@ -2169,18 +2453,14 @@ def process_subject(subject: Subject, args, device, on_lines=None) -> tuple:
     t_rel = np.zeros((N, 3))
     theta = np.zeros((N, 3))
     if lines:
-        sampler = new_sampler(planes, lines, args, device)
-        attach_sax_pairs(sampler, planes, sax_planes, lax_planes, args, device)
+        sampler = ctx["sampler"]
         n_points = [float(sampler.npts[idx].sum()) for idx in sampler.plane_lines]
-        # segmentation labels compared by the Dice / Hausdorff metrics (loader options; none = no label metrics)
-        labels = [int(x) for x in getattr(args, "seg_labels", "").split(",") if x.strip()]
-        labels_sax = [int(x) for x in getattr(args, "sax_seg_labels", "").split(",") if x.strip()]
-        has_seg = any(p.seg is not None for p in planes)
+        labels, labels_sax, has_seg = label_settings(args, planes)
         zeros = torch.zeros(N, 3, device=device)
-        line_zero = sampler.evaluate(zeros, zeros, args, labels, labels_sax, has_seg)
-        result = align(sampler, args, annealed_stages(data, planes, sax_planes, lax_planes, sampler, args, device),
-                       pose_model=model)
-        line_final = sampler.evaluate(result["theta_deg"], result["t"], args, labels, labels_sax, has_seg)
+        lmet = result.get("line_metrics")            # evaluated for the whole batch (align_batch), else here
+        line_zero = lmet["zero"] if lmet else sampler.evaluate(zeros, zeros, args, labels, labels_sax, has_seg)
+        line_final = (lmet["final"] if lmet
+                      else sampler.evaluate(result["theta_deg"], result["t"], args, labels, labels_sax, has_seg))
         for stage, lm in (("zero", line_zero), ("final", line_final)):
             for k in metric_names:
                 agg = sampler.per_plane_max if k == "hd" else sampler.per_plane      # Hausdorff: worst line per plane
@@ -2221,7 +2501,8 @@ def process_subject(subject: Subject, args, device, on_lines=None) -> tuple:
         if result["snapshots"]:
             snaps = result["snapshots"] + [("best", result["theta_deg"], result["t"])]
             history = build_history(sid, data, planes, n_pairs, sampler, snaps, result["best_step"], lax_rows,
-                                    args, labels, labels_sax, has_seg)
+                                    args, labels, labels_sax, has_seg,
+                                    line_metrics=lmet["snapshots"] + [lmet["final"]] if lmet else None)
     Rs = rotation_matrices(theta)
     poses = [(p, Rs[i], t_rel[i]) for i, p in enumerate(planes)]
 
@@ -2281,6 +2562,62 @@ def process_subject(subject: Subject, args, device, on_lines=None) -> tuple:
         **sax_qc, n_line_pairs=sum(d["kind"] not in NEIGHBOUR_KINDS for d in pairs), steps=args.steps if lines else 0,
     )
     return summary, details, pairs, poses, history
+
+
+def process_subject(subject: Subject, args, device, on_lines=None) -> tuple:
+    """Align one subject (its slices as handed over by a loader, see SliceImage). Returns the summary row, the
+    per-plane rows, the per-line-pair rows, the per-plane poses (plane, R, t; see corrected_affines) and the
+    pose/metric history (dict with 'planes' and 'steps' row lists, empty unless args.history_every > 0, i.e. with --logging).
+
+    `on_lines(planes, lines)` is called once the intersection lines are known, before alignment.
+    Without args.logging only the poses are computed: no metrics are evaluated, the segmentations stay off the GPU and
+    the summary / per-pair rows and the history are None / empty (the per-plane rows only hold n_pairs).
+    """
+    ctx = prepare_alignment(subject, args, device, on_lines)
+    result = align_one(ctx, args, device) if ctx["lines"] else None
+    return finish_alignment(ctx, result, args, device)
+
+
+def process_subjects(subjects: list[Subject], args, device, on_lines: list | None = None,
+                     datas: list | None = None, pres: list | None = None) -> list:
+    """process_subject for several subjects, aligned together in one optimization (align_batch, --batch-size): per
+    subject its result tuple, or the exception it raised. Subjects without lines are not optimized (as alone); a
+    subject failing to prepare or finish fails alone; if the shared optimization fails (e.g. out of GPU memory), its
+    subjects are aligned one at a time instead. Without batchable(args), every subject is aligned alone. `datas`: each
+    subject's prepare_subject() and `pres` its prepare_lines() if already computed (run(): in the worker processes)."""
+    ctxs = []
+    for i, s in enumerate(subjects):
+        try:
+            ctxs.append(prepare_alignment(s, args, device, on_lines[i] if on_lines else None,
+                                          datas[i] if datas else None, pres[i] if pres else None))
+        except Exception as e:  # noqa: BLE001
+            ctxs.append(e)
+    live = [c for c in ctxs if not isinstance(c, Exception) and c["lines"]]
+    results = {}
+    if len(live) > 1 and batchable(args):
+        try:
+            results = {id(c): r for c, r in zip(live, align_batch(live, args, device))}
+        except Exception as e:  # noqa: BLE001
+            print(f"\n[batch] aligning {len(live)} subjects together failed ({type(e).__name__}: {e}); "
+                  f"aligning them one at a time", flush=True)
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            results = {}
+    out = []
+    for c in ctxs:
+        if isinstance(c, Exception):
+            out.append(c)
+            continue
+        try:
+            r = None
+            if c["lines"]:
+                r = results.get(id(c))
+                if r is None:
+                    r = align_one(c, args, device)
+            out.append(finish_alignment(c, r, args, device))
+        except Exception as e:  # noqa: BLE001
+            out.append(e)
+    return out
 
 
 RELMOTION_COLUMNS = ["subject_id", "kind", "slice_a", "slice_b", "n_pairs", "dx_mm", "dy_mm", "dz_mm",
@@ -2982,8 +3319,35 @@ def fmt_row(row: dict) -> dict:
 NAME_EXCLUDED = {"root", "out_root", "run_name", "logging", "history_every", "no_cuda_graph", "max_subjects", "skip_processed",
                  "device", "workers", "step_progress"}
 HISTORY_EVERY = 0.02    # with --logging: pose/metric snapshot every this fraction of the run (plus step 0 and the best pose)
+def _worker_init():
+    """Worker processes of run(): one thread each (the run has as many processes as --workers), no GPU."""
+    torch.set_num_threads(1)
+
+
+def load_job(load, is_complete, subj_dir: Path, out_dir: Path, args):
+    """Worker process: SKIPPED_JOB when --skip-processed finds the subject complete, else (subject, data, pre) -- the
+    subject without its pixels (the main process only needs its slices' geometry and identity; the images are
+    written by save_job, which reads them again), its prepare_subject() (the frames used, masks and distance maps)
+    and its prepare_lines() (intersection lines of every mask stage), None when it has nothing to align. The CPU
+    work of loading and preparing runs here, in parallel."""
+    if args.skip_processed and is_complete(subj_dir, out_dir):
+        return SKIPPED_JOB
+    subject = load(subj_dir, args)
+    data = prepare_subject(subject, args) if subject.slices and subject.status == "ok" else None
+    pre = prepare_lines(data, args) if data is not None and (data["sax"] or data["lax"]) else None
+    light = Subject(subject.subject_id, [dataclasses.replace(s, data=None, seg=None) for s in subject.slices],
+                    subject.status)
+    return light, data, pre
+
+
+def save_job(load, save, subj_dir: Path, affines: list, out_dir: Path, args) -> None:
+    """Worker process: write the subject with the given affines (save), reading its images from subj_dir again (a
+    worker's CPU time instead of moving the full images between processes)."""
+    save(load(subj_dir, args), affines, out_dir, args)
+
+
 RESCAN_SECONDS = 30.0   # how often --root is rescanned for new subjects while others are still queued
-SKIPPED = object()      # run(): a subject found complete (--skip-processed) instead of a loaded one
+SKIPPED_JOB = "__skipped__"   # load_job(): the subject was found complete (--skip-processed)
 
 
 def write_run_config(out_dir: Path, args) -> None:
@@ -3400,7 +3764,15 @@ def build_parser(description: str) -> argparse.ArgumentParser:
     g.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu",
                    help="Device for the alignment. Default: %(default)s")
     g.add_argument("--workers", type=int, default=4,
-                   help="Background threads for loading and writing image files. Default: %(default)s")
+                   help="Worker processes for the CPU work around the alignment: loading and preparing subjects "
+                        "(masks, distance maps), writing the aligned images and the per-subject metrics and figures. "
+                        "Up to about the number of CPU cores (each holds a few subjects in memory). Default: %(default)s")
+    g.add_argument("--batch-size", type=int, default=1,
+                   help="Subjects aligned together in one optimization (align_batch): their planes and lines share the "
+                        "samplers, so each step samples all of them at once, while every term stays per subject (the "
+                        "result of each is that of a solo run, up to floating-point rounding). Raises GPU utilization "
+                        "and throughput; GPU memory grows about linearly with it. Not with --sax-sax-weight / "
+                        "--sax-gap-reg (then 1). Default: %(default)s")
     g.add_argument("--no-cuda-graph", action="store_true",
                    help="Run each optimization step eagerly instead of replaying a captured CUDA graph (same result, "
                         "slower; for debugging)")
@@ -3470,12 +3842,6 @@ def run(ap: argparse.ArgumentParser, args, load, save, is_complete) -> tuple[Pat
         seen.update(d.name for d in new)
         return new
 
-    def load_or_skip(subj_dir: Path, args_):
-        """The subject (load), or SKIPPED when --skip-processed finds its aligned images complete."""
-        if args_.skip_processed and is_complete(subj_dir, run_dir / subj_dir.name):
-            return SKIPPED
-        return load(subj_dir, args_)
-
     print(f"Scanning {args.root} for subject folders ...", flush=True)
     subjects = scan()
     print(f"Found {len(subjects)} subject folder(s); aligning on {device}, outputs in {run_dir}"
@@ -3499,19 +3865,25 @@ def run(ap: argparse.ArgumentParser, args, load, save, is_complete) -> tuple[Pat
     save_jobs = deque()                                   # (subject, description, future) for background writes
     failed, unaligned = [], []
     try:
-        with ThreadPoolExecutor(max_workers=args.workers) as ex:
+        # worker processes (not threads: loading, preparing, gzip-writing and plotting are CPU work that threads
+        # would serialize on the interpreter lock), started fresh ("spawn": never forked from a process using CUDA)
+        n_workers = max(1, min(args.workers, 61) if os.name == "nt" else args.workers)
+        with ProcessPoolExecutor(max_workers=n_workers, mp_context=multiprocessing.get_context("spawn"),
+                                 initializer=_worker_init) as ex:
             it = iter(subjects)
             queue = deque()
             capped = args.max_subjects >= 0                   # total: the folders found, or --max-subjects
             pbar = tqdm(total=min(len(subjects), args.max_subjects) if capped else len(subjects), unit="subj")
             last_scan = time.time()
 
+            batch_size = max(1, getattr(args, "batch_size", 1))
+
             def top_up():
-                """Keep 2 x --workers subjects loading ahead. When the known subjects run out, rescan --root for
+                """Keep 2 x --workers (at least 2 x --batch-size) subjects loading ahead. When the known subjects run out, rescan --root for
                 subjects written since (e.g. by a concurrently running download): at most every
                 RESCAN_SECONDS while others are still queued, always once the queue is empty."""
                 nonlocal it, last_scan, budget
-                while len(queue) < 2 * args.workers:
+                while len(queue) < max(2 * args.workers, 2 * batch_size):
                     if budget == 0:                       # --max-subjects reached (skipped ones are given back)
                         return
                     nxt = next(it, None)
@@ -3530,93 +3902,136 @@ def run(ap: argparse.ArgumentParser, args, load, save, is_complete) -> tuple[Pat
                         continue
                     if budget > 0:
                         budget -= 1
-                    queue.append((nxt, ex.submit(load_or_skip, nxt, args)))
+                    queue.append((nxt, ex.submit(load_job, load, is_complete, nxt, run_dir / nxt.name, args)))
+
+            def loaded(subj, fut):
+                """The load job's result, or its exception. A job that failed is loaded once more here, in this
+                process: a worker can fail to send back a subject it loaded fine (Windows pipes refuse large writes
+                under memory pressure: WinError 1450), while a real load error fails again here as well."""
+                try:
+                    return fut.result()
+                except Exception as err:  # noqa: BLE001
+                    print(f"\nLoading {subj.name} in a worker failed ({type(err).__name__}: {err}); retrying here",
+                          flush=True)
+                    try:
+                        return load_job(load, is_complete, subj, run_dir / subj.name, args)
+                    except Exception as err2:  # noqa: BLE001
+                        return err2
 
             top_up()
             while queue:
-                subj, fut = queue.popleft()
-                try:
-                    skip = fut.result() is SKIPPED
-                except Exception:  # noqa: BLE001              (load errors are reported below)
-                    skip = False
-                if skip:                                      # already complete (--skip-processed)
-                    n_skipped += 1
-                    if budget >= 0:
-                        budget += 1
-                    if hasattr(pbar, "total"):
-                        if not capped:                    # (capped: another folder takes its place)
-                            pbar.total -= 1
-                        pbar.set_postfix(skipped=n_skipped)
+                # the next --batch-size loaded subjects (those found complete are skipped as they come up)
+                batch = []
+                while queue and len(batch) < batch_size:
+                    subj, fut = queue.popleft()
+                    res = loaded(subj, fut)
+                    skip = isinstance(res, str) and res == SKIPPED_JOB
+                    if skip:                                      # already complete (--skip-processed)
+                        n_skipped += 1
+                        if budget >= 0:
+                            budget += 1
+                        if hasattr(pbar, "total"):
+                            if not capped:                    # (capped: another folder takes its place)
+                                pbar.total -= 1
+                            pbar.set_postfix(skipped=n_skipped)
+                        top_up()
+                        continue
+                    batch.append((subj, res))
                     top_up()
+                if not batch:
                     continue
-                top_up()
                 t0 = time.time()
-                metrics_dir = run_dir / subj.name / "metrics"
-                summary, details, pairs, history = None, [], [], None
 
-                def on_lines(planes, lines, sid=subj.name, out=metrics_dir):
-                    if not lines:
-                        return
-                    out.mkdir(parents=True, exist_ok=True)
-                    save_line_geometry(planes, lines, out, args.line_extent_mm, args.line_step_mm)
-                    viz = mask_plot_data(planes, lines, args.line_extent_mm, args.line_step_mm)
-                    save_jobs.append((sid, "mask plot", ex.submit(save_mask_plot, viz, sid, args.mask_dilation_mm,
-                                                                  out / "mask_overlay.png", args.line_extent_mm)))
+                def lines_callback(sid, out):
+                    def on_lines(planes, lines):
+                        if not lines:
+                            return
+                        out.mkdir(parents=True, exist_ok=True)
+                        save_line_geometry(planes, lines, out, args.line_extent_mm, args.line_step_mm)
+                        viz = mask_plot_data(planes, lines, args.line_extent_mm, args.line_step_mm)
+                        save_jobs.append((sid, "mask plot", ex.submit(save_mask_plot, viz, sid, args.mask_dilation_mm,
+                                                                      out / "mask_overlay.png", args.line_extent_mm)))
+                    return on_lines
 
-                status = "ok"
-                try:
-                    subject = fut.result()
-                    status = subject.status if subject.slices else "no_images"
-                    poses = []
-                    if status == "ok":
-                        summary, details, pairs, poses, history = process_subject(
-                            subject, args, device, on_lines=on_lines if args.logging else None)
-                        if not any(d["n_pairs"] > 0 for d in details):
-                            status = "not_optimized"                 # no crossing planes: written unaligned
-                        for row in sax_relative_motion(subj.name, poses, [d["n_pairs"] for d in details]):
-                            relmotion_writer.writerow(fmt_row(row))
-                        relmotion_f.flush()
-                    if args.save_images:          # whatever could be loaded, aligned or not (folder created regardless)
-                        out_dir = run_dir / subj.name
-                        out_dir.mkdir(parents=True, exist_ok=True)
-                        save_jobs.append((subj.name, "aligned images",
-                                          ex.submit(save, subject, corrected_affines(subject, poses), out_dir, args)))
-                except Exception as e:  # noqa: BLE001
-                    traceback.print_exc()
-                    status = f"error: {type(e).__name__}: {e}"[:200]
-                if status in ("not_optimized", "no_images"):
-                    unaligned.append((subj.name, status))
-                elif status != "ok":
-                    failed.append((subj.name, status))
-                if args.logging:
-                    summary = summary if summary is not None else empty_summary(subj.name, status)
-                    summary["seconds"] = round(time.time() - t0, 2)
-                    summary["timestamp"] = datetime.now().isoformat(timespec="seconds")
-                    if details:
-                        save_jobs.append((subj.name, "subject metrics", ex.submit(save_subject_metrics, dict(summary), details,
-                                                                                 pairs, metrics_dir, True, history)))
-                    (sf, swriter), (df_, dwriter), (pf, pwriter) = writers
-                    swriter.writerow(fmt_row(summary))
-                    for row in details:
-                        dwriter.writerow(fmt_row(row))
-                    for row in pairs:
-                        pwriter.writerow(fmt_row(row))
-                    for f, _ in writers:
-                        f.flush()
-                while len(save_jobs) > 3 * args.workers:
-                    name, what, job = save_jobs.popleft()
+                entries = []
+                for subj, res in batch:
+                    e = dict(subj=subj, metrics_dir=run_dir / subj.name / "metrics", subject=None, data=None,
+                             pre=None, status="ok", out=None)
                     try:
-                        job.result()
-                    except Exception:  # noqa: BLE001
-                        print(f"Writing {what} failed for {name}:")
-                        traceback.print_exc()
-                if hasattr(pbar, "set_postfix"):
-                    post = dict(subj=subj.name, status=status[:12], **(dict(skipped=n_skipped) if n_skipped else {}))
-                    if summary is not None:
-                        post.update(ncc=f"{summary['ncc_mean']:.2f}", jitter=f"{summary['sax_shift_jitter_mm']:.1f}")
-                    pbar.set_postfix(**post)
-                    pbar.update(1)
-                if not queue:                              # subjects written while this one was aligned
+                        if isinstance(res, Exception):
+                            raise res
+                        e["subject"], e["data"], e["pre"] = res
+                        e["status"] = e["subject"].status if e["subject"].slices else "no_images"
+                    except Exception as err:  # noqa: BLE001
+                        traceback.print_exception(err)
+                        e["status"] = f"error: {type(err).__name__}: {err}"[:200]
+                    entries.append(e)
+                todo = [e for e in entries if e["status"] == "ok"]
+                if todo:                                  # aligned together (--batch-size; alone when 1)
+                    outs = process_subjects([e["subject"] for e in todo], args, device,
+                                            [lines_callback(e["subj"].name, e["metrics_dir"]) if args.logging else None
+                                             for e in todo], [e["data"] for e in todo], [e["pre"] for e in todo])
+                    for e, o in zip(todo, outs):
+                        e["out"] = o
+                seconds = (time.time() - t0) / len(entries)      # the batch's time, shared by its subjects
+
+                for e in entries:
+                    subj, subject, status, metrics_dir = e["subj"], e["subject"], e["status"], e["metrics_dir"]
+                    summary, details, pairs, history = None, [], [], None
+                    try:
+                        poses = []
+                        if status == "ok":
+                            if isinstance(e["out"], Exception):
+                                raise e["out"]
+                            summary, details, pairs, poses, history = e["out"]
+                            if not any(d["n_pairs"] > 0 for d in details):
+                                status = "not_optimized"                 # no crossing planes: written unaligned
+                            for row in sax_relative_motion(subj.name, poses, [d["n_pairs"] for d in details]):
+                                relmotion_writer.writerow(fmt_row(row))
+                            relmotion_f.flush()
+                        if args.save_images and subject is not None:   # whatever could be loaded, aligned or not
+                            out_dir = run_dir / subj.name
+                            out_dir.mkdir(parents=True, exist_ok=True)
+                            save_jobs.append((subj.name, "aligned images",
+                                              ex.submit(save_job, load, save, subj, corrected_affines(subject, poses),
+                                                        out_dir, args)))
+                    except Exception as err:  # noqa: BLE001
+                        traceback.print_exception(err)
+                        status = f"error: {type(err).__name__}: {err}"[:200]
+                    if status in ("not_optimized", "no_images"):
+                        unaligned.append((subj.name, status))
+                    elif status != "ok":
+                        failed.append((subj.name, status))
+                    if args.logging:
+                        summary = summary if summary is not None else empty_summary(subj.name, status)
+                        summary["seconds"] = round(seconds, 2)
+                        summary["timestamp"] = datetime.now().isoformat(timespec="seconds")
+                        if details:
+                            save_jobs.append((subj.name, "subject metrics", ex.submit(save_subject_metrics, dict(summary),
+                                                                                     details, pairs, metrics_dir, True,
+                                                                                     history)))
+                        (sf, swriter), (df_, dwriter), (pf, pwriter) = writers
+                        swriter.writerow(fmt_row(summary))
+                        for row in details:
+                            dwriter.writerow(fmt_row(row))
+                        for row in pairs:
+                            pwriter.writerow(fmt_row(row))
+                        for f, _ in writers:
+                            f.flush()
+                    while len(save_jobs) > 3 * args.workers:
+                        name, what, job = save_jobs.popleft()
+                        try:
+                            job.result()
+                        except Exception:  # noqa: BLE001
+                            print(f"Writing {what} failed for {name}:")
+                            traceback.print_exc()
+                    if hasattr(pbar, "set_postfix"):
+                        post = dict(subj=subj.name, status=status[:12], **(dict(skipped=n_skipped) if n_skipped else {}))
+                        if summary is not None:
+                            post.update(ncc=f"{summary['ncc_mean']:.2f}", jitter=f"{summary['sax_shift_jitter_mm']:.1f}")
+                        pbar.set_postfix(**post)
+                        pbar.update(1)
+                if not queue:                              # subjects written while these were aligned
                     top_up()
             for name, what, job in save_jobs:
                 try:
