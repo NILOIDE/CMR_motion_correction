@@ -4,7 +4,7 @@
 #SBATCH --output=/u/home/stol/results/SLICE_ALIGN/%j.out  # Standard output of the script (the folder must exist)
 #SBATCH --mem=48G
 #SBATCH --gres=gpu:1,gpumem:24G
-#SBATCH --cpus-per-task=8   # Number of processor cores
+#SBATCH --cpus-per-task=40   # Number of processor cores
 #SBATCH --time=4-00:00:00
 
 # Submit from the repository root:  sbatch submit_alignment.sh [extra moco_nifti.py arguments]

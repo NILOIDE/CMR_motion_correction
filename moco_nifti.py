@@ -307,7 +307,8 @@ def main():
     g.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu",
                    help="Device for the alignment. Default: %(default)s")
     g.add_argument("--workers", type=int, default=4,
-                   help="Background threads for loading and writing image files. Default: %(default)s")
+                   help="Worker processes for loading and preparing subjects and writing their images, metrics and "
+                        "figures (CPU work, in parallel); up to about the number of CPU cores. Default: %(default)s")
     g.add_argument("--no-cuda-graph", action="store_true",
                    help="Run each optimization step eagerly instead of replaying a captured CUDA graph (same result, "
                         "slower; for debugging)")
