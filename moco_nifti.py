@@ -311,7 +311,7 @@ def main():
     g.add_argument("--no-cuda-graph", action="store_true",
                    help="Run each optimization step eagerly instead of replaying a captured CUDA graph (same result, "
                         "slower; for debugging)")
-    g.add_argument("--sample-dtype", choices=["float32", "float16", "bfloat16"], default="float32",
+    g.add_argument("--sample-dtype", choices=["float32", "float16", "bfloat16"], default="float16",
                    help="Precision of the images held on the GPU and of their sampling along the intersection lines (the "
                         "bulk of the memory for many slices): float16 halves the image memory and the sampled tensors; it "
                         "holds integer intensities up to 2048 exactly (brighter images are scaled by a power of two; the "

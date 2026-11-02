@@ -293,11 +293,76 @@ def center_disc_dist(affines: np.ndarray, shape: tuple, radius_mm: float) -> np.
     return out
 
 
+def apex_direction(sax: list[tuple[np.ndarray, tuple, np.ndarray | None]],
+                   lax: list[tuple[np.ndarray, np.ndarray | None]] = ()) -> np.ndarray | None:
+    """Unit vector (world) from the base of the SAX stack to its apex, or None with fewer than two slices.
+    sax: per SAX slice in stack order (affine, in-plane shape (X, Y), segmentation or None); lax: per LAX view
+    (affine, segmentation (X, Y, ...) or None). The stack axis is oriented by anatomy: in the LAX segmentations the atria
+    (labels 4, 5) lie at the base and the LV blood pool (label 1) toward the apex, so the apex is on the side of the LV
+    centroid relative to the atria centroid (summed over the views). Without both in any view: the UKBB convention,
+    slice 0 basal (the anatomy agreed with it on 22 of 22 test subjects; the SAX segmented area does not tell, as the
+    basal-most slices lie above the ventricles and are empty)."""
+    if len(sax) < 2:
+        return None
+    centres = [(A @ np.array([(sh[0] - 1) / 2.0, (sh[1] - 1) / 2.0, 0.0, 1.0]))[:3] for A, sh, _ in sax]
+    d = centres[-1] - centres[0]
+    if np.linalg.norm(d) < 1e-6:
+        return None
+    d = d / np.linalg.norm(d)
+    vote = 0.0
+    for A, g in lax:
+        if g is None:
+            continue
+        g = np.asarray(g)
+        g = g.reshape(g.shape[0], g.shape[1], -1).max(-1)
+        cs = []
+        for m in (g == 1, np.isin(g, (4, 5))):
+            ij = np.argwhere(m)
+            cs.append(None if len(ij) < 20 else (np.asarray(A, float) @ np.r_[ij.mean(0), 0.0, 1.0])[:3])
+        if cs[0] is not None and cs[1] is not None:
+            vote += float((cs[0] - cs[1]) @ d)
+    return -d if vote < 0 else d
+
+
+def _shift2d(a: np.ndarray, di: int, dj: int) -> np.ndarray:
+    """a shifted by (di, dj) pixels, zero-filled."""
+    out = np.zeros_like(a)
+    X, Y = a.shape
+    if abs(di) >= X or abs(dj) >= Y:
+        return out
+    out[max(di, 0):X + min(di, 0), max(dj, 0):Y + min(dj, 0)] = a[max(-di, 0):X - max(di, 0), max(-dj, 0):Y - max(dj, 0)]
+    return out
+
+
+def apical_sweep(heart: np.ndarray, affine: np.ndarray, apex: np.ndarray | None, extend_mm: float) -> np.ndarray:
+    """The heart region (X, Y) of a long-axis slice swept toward the apex by extend_mm: the union of its copies
+    shifted 0 ... extend_mm along the in-plane projection of `apex` (the base-to-apex direction), at most one pixel
+    apart. The dilated mask measured from it (--mask-dilation-mm, annealed) then reaches extend_mm further past the
+    apex, whatever the segmentation does there (apical segmentations are often incomplete). Unchanged when the slice
+    plane is far from containing the long axis (projection < half), or without a direction."""
+    if apex is None or extend_mm <= 0 or not heart.any():
+        return heart
+    M = np.asarray(affine, float)[:3, :3]
+    n = np.cross(M[:, 0], M[:, 1])
+    n /= np.linalg.norm(n)
+    u = apex - (apex @ n) * n
+    if np.linalg.norm(u) < 0.5:
+        return heart
+    u /= np.linalg.norm(u)
+    v = np.array([u @ M[:, 0] / (M[:, 0] @ M[:, 0]), u @ M[:, 1] / (M[:, 1] @ M[:, 1])])   # pixels per mm along u
+    steps = max(1, int(math.ceil(extend_mm * np.abs(v).max())))
+    out = heart.copy()
+    for k in range(1, steps + 1):
+        di, dj = np.rint(k / steps * extend_mm * v).astype(int)
+        out |= _shift2d(heart, int(di), int(dj))
+    return out
+
+
 def prepare_subject(subject: Subject, args) -> dict:
     """The internal form of a subject: --n-frames evenly spaced frames per slice (the same number for every slice),
     SAX slices one by one, every other image as a stack (X, Y, Z, F) with per-slice affines (Z, 4, 4), and, for images
     with a segmentation, the dilated heart mask (--mask-dilation-mm) and the distance to the heart (mm, for mask
-    annealing) per slice. A non-SAX image whose segmentation contains no heart is left out of the alignment (it is
+    annealing) per slice; with --apex-extend-mm the heart region is first swept toward the apex (apical_sweep). A non-SAX image whose segmentation contains no heart is left out of the alignment (it is
     still written, unaligned, by the loader); one without a segmentation takes part unmasked, or with
     --center-mask-radius-mm > 0 masked by a disc around its stack's centre (center_disc_dist)."""
     out = dict(subject_id=subject.subject_id, status=subject.status, sax=[], lax={}, order=[])
@@ -315,6 +380,9 @@ def prepare_subject(subject: Subject, args) -> dict:
     for s in sorted((s for s in subject.slices if s.image == "SAX"), key=lambda s: s.index):
         out["sax"].append(dict(index=s.index, arr=frames(s.data)[:, :, None].astype(np.float32), affine=s.affine,
                                seg=None if s.seg is None else frames(s.seg)[:, :, None], thickness=s.thickness))
+    extend = getattr(args, "apex_extend_mm", 0.0)
+    apex = (apex_direction([(e["affine"], e["arr"].shape[:2], e["seg"]) for e in out["sax"]],
+                           [(s.affine, s.seg) for s in subject.slices if s.image != "SAX"]) if extend > 0 else None)
     for image in out["order"]:
         if image == "SAX":
             continue
@@ -338,7 +406,8 @@ def prepare_subject(subject: Subject, args) -> dict:
             dist = np.full(heart.shape, np.inf, np.float32)                          # inf: slice without heart
             for z in range(len(sl)):
                 if heart[:, :, z].any():
-                    dist[:, :, z] = distance_transform_edt(~heart[:, :, z], sampling=spacing)
+                    h = apical_sweep(heart[:, :, z], sl[z].affine, apex, extend)
+                    dist[:, :, z] = distance_transform_edt(~h, sampling=spacing)
             entry.update(dist=dist, mask=dist <= args.mask_dilation_mm)
         elif getattr(args, "center_mask_radius_mm", 0.0) > 0:                       # no segmentation: default disc
             dist = center_disc_dist(entry["affine"], arr.shape[:2], args.center_mask_radius_mm)
@@ -1519,6 +1588,7 @@ OPTIMIZERS = ("adam", "nadam", "radam", "adamax", "rmsprop", "adagrad", "sgd")
 # default learning rates (translation mm, rotation deg) per optimizer when --lr / --rot-lr are not given. The adaptive
 # methods take steps of about lr per iteration whatever the gradient scale; Adagrad's steps shrink like 1/sqrt(step),
 # so it needs a larger lr; plain SGD steps are lr * gradient, and the NCC objective's gradients are small (see --lr).
+LR_END_FRACTION = 0.5                    # default end learning rate of the linear schedule, as a fraction of the start
 DEFAULT_LR = {"adam": (0.2, 0.04), "nadam": (0.2, 0.04), "radam": (0.2, 0.04), "adamax": (0.2, 0.04),
               "rmsprop": (0.2, 0.04), "adagrad": (1.0, 0.2), "sgd": (80.0, 20.0)}
 
@@ -1657,6 +1727,10 @@ def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]
     # SAX stack regularizers over adjacent slices (a, b = slice z, z + 1); the plane normals and centres are the same
     # in every stage sampler
     tilt_prior = getattr(args, "tilt_prior", 0.0) if rotate else 0.0
+    shift_prior = getattr(args, "shift_prior", 0.0)
+    shift_free = getattr(args, "shift_free_mm", 20.0)
+    rot_prior = getattr(args, "rot_prior", 0.0) if rotate else 0.0
+    rot_free = getattr(args, "rot_free_deg", 10.0)
     w_tilt_hinge = getattr(args, "tilt_hinge_reg", 0.0) if rotate else 0.0
     tilt_hinge_deg = getattr(args, "tilt_hinge_deg", 5.0)
     w_spacing = getattr(args, "spacing_reg", 0.0)
@@ -1689,6 +1763,12 @@ def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]
             tilt = theta_deg - (theta_deg * smp.Nrm).sum(1, keepdim=True) * smp.Nrm
             tilt_deg = tilt.pow(2).sum(1).clamp_min(1e-12).sqrt()          # = rot_tilt_deg; finite gradient at 0
             prior = prior + tilt_prior * torch.relu(tilt_deg - tilt_hinge_deg).pow(2).mean()
+        if shift_prior > 0:                    # each plane's shift from its acquired pose beyond --shift-free-mm (mm^2)
+            shift = t.pow(2).sum(1).clamp_min(1e-12).sqrt()                 # finite gradient at 0
+            prior = prior + shift_prior * torch.relu(shift - shift_free).pow(2).mean()
+        if rot_prior > 0:                      # each plane's rotation angle beyond --rot-free-deg (deg^2)
+            angle = theta_deg.pow(2).sum(1).clamp_min(1e-12).sqrt()
+            prior = prior + rot_prior * torch.relu(angle - rot_free).pow(2).mean()
         return score - gauge - prior - (stack_penalty(theta_deg, t) if stack_reg else 0.0) - sax_pair_penalty(smp, theta_deg, t)
 
     # stochastic line-pair dropping: each step samples only a random subset of round(--pair-keep x M) of the
@@ -1744,6 +1824,39 @@ def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]
 
     params_all = [p for g in param_groups for p in g["params"]]
     n_skipped = torch.zeros((), **f32)                   # steps skipped for a non-finite gradient
+    # step cap (--max-step-mm / --max-step-deg): after each optimizer step, a plane whose translation moved more than
+    # the cap (Euclidean, mm), or whose rotation vector changed more than the cap (deg; for --pose inplane its angle),
+    # is moved back along its step to the cap. One large gradient (a degenerate line, a mask-annealing switch) can then
+    # move a plane only a few mm per step instead of throwing it out of the image overlap, where its lines go flat and
+    # nothing brings it back. Tensor ops on buffers allocated here, so it runs inside the captured CUDA graph.
+    caps = []
+    if getattr(args, "max_step_mm", 0.0) > 0:
+        caps.append((t, torch.zeros_like(t), float(args.max_step_mm)))
+    if rotate and getattr(args, "max_step_deg", 0.0) > 0:
+        rp = phi if inplane else theta_deg
+        caps.append((rp, torch.zeros_like(rp), float(args.max_step_deg)))
+
+    def cap_steps():
+        with torch.no_grad():
+            for p, prev, limit in caps:
+                d = p - prev
+                n = d.pow(2).sum(1, keepdim=True).sqrt()
+                p.copy_(prev + d * (limit / n.clamp_min(1e-12)).clamp(max=1.0))
+
+    # hard limits (--max-shift-mm / --max-rot-deg): a plane's translation (Euclidean, mm) and rotation angle (deg) from
+    # its acquired pose never exceed them -- after each step a plane beyond is projected back onto the limit (same
+    # direction), so no slice can leave the cluster whatever the gradients do. Graph-safe like the step cap.
+    limits = []
+    if getattr(args, "max_shift_mm", 0.0) > 0:
+        limits.append((t, float(args.max_shift_mm)))
+    if rotate and getattr(args, "max_rot_deg", 0.0) > 0:
+        limits.append((phi if inplane else theta_deg, float(args.max_rot_deg)))
+
+    def apply_limits():
+        with torch.no_grad():
+            for p, limit in limits:
+                n = p.pow(2).sum(1, keepdim=True).sqrt()
+                p.mul_((limit / n.clamp_min(1e-12)).clamp(max=1.0))
 
     def body(smp):
         opt.zero_grad(set_to_none=False)
@@ -1765,7 +1878,15 @@ def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]
                                     torch.zeros_like(g)))
             n_skipped.add_((~finite).float())
         update_best(torch.where(finite, obj.detach(), best_obj))   # pose *before* this update, as before
+        if caps:
+            with torch.no_grad():
+                for p, prev, _ in caps:
+                    prev.copy_(p)
         opt.step()
+        if caps:
+            cap_steps()
+        if limits:
+            apply_limits()
 
     use_graph = device.type == "cuda" and not getattr(args, "no_cuda_graph", False)
     graphs = {}
@@ -1832,8 +1953,9 @@ def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]
                      else blur_end)
             smp.set_blur(math.ceil(sigma / blur_quantum) * blur_quantum if sigma > 0 else 0.0)
             smp.set_psf_scale(psf_s0 + (1.0 - psf_s0) * step / psf_steps if step < psf_steps else 1.0)
-            lr_t.fill_(lr_at(step, args.lr, args.lr_end))
-            lr_r.fill_(lr_at(step, args.rot_lr, args.rot_lr_end))
+            lr_t.fill_(lr_at(step, args.lr, LR_END_FRACTION * args.lr if args.lr_end is None else args.lr_end))
+            lr_r.fill_(lr_at(step, args.rot_lr,
+                             LR_END_FRACTION * args.rot_lr if args.rot_lr_end is None else args.rot_lr_end))
             nominal = step >= track_from
             step_buf.fill_(float(step))
             if stochastic:
@@ -2978,7 +3100,7 @@ def build_parser(description: str) -> argparse.ArgumentParser:
                          "the subjects (needs tqdm)")
 
     # ###################    OPTIMIZER PARAMS    #########################################
-    ap.add_argument("--steps", type=int, default=400, help="Optimizer steps")
+    ap.add_argument("--steps", type=int, default=1000, help="Optimizer steps")
     ap.add_argument("--optimizer", choices=OPTIMIZERS, default="sgd",
                     help="sgd: plain gradient steps (see --momentum, --nesterov); its steps scale with the gradient, "
                          "so it needs much larger learning rates (see --lr). SGD lead consistently higher performance. "
@@ -2997,10 +3119,14 @@ def build_parser(description: str) -> argparse.ArgumentParser:
                          "(adam/nadam/radam/adamax/rmsprop 0.04, adagrad 0.2, sgd 20)")
     ap.add_argument("--momentum", type=float, default=0.0, help="Momentum for --optimizer sgd (0 = plain SGD). Default: %(default)s")
     ap.add_argument("--nesterov", action="store_true", help="Nesterov momentum for --optimizer sgd")
-    ap.add_argument("--lr-schedule", choices=["linear", "constant"], default="constant",
-                    help="linear: decay each learning rate linearly from its start value to its end value; constant: no decay")
-    ap.add_argument("--lr-end", type=float, default=0.0, help="Final translation learning rate for the linear schedule")
-    ap.add_argument("--rot-lr-end", type=float, default=0.0, help="Final rotation learning rate for the linear schedule")
+    ap.add_argument("--lr-schedule", choices=["linear", "constant"], default="linear",
+                    help="linear: decay each learning rate linearly from its start value to its end value over the run "
+                         "(the line-dropping noise of --pair-keep averages out, so the poses settle where the best pose "
+                         "is tracked); constant: no decay. Default: %(default)s")
+    ap.add_argument("--lr-end", type=float, default=None,
+                    help="Final translation learning rate for the linear schedule. Default: 50%% of --lr")
+    ap.add_argument("--rot-lr-end", type=float, default=None,
+                    help="Final rotation learning rate for the linear schedule. Default: 50%% of --rot-lr")
     ap.add_argument("--pair-keep", type=float, default=0.8,
                     help="Stochastic optimization: fraction of intersection lines used at each step (1 = deterministic). "
                          "Each step draws a new random subset of round(fraction x lines) lines and samples only those, "
@@ -3056,12 +3182,12 @@ def build_parser(description: str) -> argparse.ArgumentParser:
     # ###################    COARSE-TO-FINE (BLUR) PARAMS    #############################
     ap.add_argument("--blur-sigma", type=float, default=3.0,
                     help="Coarse-to-fine: initial in-plane Gaussian sigma (mm) of the images, decayed linearly to 0 (0 = off)")
-    ap.add_argument("--blur-frac", type=float, default=0.9,
+    ap.add_argument("--blur-frac", type=float, default=0.8,
                     help="Fraction of the steps over which the blur decays to --blur-sigma-end (> 1: it never gets "
                          "there); 0 = no decay, the blur stays at --blur-sigma for the whole run")
-    ap.add_argument("--blur-sigma-end", type=float, default=0.0,
+    ap.add_argument("--blur-sigma-end", type=float, default=1.0,
                     help="Blur sigma (mm) the coarse-to-fine blur decays to (linearly from --blur-sigma over "
-                         "--blur-frac of the run) and then keeps until the end. Default: %(default)s (unblurred)")
+                         "--blur-frac of the run) and then keeps until the end (0: unblurred at the end). Default: %(default)s")
 
     # ###################    INTERSECTION LINE AND MASK PARAMS    ########################
     ap.add_argument("--line-step-mm", type=float, default=1.8,
@@ -3144,6 +3270,44 @@ def build_parser(description: str) -> argparse.ArgumentParser:
                     help="Penalty weight on each plane's own tilt (rotation about its in-plane axes, as rot_tilt_deg in the "
                          "outputs) above --tilt-hinge-deg: relu(tilt - threshold)^2 (deg^2), mean over planes. In-plane "
                          "rotation and translations are not penalized; tilts up to the threshold cost nothing (0 = off)")
+    ap.add_argument("--shift-prior", type=float, default=0.01,
+                    help="Penalty weight on each plane's shift from its acquired pose beyond --shift-free-mm: "
+                         "relu(|t| - free)^2 (mm^2, |t| the Euclidean norm of the plane's translation), mean over planes. "
+                         "Shifts within the free zone cost nothing, so ordinary breath-hold corrections are not biased "
+                         "toward zero; a plane drifting out of the cluster is pulled back (its lines go flat once they "
+                         "leave the image overlap, so the image term alone cannot). With SGD a plane's step from it is "
+                         "lr x 2 w / n_planes x the excess, so keep w well below n_planes / lr (e.g. 0.01 at lr 80) "
+                         "(0 = off). Default: %(default)s")
+    ap.add_argument("--shift-free-mm", type=float, default=20.0,
+                    help="Shift (mm) from the acquired pose allowed without cost by --shift-prior. Default: %(default)s")
+    ap.add_argument("--rot-prior", type=float, default=0.01,
+                    help="Penalty weight on each plane's rotation angle from its acquired pose beyond --rot-free-deg: "
+                         "relu(angle - free)^2 (deg^2), mean over planes; in-plane rotation and tilt alike (see "
+                         "--tilt-prior for tilt only) (0 = off). Default: %(default)s")
+    ap.add_argument("--rot-free-deg", type=float, default=10.0,
+                    help="Rotation (deg) from the acquired pose allowed without cost by --rot-prior. Default: %(default)s")
+    ap.add_argument("--max-step-mm", type=float, default=2.0,
+                    help="Largest translation of a plane per optimizer step (mm, Euclidean): a longer step is shortened "
+                         "to it, keeping its direction. Keeps one large gradient from throwing a plane out of the image "
+                         "overlap (e.g. 2; 0 = off). Default: %(default)s")
+    ap.add_argument("--max-step-deg", type=float, default=1.0,
+                    help="Largest rotation of a plane per optimizer step (deg; change of its rotation vector) (e.g. 1; "
+                         "0 = off). Default: %(default)s")
+    ap.add_argument("--apex-extend-mm", type=float, default=20.0,
+                    help="Extend each segmented LAX view's heart mask toward the apex by this much (mm) before it is "
+                         "dilated (--mask-dilation-mm, annealed): the heart region is swept along the in-plane direction "
+                         "of the LV long axis (base to apex: the SAX stack, oriented by the LAX segmentations: atria at "
+                         "the base, LV toward the apex). Keeps the apical SAX slices' lines supervised when the mask shrinks, also where the "
+                         "apical segmentation is incomplete (0 = off; subjects without SAX slices are "
+                         "unaffected). Default: %(default)s")
+    ap.add_argument("--max-shift-mm", type=float, default=50.0,
+                    help="Hard limit on each plane's translation from its acquired pose (mm, Euclidean): after every "
+                         "step a plane beyond it is projected back onto it. Unlike --shift-prior it cannot be overcome by "
+                         "the image term (e.g. 50: far beyond real breath-hold motion, UKBB 99.9th percentile ~23 mm; "
+                         "0 = off). Default: %(default)s")
+    ap.add_argument("--max-rot-deg", type=float, default=20.0,
+                    help="Hard limit on each plane's rotation angle from its acquired pose (deg) (e.g. 20; UKBB 99.9th "
+                         "percentile ~8 deg; 0 = off). Default: %(default)s")
     ap.add_argument("--tilt-hinge-reg", type=float, default=0.0,
                     help="Penalty weight on the relative tilt of adjacent SAX slices above --tilt-hinge-deg: "
                          "relu(angle between their normals - threshold)^2 (deg^2), mean over adjacent pairs. Ordinary "
@@ -3268,6 +3432,8 @@ def run(ap: argparse.ArgumentParser, args, load, save, is_complete) -> tuple[Pat
     lr0, rot_lr0 = DEFAULT_LR[args.optimizer]
     args.lr = lr0 if args.lr is None else args.lr
     args.rot_lr = rot_lr0 if args.rot_lr is None else args.rot_lr
+    args.lr_end = LR_END_FRACTION * args.lr if getattr(args, "lr_end", None) is None else args.lr_end
+    args.rot_lr_end = LR_END_FRACTION * args.rot_lr if getattr(args, "rot_lr_end", None) is None else args.rot_lr_end
     args.history_every = HISTORY_EVERY if args.logging else 0.0     # pose snapshots during optimization
     if args.root is None:
         sys.exit("No input directory: pass --root")

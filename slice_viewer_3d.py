@@ -35,6 +35,10 @@ Usage
     python slice_viewer_3d.py 1000071 --run-dir D:\\some\\run\\dir
     python slice_viewer_3d.py 1000071 --start 0     # open at the acquired geometry
     python slice_viewer_3d.py 1000071 --frame 10 --no-seg
+    python slice_viewer_3d.py --remote user@host:/path/to/run_dir --subjects worst_cases/slice_shift_max.txt
+                                                    # a run on another machine (ssh, key authentication): each
+                                                    # subject is downloaded once into --cache-dir; [ / ] step
+                                                    # through the listed subjects in the file's order
 
 Interaction
 -----------
@@ -132,7 +136,13 @@ import argparse
 import json
 import math
 import re
+import shlex
+import shutil
+import subprocess
 import sys
+import tarfile
+import threading
+from datetime import datetime
 from pathlib import Path
 
 import nibabel as nib
@@ -146,6 +156,7 @@ from scipy.ndimage import distance_transform_edt, gaussian_filter, map_coordinat
 from vtkmodules.vtkRenderingCore import vtkActor2D, vtkCoordinate, vtkPolyDataMapper2D
 
 ALIGN_ROOT = Path(r"C:\Users\Nil\Documents\data\ukbb_alignment")
+REMOTE_CACHE = Path.home() / ".cache" / "cmr_slice_viewer"   # downloaded subjects of remote runs (--remote)
 # data keys: file names and CSV values. "ao": the UKBB aortic slice (ao.nii.gz, a single axial slice through the
 # ascending aorta, without segmentation), shown and handled like a LA view; skipped when the file is absent
 VIEWS = ["SA", "LA_2Ch", "LA_3Ch", "LA_4Ch", "ao"]
@@ -293,6 +304,8 @@ HIST_SLIDER_Y, FRAME_SLIDER_Y = 0.03, 0.075  # bottom sliders (normalised height
 SLIDER_TITLE_GAP = 14                      # px between a bottom slider's title and its tube
 PROFILE_COLORS = ("#e0e0e0", "#ffb74d")    # picked slice, the other slice of the line
 PROFILE_STEP_MM = 0.5
+BLUR_QUANTUM_MM = 0.2                     # motion_gradient.align applies the blur sigma rounded up to this
+BLUR_TEXT_X = 218                         # blur value right of the "Image blurring  [g]" label
 PROFILE_RADIO_X = 230                     # radio column right of the slice rows
 KNOB_LABEL_DY = 9                          # px from a bottom slider's tube to its value label
 PROFILE_MASK_Y = 10                        # height (grey units) of the in-mask bar along the chart bottom
@@ -333,6 +346,71 @@ def _as_4d(arr: np.ndarray) -> np.ndarray:
 def _n_frames_on_disk(img) -> int:
     """Number of cine frames of a NIfTI image (its 4th dimension; 1 for a 2D / 3D image), from the header."""
     return int(img.shape[3]) if len(img.shape) > 3 else 1
+
+
+def apex_direction(sax: list[tuple[np.ndarray, tuple, np.ndarray | None]],
+                   lax: list[tuple[np.ndarray, np.ndarray | None]] = ()) -> np.ndarray | None:
+    """Unit vector (world) from the base of the SAX stack to its apex, or None with fewer than two slices.
+    sax: per SAX slice in stack order (affine, in-plane shape (X, Y), segmentation or None); lax: per LAX view
+    (affine, segmentation (X, Y, ...) or None). The stack axis is oriented by anatomy: in the LAX segmentations the atria
+    (labels 4, 5) lie at the base and the LV blood pool (label 1) toward the apex, so the apex is on the side of the LV
+    centroid relative to the atria centroid (summed over the views). Without both in any view: the UKBB convention,
+    slice 0 basal (the anatomy agreed with it on 22 of 22 test subjects; the SAX segmented area does not tell, as the
+    basal-most slices lie above the ventricles and are empty)."""
+    if len(sax) < 2:
+        return None
+    centres = [(A @ np.array([(sh[0] - 1) / 2.0, (sh[1] - 1) / 2.0, 0.0, 1.0]))[:3] for A, sh, _ in sax]
+    d = centres[-1] - centres[0]
+    if np.linalg.norm(d) < 1e-6:
+        return None
+    d = d / np.linalg.norm(d)
+    vote = 0.0
+    for A, g in lax:
+        if g is None:
+            continue
+        g = np.asarray(g)
+        g = g.reshape(g.shape[0], g.shape[1], -1).max(-1)
+        cs = []
+        for m in (g == 1, np.isin(g, (4, 5))):
+            ij = np.argwhere(m)
+            cs.append(None if len(ij) < 20 else (np.asarray(A, float) @ np.r_[ij.mean(0), 0.0, 1.0])[:3])
+        if cs[0] is not None and cs[1] is not None:
+            vote += float((cs[0] - cs[1]) @ d)
+    return -d if vote < 0 else d
+
+
+def _shift2d(a: np.ndarray, di: int, dj: int) -> np.ndarray:
+    """a shifted by (di, dj) pixels, zero-filled."""
+    out = np.zeros_like(a)
+    X, Y = a.shape
+    if abs(di) >= X or abs(dj) >= Y:
+        return out
+    out[max(di, 0):X + min(di, 0), max(dj, 0):Y + min(dj, 0)] = a[max(-di, 0):X - max(di, 0), max(-dj, 0):Y - max(dj, 0)]
+    return out
+
+
+def apical_sweep(heart: np.ndarray, affine: np.ndarray, apex: np.ndarray | None, extend_mm: float) -> np.ndarray:
+    """The heart region (X, Y) of a long-axis slice swept toward the apex by extend_mm: the union of its copies
+    shifted 0 ... extend_mm along the in-plane projection of `apex` (the base-to-apex direction), at most one pixel
+    apart. The dilated mask measured from it (--mask-dilation-mm, annealed) then reaches extend_mm further past the
+    apex, whatever the segmentation does there (apical segmentations are often incomplete). Unchanged when the slice
+    plane is far from containing the long axis (projection < half), or without a direction."""
+    if apex is None or extend_mm <= 0 or not heart.any():
+        return heart
+    M = np.asarray(affine, float)[:3, :3]
+    n = np.cross(M[:, 0], M[:, 1])
+    n /= np.linalg.norm(n)
+    u = apex - (apex @ n) * n
+    if np.linalg.norm(u) < 0.5:
+        return heart
+    u /= np.linalg.norm(u)
+    v = np.array([u @ M[:, 0] / (M[:, 0] @ M[:, 0]), u @ M[:, 1] / (M[:, 1] @ M[:, 1])])   # pixels per mm along u
+    steps = max(1, int(math.ceil(extend_mm * np.abs(v).max())))
+    out = heart.copy()
+    for k in range(1, steps + 1):
+        di, dj = np.rint(k / steps * extend_mm * v).astype(int)
+        out |= _shift2d(heart, int(di), int(dj))
+    return out
 
 
 def phase_frames(n_available: int, n: int) -> list[int]:
@@ -759,6 +837,151 @@ def find_run_dir(align_root: Path, subject: str | None, run: str | None) -> Path
     return runs[0] if runs else None
 
 
+class RemoteRun:
+    """A run directory on another machine, `user@host:/path/to/run_dir`, read over ssh (key authentication; ssh runs
+    with BatchMode, so it fails instead of prompting). Each subject folder (images, segmentations, metrics/) is
+    downloaded once, as one tar stream, into a local mirror of the run, <cache>/<host>/<run name>/, and from there
+    loaded like a local run; a subject is only complete once its marker file is written, so an interrupted download
+    is fetched again. The next subject of the list is prefetched in the background while one is viewed."""
+
+    MARKER = ".downloaded"
+
+    def __init__(self, spec: str, cache_root: Path):
+        if ":" not in spec:
+            raise ValueError(f"--remote expects user@host:/path/to/run_dir, got {spec!r}")
+        self.target, path = spec.split(":", 1)
+        self.path = path.rstrip("/")
+        host = re.sub(r"[^\w.-]", "_", self.target.split("@")[-1])
+        self.local = Path(cache_root) / host / Path(self.path).name
+        self.local.mkdir(parents=True, exist_ok=True)
+        for stale in self.local.glob(".partial-*"):          # downloads interrupted by closing the viewer
+            shutil.rmtree(stale, ignore_errors=True)
+        self._lock = threading.Lock()
+        self._busy: dict[str, threading.Event] = {}         # subject -> set when its download has finished
+
+    def _ssh(self, command: str, **kwargs) -> subprocess.Popen:
+        return subprocess.Popen(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", self.target, command],
+                                **kwargs)
+
+    def run(self, command: str, timeout: float = 300) -> str:
+        """Output of a shell command on the remote machine (raises on failure)."""
+        p = self._ssh(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        out, err = p.communicate(timeout=timeout)
+        if p.returncode:
+            raise RuntimeError(f"ssh {self.target} {command!r} failed ({p.returncode}): {err.strip()}")
+        return out
+
+    def _download(self, rel: str) -> None:
+        """Stream <remote run>/<rel> (a file or folder) into the mirror as a tar archive, via a temporary folder."""
+        tmp = self.local / f".partial-{rel.replace('/', '_')}"
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True)
+        p = self._ssh(f"tar -C {shlex.quote(self.path)} -cf - {shlex.quote(rel)}",
+                      stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            with tarfile.open(fileobj=p.stdout, mode="r|") as tar:
+                tar.extractall(tmp, filter="data")
+        finally:
+            err = p.stderr.read().decode(errors="replace")
+            p.wait()
+        if p.returncode:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise RuntimeError(f"downloading {self.target}:{self.path}/{rel} failed: {err.strip()}")
+        dest = self.local / rel
+        if dest.exists():
+            shutil.rmtree(dest) if dest.is_dir() else dest.unlink()
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        (tmp / rel).replace(dest)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    def fetch_subject(self, subject: str) -> Path:
+        """The local copy of a subject folder, downloaded first if needed (waits for a running prefetch of it)."""
+        marker = self.local / subject / self.MARKER
+        while True:
+            if marker.exists():
+                return self.local / subject
+            with self._lock:
+                event = self._busy.get(subject)
+                if event is None:
+                    event = self._busy[subject] = threading.Event()
+                    mine = True
+                else:
+                    mine = False
+            if not mine:
+                event.wait()
+                continue
+            try:
+                print(f"[remote] downloading {subject} from {self.target}:{self.path} ...", flush=True)
+                self._download(subject)
+                marker.write_text("")
+            finally:
+                with self._lock:
+                    self._busy.pop(subject, None)
+                event.set()
+
+    def prefetch(self, subject: str) -> None:
+        """Download a subject in the background (errors are only reported)."""
+        def work():
+            try:
+                self.fetch_subject(subject)
+            except Exception as exc:                          # noqa: BLE001
+                print(f"[remote] prefetch of {subject} failed: {exc}", file=sys.stderr)
+        if not (self.local / subject / self.MARKER).exists():
+            threading.Thread(target=work, daemon=True).start()
+
+    def fetch_run_config(self) -> None:
+        """overall_metrics/run_config.json (the run's settings: mask annealing, line sampling, PSF), if present."""
+        try:
+            self._download("overall_metrics/run_config.json")
+        except RuntimeError as exc:
+            print(f"[remote] no run_config.json: {exc}", file=sys.stderr)
+
+    def list_subjects(self) -> list[str]:
+        """The run's subjects with images, from overall_metrics/motion_summary.csv (one row per subject; listing the
+        run directory itself is slow on a large cohort), in numerical order."""
+        out = self.run(f"tail -n +2 {shlex.quote(self.path + '/overall_metrics/motion_summary.csv')} | cut -d, -f1,2")
+        status = {}
+        for line in out.splitlines():
+            sid, _, st = line.partition(",")
+            if sid.strip():
+                status[sid.strip()] = st.strip()               # append-only: the latest row of a subject wins
+        return sorted((sid for sid, st in status.items() if st != "no_images"), key=lambda x: (len(x), x))
+
+
+SUBJECT_FOCUS: dict[str, str] = {}      # subject -> slice to profile first, from a --subjects list (read_subject_list)
+
+
+def focus_slice(image: str, index: int) -> str:
+    """The viewer's name of slice `index` of an image as written in the alignment CSVs: SAX 5 -> SA[05], LAX_4Ch 0 ->
+    LA_4Ch (a single slice keeps the view name), ao 0 -> ao."""
+    view = from_disk(image)
+    return f"{view}[{index:02d}]" if view == "SA" else view
+
+
+def read_subject_list(items: list[str]) -> list[str]:
+    """Subject ids from --subjects: each item is a subject id or a text file with one subject per line (its first
+    whitespace / comma separated token; lines starting with '#' and non-numeric tokens, e.g. a header, are skipped).
+    Order kept, duplicates dropped. Lines of a worst_cases.py list (subject, value, image, slice, ...) also give the
+    slice where the subject is worst: it is the one profiled first (SUBJECT_FOCUS)."""
+    out = []
+    for item in items:
+        p = Path(item)
+        if p.is_file():
+            for line in p.read_text().splitlines():
+                toks = line.split()
+                if not toks or toks[0].startswith("#"):
+                    continue
+                tok = re.split(r"[\s,]+", line.strip(), maxsplit=1)[0]
+                if not tok.isdigit():
+                    continue
+                out.append(tok)
+                if len(toks) >= 4 and toks[3].isdigit() and tok not in SUBJECT_FOCUS:
+                    SUBJECT_FOCUS[tok] = focus_slice(toks[2], int(toks[3]))
+        else:
+            out += [t for t in re.split(r"[\s,]+", item) if t]
+    return list(dict.fromkeys(out))
+
+
 # ----------------------------------------------------------------------------
 # Geometry
 # ----------------------------------------------------------------------------
@@ -1025,6 +1248,7 @@ class SliceViewer:
 
     # --- per-subject lifecycle ---------------------------------------------------
     def _reset_scene_state(self):
+        self._blur_text = None                       # text next to "Image blurring" (built by _build_ui with a config)
         self.entries: list[dict] = []
         self._entry_by_key: dict[tuple, dict] = {}
         self._mask_items: list[dict] = []
@@ -1172,6 +1396,11 @@ class SliceViewer:
             self._build_slices()
         self._build_overlays()
         names = [e["name"] for e in self.entries]
+        focus = loaded.get("profile")                    # e.g. a --subjects list's worst slice of this subject
+        if focus in names:
+            if focus != self.profile_key:
+                self._profile_scroll = self._scroll_target = 0.0
+            self.profile_key = focus
         if self.profile_key not in names:
             sa = [n for n, e in zip(names, self.entries) if e["view"] == "SA"]
             self.profile_key = sa[len(sa) // 2] if sa else (names[0] if names else None)
@@ -1901,15 +2130,27 @@ class SliceViewer:
 
     def _heart_dist(self, e: dict) -> np.ndarray | None:
         """Distance (mm) of every voxel of LA slice e to the heart (its segmentation, union over frames), as the
-        alignment script computes it; None without a segmentation."""
-        if "heart_dist" not in e:
+        alignment script computes it -- with the run's --apex-extend-mm the heart region first swept toward the apex
+        (apical_sweep, at the acquired geometry); None without a segmentation."""
+        extend = float((getattr(self, "config", None) or {}).get("apex_extend_mm") or 0.0)
+        if e.get("heart_dist_extend") != extend:
             seg = e["slice"]["seg"]
             if seg is None or not (seg > 0).any():
                 e["heart_dist"] = None
             else:
                 A = e["slice"]["affine"]
                 sp = (np.linalg.norm(A[:3, 0]), np.linalg.norm(A[:3, 1]))
-                e["heart_dist"] = distance_transform_edt(~(seg > 0).any(-1), sampling=sp)
+                heart = (seg > 0).any(-1)
+                if extend > 0:
+                    snap0 = self.snapshots[0]["affines"]
+                    sa = sorted((x for x in self.entries if x["view"] == "SA"), key=lambda x: x["key"][1])
+                    apex = apex_direction([(snap0.get(x["key"], x["slice"]["affine"]), x["slice"]["grey"].shape[:2],
+                                            x["slice"]["seg"]) for x in sa],
+                                          [(snap0.get(x["key"], x["slice"]["affine"]), x["slice"]["seg"])
+                                           for x in self.entries if x["view"] != "SA"])
+                    heart = apical_sweep(heart, snap0.get(e["key"], A), apex, extend)
+                e["heart_dist"] = distance_transform_edt(~heart, sampling=sp)
+            e["heart_dist_extend"] = extend
         return e["heart_dist"]
 
     def _mask_contour_ijk(self, key: tuple, dil: float | None):
@@ -2094,13 +2335,17 @@ class SliceViewer:
         psf_s0 = 1.0 if cfg.get("no_psf") else float(cfg.get("psf_scale_start", 1.0) or 1.0)
         psf_steps = int(round(float(cfg.get("psf_anneal_frac", 0.6)) * steps)) if psf_s0 > 1.0 else 0
         scale = psf_s0 + (1.0 - psf_s0) * step / psf_steps if step < psf_steps else 1.0
+        # as motion_gradient.align: from --blur-sigma linearly down to --blur-sigma-end over --blur-frac of the run, then
+        # held; --blur-frac 0: --blur-sigma throughout; applied rounded up to 0.2 mm (its blur_quantum)
         b0 = float(cfg.get("blur_sigma", 0.0) or 0.0)
+        b_end = min(float(cfg.get("blur_sigma_end", 0.0) or 0.0), b0)
         b_frac = float(cfg.get("blur_frac", 0.6))
         if b0 > 0 and b_frac <= 0:                       # --blur-frac 0: constant blur for the whole run
             sigma = b0
         else:
             b_steps = int(round(b_frac * steps)) if b0 > 0 else 0
-            sigma = b0 * max(0.0, 1.0 - step / b_steps) if step < b_steps else 0.0
+            sigma = b_end + (b0 - b_end) * (1.0 - step / b_steps) if step < b_steps else b_end
+        sigma = math.ceil(sigma / BLUR_QUANTUM_MM) * BLUR_QUANTUM_MM if sigma > 0 else 0.0
         return scale, sigma
 
     def _band(self, scale: float) -> tuple[np.ndarray, np.ndarray]:
@@ -2828,7 +3073,17 @@ class SliceViewer:
         self._apply_metric_values()
         self._update_knob_labels()
         self._update_header()
+        self._update_blur_text()
         self._update_profiles()
+
+    def _update_blur_text(self):
+        """The in-plane blur sigma (mm) the optimizer used at the shown step (--blur-sigma annealed over --blur-frac
+        of the run, see _loss_state), next to the 'Image blurring' toggle; 0 mm once it no longer blurs."""
+        txt = getattr(self, "_blur_text", None)
+        if txt is None or not self.snapshots:
+            return
+        _, sigma = self._loss_state(self.snapshots[self.snap_index]["step"])
+        txt.SetInput(f"{sigma:.1f} mm" if sigma > 0 else "0 mm")       # (the panel font has no sigma glyph)
 
     # --- outline colour by metric --------------------------------------------
     def _metric_value(self, e: dict, snap: dict) -> float:
@@ -3136,7 +3391,7 @@ class SliceViewer:
             y -= ROW_PITCH
 
         add_row("Segmentation  [s]", self._on_seg_toggle, self.show_seg, "seg")
-        add_row("Outlines  [o]", self._on_outline_toggle, True, "outlines")
+        add_row("Outlines  [o]", self._on_outline_toggle, self.show_outlines, "outlines")
         if self._mask_items:
             add_row("Dilated mask contour  [m]", self._on_mask_toggle, self.show_mask, "mask")
         if self._line_items is not None:
@@ -3149,12 +3404,17 @@ class SliceViewer:
         add_row("Metric profiles  [n]", self._on_metric_profiles_toggle, self.show_metric_profiles, "metric_profiles")
         if self.config is not None:
             add_row("Apply PSF to profile  [y]", self._on_psf_toggle, self.show_psf, "psf")
+            # the optimizer's in-plane blur at the shown step, right of the toggle (updated per step: _update_blur_text)
+            self._blur_text = self._text("", position=(BLUR_TEXT_X, y + 4), font_size=8, color="#bbbbbb")
             add_row("Image blurring  [g]", self._on_blur_toggle, self.show_blur, "blur")
         y -= 8
+        # every checkbox shows the actual state: on a run change the slices are kept with their visibility (load_index)
         if "SA" in self.data:
-            add_row("All SA  [a]", lambda v: self._set_group("SA", v), True, "all_sa")
+            add_row("All SA  [a]", lambda v: self._set_group("SA", v),
+                    all(e["visible"] for e in self.entries if e["view"] == "SA"), "all_sa")
         if any(v != "SA" for v in self.data):                # (LA views and the aortic slice)
-            add_row("All LA  [l]", lambda v: self._set_group("LA", v), True, "all_la")
+            add_row("All LA  [l]", lambda v: self._set_group("LA", v),
+                    all(e["visible"] for e in self.entries if e["view"] != "SA"), "all_la")
         y -= 8
         # column headers above the slice rows: the outline metric (value column) and "profile"
         self._text("profile", position=(PROFILE_RADIO_X + 7, y + ROW_PITCH - 4), font_size=7,
@@ -3167,7 +3427,7 @@ class SliceViewer:
                 position=(PROFILE_RADIO_X, y + 3), size=14, border_size=3,
                 color_on="#ffa726", color_off="#555555", background_color="#303030")
             self._row_value[e["name"]] = self._text("", position=(PANEL_X_VAL, y + 2), font_size=9, color="white")
-            add_row(self._row_label(e), self._make_slice_cb(e), True, e["name"])
+            add_row(self._row_label(e), self._make_slice_cb(e), e["visible"], e["name"])
 
         # Outline-colour metric (radio group: exactly one active); each row also shows the
         # subject-level value of its metric at the shown step (filled by _update_header)
@@ -3245,10 +3505,16 @@ class SliceViewer:
 
 
     # --- callbacks -------------------------------------------------------
+    def _sync_group_boxes(self):
+        """'All SA' / 'All LA' show ticked exactly when every slice of their group is shown."""
+        self._set_checkbox_state("all_sa", all(e["visible"] for e in self.entries if e["view"] == "SA"))
+        self._set_checkbox_state("all_la", all(e["visible"] for e in self.entries if e["view"] != "SA"))
+
     def _make_slice_cb(self, e: dict):
         def cb(value: bool):
             e["visible"] = bool(value)
             self._set_checkbox_state(e["name"], e["visible"])
+            self._sync_group_boxes()
             self._apply_visibility()
             self.pl.render()
         return cb
@@ -3259,6 +3525,7 @@ class SliceViewer:
             if e["view"].startswith(prefix) or (prefix == "LA" and e["view"] != "SA"):
                 e["visible"] = bool(value)
                 self._set_checkbox_state(e["name"], e["visible"])
+        self._sync_group_boxes()
         self._apply_visibility()
         self.pl.render()
 
@@ -3421,6 +3688,43 @@ def _first_instance(subject_dir: Path) -> int | None:
     return None
 
 
+def run_config_for(run_dir: Path, metrics_dir: Path, history: dict) -> dict | None:
+    """The settings the subject was aligned with. A run directory aligned into again with other settings keeps one
+    config per start (run_config.json, then run_config_<YYYYMMDD-HHMMSS>.json, see motion_gradient.write_run_config);
+    the subject's is the newest one started before it was aligned (the timestamp in its metrics/summary.csv, else its
+    history's modification time). Everything the viewer rebuilds per step (blur, PSF scale, mask annealing stage)
+    depends on it, e.g. --steps."""
+    om = run_dir / "overall_metrics"
+    starts = []
+    for path in om.glob("run_config*.json"):
+        m = re.search(r"run_config_(\d{8}-\d{6})\.json$", path.name)
+        try:
+            t = datetime.strptime(m.group(1), "%Y%m%d-%H%M%S").timestamp() if m else path.stat().st_mtime
+        except (OSError, ValueError):
+            continue
+        starts.append((t, path))
+    if not starts:
+        print(f"[warn] {om / 'run_config.json'} missing: profiles can only show raw intensities", file=sys.stderr)
+        return None
+    starts.sort()
+    aligned = None
+    try:
+        row = pd.read_csv(metrics_dir / "summary.csv").iloc[-1]
+        aligned = datetime.fromisoformat(str(row["timestamp"])).timestamp()
+    except Exception:                                    # noqa: BLE001 (no summary / timestamp)
+        hist = metrics_dir / HISTORY_CSV
+        aligned = hist.stat().st_mtime if hist.exists() else None
+    path = starts[-1][1] if aligned is None else next((p for t, p in reversed(starts) if t <= aligned + 1), starts[0][1])
+    config = json.loads(path.read_text())
+    n = history.get("n_steps")
+    if len(starts) > 1:
+        print(f"[config] {path.name} (one of {len(starts)} configs of this run directory)")
+    if n and config.get("steps") and int(config["steps"]) != int(n):
+        print(f"[warn] {path.name}: steps={config['steps']} but the history runs to step {n}: per-step "
+              f"reconstructions (blur, PSF, mask annealing) may be off", file=sys.stderr)
+    return config
+
+
 def load_subject_run(run_dir: Path, subject: str, instance: int | None = None, cache: dict | None = None) -> dict:
     """Everything the viewer needs for one subject of a run. The images are read from <run>/<subject>/ (current
     layout) or, for older runs, from <run>/<subject>/Instance_<n>/. `cache` (a dict kept by the caller) holds the
@@ -3469,10 +3773,7 @@ def load_subject_run(run_dir: Path, subject: str, instance: int | None = None, c
                 if A is not None and not np.allclose(A, s["affine"], atol=5e-3):
                     print(f"[warn] {s['file']}: NIfTI affine differs from the history's best pose "
                           f"(max |diff| {np.abs(A - s['affine']).max():.3f})", file=sys.stderr)
-    cfg_path = run_dir / "overall_metrics" / "run_config.json"
-    config = json.loads(cfg_path.read_text()) if cfg_path.exists() else None
-    if config is None:
-        print(f"[warn] {cfg_path} missing: profiles can only show raw intensities", file=sys.stderr)
+    config = run_config_for(run_dir, metrics_dir, history)
     title = f"UKBB {subject}" + (f" / Instance_{instance}" if instance is not None else "")
     if model in POSE_NOTES:
         title += f"   [{POSE_NOTES[model]}]"
@@ -3493,6 +3794,17 @@ def parse_args(argv=None):
     ap.add_argument("--run-dir", type=Path, default=None,
                     help="explicit run directory containing <subject>/ (images + metrics/) "
                          "(overrides --align-root/--run)")
+    ap.add_argument("--remote", default=None, metavar="USER@HOST:/RUN_DIR",
+                    help="a run directory on another machine, read over ssh (key authentication): every subject is "
+                         "downloaded once into --cache-dir when shown (the next one in the background). Subjects: "
+                         "--subjects, else every subject of its overall_metrics/motion_summary.csv")
+    ap.add_argument("--cache-dir", type=Path, default=REMOTE_CACHE,
+                    help="where --remote subjects are kept (<cache>/<host>/<run name>/<subject>/; delete freely). "
+                         "Default: %(default)s")
+    ap.add_argument("--subjects", nargs="+", default=None, metavar="ID_OR_FILE",
+                    help="the subjects to step through with [ / ], in this order: subject ids and/or text files with "
+                         "one subject per line (first token; e.g. a list written by worst_cases.py, whose slice column "
+                         "also picks the slice profiled first). Default: all subjects of the run")
     ap.add_argument("--instance", type=int, default=None,
                     help="older runs only: imaging instance folder (default: the first Instance_<n> found, else none)")
     ap.add_argument("--start", default="best",
@@ -3522,6 +3834,11 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
+    listed = read_subject_list(args.subjects) if args.subjects else None
+    if listed is not None and not listed:
+        sys.exit("--subjects: no subject ids found")
+    if args.remote:
+        return main_remote(args, listed)
 
     run_dir = args.run_dir or find_run_dir(args.align_root, args.subject, args.run)
     if run_dir is None:
@@ -3529,9 +3846,12 @@ def main(argv=None):
                  + (f" for subject {args.subject}" if args.subject else ""))
     run_dir = Path(run_dir)
 
-    subjects = _subjects_in_run(run_dir)
+    subjects_for = _subjects_in_run
+    if listed is not None:                               # --subjects: those of the list the run has, in list order
+        subjects_for = lambda run: [s for s in listed if _is_subject_dir(Path(run) / s)]   # noqa: E731
+    subjects = subjects_for(run_dir)
     if not subjects:
-        sys.exit(f"No aligned subject in {run_dir}")
+        sys.exit(f"No aligned subject in {run_dir}" + (" from --subjects" if listed is not None else ""))
     if args.subject is not None:
         if args.subject not in subjects:
             if (run_dir / args.subject).is_dir():
@@ -3554,7 +3874,7 @@ def main(argv=None):
     image_cache = {}                                     # the last subject's images, reused across runs
 
     def loader(run: Path, subject: str) -> dict:
-        return load_subject_run(run, subject, args.instance, image_cache)
+        return dict(load_subject_run(run, subject, args.instance, image_cache), profile=SUBJECT_FOCUS.get(subject))
 
     start = None
     if args.start == "end":
@@ -3566,7 +3886,57 @@ def main(argv=None):
         pv.OFF_SCREEN = True
 
     viewer = SliceViewer(
-        runs, _subjects_in_run, loader, run_index=run_index,
+        runs, subjects_for, loader, run_index=run_index,
+        subject=args.subject, subject_index=args.subject_index,
+        frame=args.frame, show_seg=not args.no_seg, seg_alpha=args.seg_alpha, start=start,
+        metric=args.metric, show_mask=args.mask, show_lines=args.lines, show_sa_lines=args.sa_lines,
+        show_radius=args.radius, show_profiles=not args.no_profiles,
+        show_metric_profiles=not args.no_metric_profiles,
+        show_psf=not args.raw_profiles, show_blur=args.blur,
+    )
+    if args.screenshot is not None:
+        viewer.show(screenshot=str(args.screenshot), auto_close=True)
+        print(f"Saved {args.screenshot}")
+    else:
+        viewer.show()
+
+
+def main_remote(args, listed: list[str] | None):
+    """--remote: view a run on another machine through a local cache (RemoteRun). One run only (no { } run
+    navigation); [ / ] step through --subjects (or all of the run's subjects), downloading each when shown."""
+    remote = RemoteRun(args.remote, args.cache_dir)
+    print(f"Remote run {remote.target}:{remote.path}, cached in {remote.local}")
+    remote.fetch_run_config()
+    subjects = listed if listed is not None else remote.list_subjects()
+    if not subjects:
+        sys.exit("No subjects to show")
+    if args.subject is not None and args.subject not in subjects:
+        subjects = [args.subject] + subjects
+    elif args.subject is None and not 0 <= args.subject_index < len(subjects):
+        sys.exit(f"Subject index {args.subject_index} out of bounds ({len(subjects)} subjects).")
+    print(f"{len(subjects)} subject(s) to step through")
+
+    image_cache = {}
+
+    def loader(run: Path, subject: str) -> dict:
+        try:
+            remote.fetch_subject(subject)
+        except RuntimeError as exc:
+            sys.exit(str(exc))
+        i = subjects.index(subject) if subject in subjects else -1
+        for nxt in subjects[i + 1:i + 2] + subjects[max(i - 1, 0):i]:   # the next (and previous) in the background
+            remote.prefetch(nxt)
+        return dict(load_subject_run(run, subject, args.instance, image_cache), profile=SUBJECT_FOCUS.get(subject))
+
+    start = None
+    if args.start == "end":
+        start = 10 ** 9
+    elif args.start != "best":
+        start = int(args.start)
+    if args.screenshot is not None:
+        pv.OFF_SCREEN = True
+    viewer = SliceViewer(
+        [remote.local], lambda run: subjects, loader, run_index=0,
         subject=args.subject, subject_index=args.subject_index,
         frame=args.frame, show_seg=not args.no_seg, seg_alpha=args.seg_alpha, start=start,
         metric=args.metric, show_mask=args.mask, show_lines=args.lines, show_sa_lines=args.sa_lines,

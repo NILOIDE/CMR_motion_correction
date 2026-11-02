@@ -1,0 +1,130 @@
+Worst-case review of the full UK Biobank alignment run
+========================================================
+Run: stol@131.159.110.9:/vol/miltank/projects/ukbb/data/cardiac/slice_alignment/aligned_subjects
+Run every command from the repository root (C:\Users\Nil\Documents\git\CMR_motion_correction) in the "ukbb" conda
+environment (conda activate ukbb). ssh uses your key; nothing prompts.
+
+
+1. Rank the subjects (re-run whenever more subjects have finished; ~15 s)
+-----------------------------------------------------------------------
+Runs on the server (python3, standard library) and writes one list per metric to worst_cases\<metric>.txt, worst
+first: subject, value, and the slice / view / intersection where it is worst.
+
+python worst_cases.py --remote stol@131.159.110.9:/vol/miltank/projects/ukbb/data/cardiac/slice_alignment/aligned_subjects --top 50
+
+Options: --top N (subjects per list), --min-points N (per-slice / per-line Dice and NCC only where the line has at
+least N points; default 20), --metrics <names> (only some lists).
+
+
+2. View a list
+--------------
+Each subject is downloaded once (~30 MB) into %USERPROFILE%\.cache\cmr_slice_viewer\ when shown; the next one in the
+list is fetched in the background. ] / [ (or PageDown / PageUp) step through the list, worst first. The slice named in
+the list is the one profiled first (intersection panes on the right).
+Useful keys: Home = acquired geometry (step 0), b = best pose, i = sampling lines, m = dilated masks,
+k = SA-SA lines, u = long-axis radius, , / . = profile the previous / next slice.
+
+Every command below is the same viewer call; only --subjects (and the start options) change.
+
+--- Motion: single slices / views (pose relative to the mean LAX pose) ---
+
+# Biggest single-slice or view 3D shift
+python slice_viewer_3d.py --remote stol@131.159.110.9:/vol/miltank/projects/ukbb/data/cardiac/slice_alignment/aligned_subjects --subjects worst_cases\slice_shift_max.txt --lines
+
+# Biggest in-plane shift of a single slice or view
+python slice_viewer_3d.py --remote stol@131.159.110.9:/vol/miltank/projects/ukbb/data/cardiac/slice_alignment/aligned_subjects --subjects worst_cases\slice_inplane_max.txt --lines
+
+# Biggest through-plane shift |dz| of a single slice or view
+python slice_viewer_3d.py --remote stol@131.159.110.9:/vol/miltank/projects/ukbb/data/cardiac/slice_alignment/aligned_subjects --subjects worst_cases\slice_dz_max.txt --lines
+
+# Biggest tilt (out-of-plane rotation) of a single slice or view
+python slice_viewer_3d.py --remote stol@131.159.110.9:/vol/miltank/projects/ukbb/data/cardiac/slice_alignment/aligned_subjects --subjects worst_cases\slice_tilt_max.txt --lines
+
+# Biggest in-plane rotation of a single slice or view
+python slice_viewer_3d.py --remote stol@131.159.110.9:/vol/miltank/projects/ukbb/data/cardiac/slice_alignment/aligned_subjects --subjects worst_cases\slice_rot_inplane_max.txt --lines
+
+--- Motion: SAX slices relative to the rest of the stack ---
+
+# One SAX slice moved furthest from the rest of its stack
+python slice_viewer_3d.py --remote stol@131.159.110.9:/vol/miltank/projects/ukbb/data/cardiac/slice_alignment/aligned_subjects --subjects worst_cases\sax_rel_shift_max.txt --lines
+
+# One SAX slice rotated furthest relative to the rest of its stack
+python slice_viewer_3d.py --remote stol@131.159.110.9:/vol/miltank/projects/ukbb/data/cardiac/slice_alignment/aligned_subjects --subjects worst_cases\sax_rel_rot_max.txt --lines --radius
+
+# Largest relative shift between two adjacent SAX slices
+python slice_viewer_3d.py --remote stol@131.159.110.9:/vol/miltank/projects/ukbb/data/cardiac/slice_alignment/aligned_subjects --subjects worst_cases\sax_adjacent_shift_max.txt --lines
+
+# Largest SAX slice-to-slice jitter (subject level)
+python slice_viewer_3d.py --remote stol@131.159.110.9:/vol/miltank/projects/ukbb/data/cardiac/slice_alignment/aligned_subjects --subjects worst_cases\sax_jitter.txt --lines
+
+# Neighbouring SAX slices crossing inside the heart (smallest / negative gap near the LV axis)
+python slice_viewer_3d.py --remote stol@131.159.110.9:/vol/miltank/projects/ukbb/data/cardiac/slice_alignment/aligned_subjects --subjects worst_cases\sax_gap_min.txt --sa-lines --radius
+
+# Largest rms SAX tilt
+python slice_viewer_3d.py --remote stol@131.159.110.9:/vol/miltank/projects/ukbb/data/cardiac/slice_alignment/aligned_subjects --subjects worst_cases\sax_tilt_rms.txt --sa-lines --radius
+
+# Largest LAX view shift
+python slice_viewer_3d.py --remote stol@131.159.110.9:/vol/miltank/projects/ukbb/data/cardiac/slice_alignment/aligned_subjects --subjects worst_cases\lax_shift_max.txt --lines
+
+--- Segmentation agreement after alignment (outlines coloured by Dice / Hausdorff) ---
+
+# Worst single-slice or view Dice
+python slice_viewer_3d.py --remote stol@131.159.110.9:/vol/miltank/projects/ukbb/data/cardiac/slice_alignment/aligned_subjects --subjects worst_cases\slice_dice_min.txt --metric dice --lines
+
+# Worst Dice of a single intersection line
+python slice_viewer_3d.py --remote stol@131.159.110.9:/vol/miltank/projects/ukbb/data/cardiac/slice_alignment/aligned_subjects --subjects worst_cases\pair_dice_min.txt --metric dice --lines
+
+# Largest single-slice Dice decrease caused by the alignment (compare with Home = acquired pose)
+python slice_viewer_3d.py --remote stol@131.159.110.9:/vol/miltank/projects/ukbb/data/cardiac/slice_alignment/aligned_subjects --subjects worst_cases\slice_dice_drop.txt --metric dice --lines
+
+# Lowest subject mean Dice
+python slice_viewer_3d.py --remote stol@131.159.110.9:/vol/miltank/projects/ukbb/data/cardiac/slice_alignment/aligned_subjects --subjects worst_cases\dice_final_low.txt --metric dice
+
+# Largest subject mean Dice decrease caused by the alignment
+python slice_viewer_3d.py --remote stol@131.159.110.9:/vol/miltank/projects/ukbb/data/cardiac/slice_alignment/aligned_subjects --subjects worst_cases\dice_drop.txt --metric dice
+
+# Worst single-slice Hausdorff distance
+python slice_viewer_3d.py --remote stol@131.159.110.9:/vol/miltank/projects/ukbb/data/cardiac/slice_alignment/aligned_subjects --subjects worst_cases\slice_hd_max.txt --metric hd --lines
+
+# Worst subject Hausdorff distance
+python slice_viewer_3d.py --remote stol@131.159.110.9:/vol/miltank/projects/ukbb/data/cardiac/slice_alignment/aligned_subjects --subjects worst_cases\hd_max.txt --metric hd
+
+--- Image agreement after alignment (NCC, the optimized similarity) ---
+
+# Worst single-slice or view NCC
+python slice_viewer_3d.py --remote stol@131.159.110.9:/vol/miltank/projects/ukbb/data/cardiac/slice_alignment/aligned_subjects --subjects worst_cases\slice_ncc_min.txt --lines
+
+# Worst NCC of a single intersection line
+python slice_viewer_3d.py --remote stol@131.159.110.9:/vol/miltank/projects/ukbb/data/cardiac/slice_alignment/aligned_subjects --subjects worst_cases\pair_ncc_min.txt --lines
+
+# Largest single-slice NCC decrease caused by the alignment
+python slice_viewer_3d.py --remote stol@131.159.110.9:/vol/miltank/projects/ukbb/data/cardiac/slice_alignment/aligned_subjects --subjects worst_cases\slice_ncc_drop.txt --lines
+
+# Lowest subject mean NCC
+python slice_viewer_3d.py --remote stol@131.159.110.9:/vol/miltank/projects/ukbb/data/cardiac/slice_alignment/aligned_subjects --subjects worst_cases\ncc_final_low.txt
+
+# Subjects whose mean NCC the alignment made worst
+python slice_viewer_3d.py --remote stol@131.159.110.9:/vol/miltank/projects/ukbb/data/cardiac/slice_alignment/aligned_subjects --subjects worst_cases\ncc_gain_negative.txt --lines
+
+--- Not (fully) aligned ---
+
+# Not optimized (no crossing views): shown at the acquired pose
+python slice_viewer_3d.py --remote stol@131.159.110.9:/vol/miltank/projects/ukbb/data/cardiac/slice_alignment/aligned_subjects --subjects worst_cases\not_optimized.txt
+
+# In-plane pose model only (a single LAX view, or no SAX stack)
+python slice_viewer_3d.py --remote stol@131.159.110.9:/vol/miltank/projects/ukbb/data/cardiac/slice_alignment/aligned_subjects --subjects worst_cases\inplane_only.txt --lines
+
+
+3. Other ways in
+----------------
+# One subject (or a few, in this order)
+python slice_viewer_3d.py --remote stol@131.159.110.9:/vol/miltank/projects/ukbb/data/cardiac/slice_alignment/aligned_subjects --subjects 2648950 3128541
+
+# Start a list somewhere other than the top (0-based position in the list)
+python slice_viewer_3d.py --remote stol@131.159.110.9:/vol/miltank/projects/ukbb/data/cardiac/slice_alignment/aligned_subjects --subjects worst_cases\slice_shift_max.txt --subject-index 10
+
+# Open at the acquired geometry instead of the best pose
+python slice_viewer_3d.py --remote stol@131.159.110.9:/vol/miltank/projects/ukbb/data/cardiac/slice_alignment/aligned_subjects --subjects worst_cases\slice_dice_drop.txt --start 0
+
+# Free disk space used by downloaded subjects (safe at any time; they are fetched again when needed)
+rmdir /s /q %USERPROFILE%\.cache\cmr_slice_viewer
