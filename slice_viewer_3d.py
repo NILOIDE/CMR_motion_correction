@@ -35,6 +35,10 @@ Usage
     python slice_viewer_3d.py 1000071 --run-dir D:\\some\\run\\dir
     python slice_viewer_3d.py 1000071 --start 0     # open at the acquired geometry
     python slice_viewer_3d.py 1000071 --frame 10 --no-seg
+    python slice_viewer_3d.py --remote user@host:/path/to/run_dir --subjects worst_cases/slice_shift_max.txt
+                                                    # a run on another machine (ssh, key authentication): each
+                                                    # subject is downloaded once into --cache-dir; [ / ] step
+                                                    # through the listed subjects in the file's order
 
 Interaction
 -----------
@@ -60,7 +64,11 @@ Interaction
                         through the history (each line is the intersection of its two planes
                         at the shown step, i.e. the line the loss samples at that step)
                         Sampling lines (also SA-SA) are burned into each slice they belong to:
-                        every slice shows its own copy, visible from both sides, hidden with it
+                        every slice shows its own copy, visible from both sides, hidden with it.
+                        SA-LA lines light blue; LA-LA lines on a LA slice in the colour of the
+                        view they cross (2Ch amber, 3Ch white, 4Ch pink, Ao aquamarine); lines
+                        that coincide on a slice (e.g. 2Ch and 3Ch on the 4Ch view, both near the
+                        long axis) as interleaved dashes of their colours
     k                   toggle the SA-SA sampling lines of neighbouring SA slices
                         (runs with the SA-SA term; violet): stored per
                         snapshot, so a pair only shows a line at steps where its slices cross
@@ -83,15 +91,24 @@ Interaction
                         hovering a chart marks that position on the line in 3D (red tick in both
                         slices) and shows both grey values in the chart title;
                         the small radio next to each slice row picks it. An SA slice shows its
-                        3 SA-LA lines and its SA-SA crossing with the next slice, an LA view its
-                        2 LA-LA lines. Curves: displayed grey value of both slices along the line
+                        SA-LA lines (2Ch, 3Ch, 4Ch and, when present, the aortic slice Ao) and its
+                        SA-SA crossing with the next slice; an LA view (Ao included) first its
+                        crossings with the other LA views, then with every SA slice that crosses
+                        it: its loss line, or for pairs without one (e.g. Ao x 4Ch) the planes'
+                        crossing at the shown step, "(not in loss)", with no thick part. The
+                        intensity and the metric charts each sit in a framed rectangle on the
+                        right showing 4 charts; with more intersections, the mouse wheel over
+                        either rectangle scrolls both together, smoothly (half a chart per notch;
+                        scroll bar on the right edge; the camera does not zoom there). Curves: displayed grey value of both slices along the line
                         at the shown step and frame (thin: inside both images, thick: in the
                         loss; both follow the annealed mask dilation of the shown step, as do
                         the mask contours and the yellow bar); y toggles raw intensities / the loss view: the raw image blurred
                         and averaged over the PSF band across the other slice's slab with the blur
                         and PSF scale of the shown step (from the run's run_config.json; SA-SA
                         lines: blur only); yellow bar along the bottom: inside the LA dilated mask (either
-                        LA slice of the line, at its current pose); NCC over the loss part,
+                        LA slice of the line, at its current pose; SA-Ao lines, the aortic slice having no
+                        segmentation: inside the SA-SA cylinder around the shown step's long axis, the
+                        mask the alignment uses for them); NCC over the loss part,
                         current frame only
     n                   toggle the metric charts below the profile charts: one per intersection, the
                         selected metric per point along the same line (NCC: z_a z_b, mean = NCC;
@@ -119,24 +136,35 @@ import argparse
 import json
 import math
 import re
+import shlex
+import shutil
+import subprocess
 import sys
+import tarfile
+import threading
+from datetime import datetime
 from pathlib import Path
 
 import nibabel as nib
 import numpy as np
 import pandas as pd
 import pyvista as pv
+from pyvista.plotting.renderer import Renderer as PvRenderer
 from matplotlib.path import Path as PolyPath
 from contourpy import contour_generator
 from scipy.ndimage import distance_transform_edt, gaussian_filter, map_coordinates
+from vtkmodules.vtkRenderingCore import vtkActor2D, vtkCoordinate, vtkPolyDataMapper2D
 
 ALIGN_ROOT = Path(r"C:\Users\Nil\Documents\data\ukbb_alignment")
-VIEWS = ["SA", "LA_2Ch", "LA_3Ch", "LA_4Ch"]      # data keys: file names and CSV values
+REMOTE_CACHE = Path.home() / ".cache" / "cmr_slice_viewer"   # downloaded subjects of remote runs (--remote)
+# data keys: file names and CSV values. "ao": the UKBB aortic slice (ao.nii.gz, a single axial slice through the
+# ascending aorta, without segmentation), shown and handled like a LA view; skipped when the file is absent
+VIEWS = ["SA", "LA_2Ch", "LA_3Ch", "LA_4Ch", "ao"]
 
 
 def label(name: str) -> str:
-    """Display form of a view / slice / line-kind name: SA -> SA, LA -> LA (the data keep SA / LA)."""
-    return name.replace("SA", "SA").replace("LA", "LA")
+    """Display form of a view / slice / line-kind name: SA -> SA, LA -> LA (the data keep SA / LA), ao -> Ao."""
+    return "Ao" if name == "ao" else name.replace("SA", "SA").replace("LA", "LA")
 
 SEG_SUBDIR = "nnUNet_segs"
 SEG_SUFFIX = "_nnUNetSeg.nii.gz"
@@ -232,22 +260,52 @@ MASK_CONTOURS_CSV = "mask_contours.csv"
 MASK_CONTOUR_COLOR = "#ffeb3b"
 MASK_CONTOUR_WIDTH = 2
 LINE_COLORS = {"SA-LA": (79, 195, 247), "LA-LA": (255, 183, 77)}   # SA-LA / LA-LA, as in mask_overlay.png
+# LA-LA lines burned into a LA slice take the colour of the view they cross (the 2Ch / 3Ch / 4Ch views all contain the
+# LV long axis, so on one view the lines with the other two nearly coincide). Lines that coincide on a slice are drawn
+# as interleaved dashes, one colour each, so every one of them stays visible.
+LA_PARTNER_COLORS = {"LA_2Ch": (255, 183, 77), "LA_3Ch": (240, 240, 240), "LA_4Ch": (255, 64, 129),
+                     "ao": (100, 255, 218)}       # amber, white, pink, aquamarine
+COINCIDE_DEG, COINCIDE_MM = 6.0, 4.0     # two lines on one slice coincide: directions within / midpoint distance below
+DASH_MM = 8.0                            # dash length of coinciding lines
 LINE_USED_WIDTH = 4     # part of the line that is sampled in the loss
 LINE_IMG_WIDTH = 1      # part inside both images (thin, faint)
 
 # Intersection intensity profiles: small charts on the right, one per intersection of the
-# slice picked with the radio buttons next to the slice list (SA slice: its 3 SA-LA lines and
-# its SA-SA crossing with the next slice; LA view: its 2 LA-LA lines); below them a second set
-# with the selected metric per point along the same lines
-PROFILE_SLOTS = 4
+# slice picked with the radio buttons next to the slice list (SA slice: its SA-LA lines with
+# 2Ch / 3Ch / 4Ch / Ao and its SA-SA crossing with the next slice; LA view, Ao included: its
+# crossings with the other LA views, then with every SA slice); below them a second set with
+# the selected metric per point along the same lines. Each set lives in its own framed
+# rectangle in the right column (intensity on top, metric below; one rectangle takes the whole
+# column when the other set is hidden) showing PROFILE_VISIBLE charts; with more intersections
+# the mouse wheel over either rectangle scrolls both together, smoothly (SCROLL_STEP charts per
+# notch, eased over a few frames; a scroll bar on the right edge shows the position). The charts
+# of each rectangle are drawn by their own overlay renderer whose viewport is the rectangle, so
+# charts scrolled half out of it are clipped at its edges. The column runs from PROFILE_Y0 (above the colour
+# bar and its max slider) to PROFILE_TOP (below the run / subject navigation, top right).
+PROFILE_VISIBLE = 4                         # charts shown per rectangle; the others scroll
 PROFILE_X, PROFILE_W = 0.735, 0.25
-PROFILE_Y0, PROFILE_H, PROFILE_PITCH = 0.19, 0.084, 0.09     # bottom row; 2 x PROFILE_SLOTS rows
+PROFILE_Y0, PROFILE_TOP = 0.19, 0.935       # column of the charts (normalised window height)
+PROFILE_GAP = 0.006                         # vertical gap between two charts
+RECT_GAP = 0.014                            # gap between the intensity and the metric rectangle
+RECT_PAD = 0.004                            # frame padding around the charts
+SCROLL_X0, SCROLL_W = PROFILE_X + PROFILE_W + 0.004, 0.005   # scroll bar, right of the charts
+RECT_X0, RECT_X1 = PROFILE_X - RECT_PAD, SCROLL_X0 + SCROLL_W + 0.003
+RECT_COLOR = (0.35, 0.35, 0.35)             # rectangle frame
+SCROLL_TRACK_COLOR = (0.20, 0.20, 0.20)
+SCROLL_THUMB_COLOR = (0.70, 0.70, 0.70)
+SCROLL_STEP = 0.5                           # charts scrolled per mouse-wheel notch
+SCROLL_EASE = 0.45                          # fraction of the remaining distance covered per animation frame
+SCROLL_TIMER_MS = 15                        # animation frame interval
+TICK_LABEL_PX = 12                          # min vertical distance (px) between two y tick labels
+CHART_FRAME_PX = 34                         # chart height (px) taken by its title and x axis, not the plot area
 NAV_RIGHT_W = 380                          # width (px) of the run / subject navigation block, top right
 HEADER_TOP_DY = 14                         # header (title, run name) top edge, px below the window top
 HIST_SLIDER_Y, FRAME_SLIDER_Y = 0.03, 0.075  # bottom sliders (normalised height of their tubes)
 SLIDER_TITLE_GAP = 14                      # px between a bottom slider's title and its tube
 PROFILE_COLORS = ("#e0e0e0", "#ffb74d")    # picked slice, the other slice of the line
 PROFILE_STEP_MM = 0.5
+BLUR_QUANTUM_MM = 0.2                     # motion_gradient.align applies the blur sigma rounded up to this
+BLUR_TEXT_X = 218                         # blur value right of the "Image blurring  [g]" label
 PROFILE_RADIO_X = 230                     # radio column right of the slice rows
 KNOB_LABEL_DY = 9                          # px from a bottom slider's tube to its value label
 PROFILE_MASK_Y = 10                        # height (grey units) of the in-mask bar along the chart bottom
@@ -285,6 +343,97 @@ def _as_4d(arr: np.ndarray) -> np.ndarray:
     raise ValueError(f"Unexpected array dimensionality {arr.ndim}")
 
 
+def _n_frames_on_disk(img) -> int:
+    """Number of cine frames of a NIfTI image (its 4th dimension; 1 for a 2D / 3D image), from the header."""
+    return int(img.shape[3]) if len(img.shape) > 3 else 1
+
+
+def apex_direction(sax: list[tuple[np.ndarray, tuple, np.ndarray | None]],
+                   lax: list[tuple[np.ndarray, np.ndarray | None]] = ()) -> np.ndarray | None:
+    """Unit vector (world) from the base of the SAX stack to its apex, or None with fewer than two slices.
+    sax: per SAX slice in stack order (affine, in-plane shape (X, Y), segmentation or None); lax: per LAX view
+    (affine, segmentation (X, Y, ...) or None). The stack axis is oriented by anatomy: in the LAX segmentations the atria
+    (labels 4, 5) lie at the base and the LV blood pool (label 1) toward the apex, so the apex is on the side of the LV
+    centroid relative to the atria centroid (summed over the views). Without both in any view: the UKBB convention,
+    slice 0 basal (the anatomy agreed with it on 22 of 22 test subjects; the SAX segmented area does not tell, as the
+    basal-most slices lie above the ventricles and are empty)."""
+    if len(sax) < 2:
+        return None
+    centres = [(A @ np.array([(sh[0] - 1) / 2.0, (sh[1] - 1) / 2.0, 0.0, 1.0]))[:3] for A, sh, _ in sax]
+    d = centres[-1] - centres[0]
+    if np.linalg.norm(d) < 1e-6:
+        return None
+    d = d / np.linalg.norm(d)
+    vote = 0.0
+    for A, g in lax:
+        if g is None:
+            continue
+        g = np.asarray(g)
+        g = g.reshape(g.shape[0], g.shape[1], -1).max(-1)
+        cs = []
+        for m in (g == 1, np.isin(g, (4, 5))):
+            ij = np.argwhere(m)
+            cs.append(None if len(ij) < 20 else (np.asarray(A, float) @ np.r_[ij.mean(0), 0.0, 1.0])[:3])
+        if cs[0] is not None and cs[1] is not None:
+            vote += float((cs[0] - cs[1]) @ d)
+    return -d if vote < 0 else d
+
+
+def _shift2d(a: np.ndarray, di: int, dj: int) -> np.ndarray:
+    """a shifted by (di, dj) pixels, zero-filled."""
+    out = np.zeros_like(a)
+    X, Y = a.shape
+    if abs(di) >= X or abs(dj) >= Y:
+        return out
+    out[max(di, 0):X + min(di, 0), max(dj, 0):Y + min(dj, 0)] = a[max(-di, 0):X - max(di, 0), max(-dj, 0):Y - max(dj, 0)]
+    return out
+
+
+def apical_sweep(heart: np.ndarray, affine: np.ndarray, apex: np.ndarray | None, extend_mm: float) -> np.ndarray:
+    """The heart region (X, Y) of a long-axis slice swept toward the apex by extend_mm: the union of its copies
+    shifted 0 ... extend_mm along the in-plane projection of `apex` (the base-to-apex direction), at most one pixel
+    apart. The dilated mask measured from it (--mask-dilation-mm, annealed) then reaches extend_mm further past the
+    apex, whatever the segmentation does there (apical segmentations are often incomplete). Unchanged when the slice
+    plane is far from containing the long axis (projection < half), or without a direction."""
+    if apex is None or extend_mm <= 0 or not heart.any():
+        return heart
+    M = np.asarray(affine, float)[:3, :3]
+    n = np.cross(M[:, 0], M[:, 1])
+    n /= np.linalg.norm(n)
+    u = apex - (apex @ n) * n
+    if np.linalg.norm(u) < 0.5:
+        return heart
+    u /= np.linalg.norm(u)
+    v = np.array([u @ M[:, 0] / (M[:, 0] @ M[:, 0]), u @ M[:, 1] / (M[:, 1] @ M[:, 1])])   # pixels per mm along u
+    steps = max(1, int(math.ceil(extend_mm * np.abs(v).max())))
+    out = heart.copy()
+    for k in range(1, steps + 1):
+        di, dj = np.rint(k / steps * extend_mm * v).astype(int)
+        out |= _shift2d(heart, int(di), int(dj))
+    return out
+
+
+def phase_frames(n_available: int, n: int) -> list[int]:
+    """The frames of an n_available-frame cine at the phases of an n-frame one: frame k of n -> floor(k / n *
+    n_available), as motion_gradient.phase_frames. Every cine spans one cardiac cycle, so this pairs the same
+    cardiac phase across cines of different frame counts (UKBB: the aortic cine has 100 frames, the others 50)."""
+    return sorted({k * n_available // n for k in range(n)})        # integer arithmetic: exact for every k
+
+
+def _read_frames(img, frames: list[int], dtype=np.float32) -> np.ndarray:
+    """The given frames of a NIfTI image as (x, y, z, t). Evenly strided frames (e.g. every other frame of the
+    aortic cine) are read with a strided slice of the array proxy, so the frames left out are never kept in
+    memory; other selections read the whole image first."""
+    n_disk = _n_frames_on_disk(img)
+    if frames == list(range(n_disk)):
+        return _as_4d(np.asarray(img.dataobj, dtype=dtype))
+    if len(img.shape) > 3:
+        step = frames[1] - frames[0] if len(frames) > 1 else n_disk
+        if frames == list(range(frames[0], n_disk, step))[:len(frames)] and frames[0] + step * len(frames) >= n_disk:
+            return _as_4d(np.asarray(img.dataobj[..., frames[0]::step], dtype=dtype))
+    return _as_4d(np.asarray(img.dataobj, dtype=dtype))[..., frames]
+
+
 def _slice_index(path: Path) -> int:
     m = SLICE_RE.search(path.name)
     return int(m.group(1)) if m else 0
@@ -307,20 +456,33 @@ def find_view_files(base: Path, view: str) -> tuple[str | None, list[Path]]:
     return None, []
 
 
+SAX_SEG_PREFERRED = "seg_sa.nii.gz"     # UKBB SAX segmentation, used before the nnU-Net one when present (same labels)
+
+
 def seg_path_for(base: Path, img_path: Path) -> Path:
-    """nnUNet_segs/<image name without .nii.gz>_nnUNetSeg.nii.gz"""
+    """nnUNet_segs/<image name without .nii.gz>_nnUNetSeg.nii.gz; for the SAX stack (one volume) nnUNet_segs/seg_sa.nii.gz
+    when present (moco_nifti.py prefers it as well; its per-slice outputs carry the segmentation it used)."""
     stem = img_path.name[: -len(NII_SUFFIX)]
+    preferred = base / SEG_SUBDIR / SAX_SEG_PREFERRED
+    if stem == to_disk("SA") and preferred.exists():
+        return preferred
     return base / SEG_SUBDIR / f"{stem}{SEG_SUFFIX}"
 
 
-def _load_seg(seg_path: Path, img_shape: tuple, img_affine: np.ndarray, label: str):
+def _load_seg(seg_path: Path, img_shape: tuple, img_affine: np.ndarray, label: str, frames: list[int] | None = None):
+    """The segmentation of an image, at the image's selected `frames` (default: all), or None."""
     if not seg_path.exists():
         return None
     seg_img = nib.load(str(seg_path))
     # Some seg files are stored as scaled int16 (scl_slope/inter); nibabel then
     # returns floats that may sit just below the integer label, so round
     # instead of truncating.
-    seg = _as_4d(np.rint(np.asarray(seg_img.dataobj)).astype(np.int16))
+    sel = list(range(_n_frames_on_disk(seg_img))) if frames is None else frames
+    if sel and max(sel) >= _n_frames_on_disk(seg_img):
+        print(f"[warn] {label}: seg has {_n_frames_on_disk(seg_img)} frames, fewer than its image; "
+              f"ignoring segmentation", file=sys.stderr)
+        return None
+    seg = np.rint(_read_frames(seg_img, sel, np.float32)).astype(np.int16)
     if seg.shape != img_shape:
         print(f"[warn] {label}: seg shape {seg.shape} != image shape {img_shape}; "
               f"ignoring segmentation", file=sys.stderr)
@@ -336,16 +498,22 @@ def load_images(instance_dir: Path) -> dict:
     Load all views found in an Instance_<n> directory.
 
     Returns {view: {"mode": "volume"|"slices", "slices": [slice, ...]}} where each
-    slice is {"grey": (nx, ny, t) uint8, "seg": (nx, ny, t) int16 | None,
+    slice is {"grey": (nx, ny, t) uint8, "seg": (nx, ny, t) int16 | None, with t the smallest frame count of
+    all the subject's cines and the other cines read at those phases (phase_frames; only those frames are kept),
     "affine": 4x4 with the origin at this slice (k = 0), "index": slice index
     within the view (0 for LA), "name": str, "file": str}.
     """
     if not instance_dir.is_dir():
         raise FileNotFoundError(instance_dir)
 
+    found = {view: find_view_files(instance_dir, view) for view in VIEWS}
+    # All cines are shown at the phases of the one with the fewest frames (UKBB: 50; the aortic cine's 100 frames
+    # are read every other one -- frame k of the viewer is the same cardiac phase in every slice, see phase_frames)
+    counts = [_n_frames_on_disk(nib.load(str(p))) for mode, paths in found.values() if mode is not None for p in paths]
+    n_common = min(counts) if counts else 1
     data = {}
     for view in VIEWS:
-        mode, paths = find_view_files(instance_dir, view)
+        mode, paths = found[view]
         if mode is None:
             print(f"[warn] {view}: no {view}{NII_SUFFIX} or {view}_sliceNN{NII_SUFFIX} "
                   f"in {instance_dir}; skipping view", file=sys.stderr)
@@ -356,9 +524,11 @@ def load_images(instance_dir: Path) -> dict:
         raw_slices = []
         for p in paths:
             img = nib.load(str(p))
-            arr = _as_4d(np.asarray(img.dataobj, dtype=np.float32))
+            n_disk = _n_frames_on_disk(img)
+            frames = phase_frames(n_disk, n_common)
+            arr = _read_frames(img, frames)
             affine = np.asarray(img.affine, dtype=np.float64)
-            seg = _load_seg(seg_path_for(instance_dir, p), arr.shape, affine, p.name)
+            seg = _load_seg(seg_path_for(instance_dir, p), arr.shape, affine, p.name, frames)
             zooms = img.header.get_zooms()
             thick_hdr = float(zooms[2]) if len(zooms) > 2 else float("nan")
             nz = arr.shape[2]
@@ -380,6 +550,7 @@ def load_images(instance_dir: Path) -> dict:
                     "index": idx,
                     "file": p.name,
                     "thick_hdr": thick_hdr,
+                    "n_frames_disk": n_disk,
                 })
         raw_slices.sort(key=lambda s: s["index"])
 
@@ -400,6 +571,7 @@ def load_images(instance_dir: Path) -> dict:
                 "raw": s["raw"],                  # NIfTI intensities: what the loss compares
                 "lo": float(lo), "hi": float(hi),  # display scaling of the view (grey = (raw - lo) / (hi - lo))
                 "thick_hdr": s["thick_hdr"],
+                "n_frames_disk": s["n_frames_disk"],   # frames in the file (the cine keeps n_common of them)
             })
         data[view] = {"mode": mode, "slices": slices}
 
@@ -454,8 +626,10 @@ def describe_images(instance_dir: Path, data: dict) -> None:
     for view, v in data.items():
         labs = sorted({int(x) for s in v["slices"] if s["seg"] is not None for x in np.unique(s["seg"])})
         shape = v["slices"][0]["grey"].shape
+        n_disk = v["slices"][0].get("n_frames_disk", shape[2])
+        frames = f"{shape[2]} frames" + (f" (of {n_disk}, at the same phases)" if n_disk != shape[2] else "")
         print(f"  {label(view):8s} {v['mode']:7s} {len(v['slices']):2d} slice(s) of {shape[0]}x{shape[1]}, "
-              f"{shape[2]} frames, seg labels={','.join(map(str, labs)) or 'none'}")
+              f"{frames}, seg labels={','.join(map(str, labs)) or 'none'}")
 
 
 # ----------------------------------------------------------------------------
@@ -661,6 +835,151 @@ def find_run_dir(align_root: Path, subject: str | None, run: str | None) -> Path
         return cand
     runs = runs_by_creation(align_root, subject)
     return runs[0] if runs else None
+
+
+class RemoteRun:
+    """A run directory on another machine, `user@host:/path/to/run_dir`, read over ssh (key authentication; ssh runs
+    with BatchMode, so it fails instead of prompting). Each subject folder (images, segmentations, metrics/) is
+    downloaded once, as one tar stream, into a local mirror of the run, <cache>/<host>/<run name>/, and from there
+    loaded like a local run; a subject is only complete once its marker file is written, so an interrupted download
+    is fetched again. The next subject of the list is prefetched in the background while one is viewed."""
+
+    MARKER = ".downloaded"
+
+    def __init__(self, spec: str, cache_root: Path):
+        if ":" not in spec:
+            raise ValueError(f"--remote expects user@host:/path/to/run_dir, got {spec!r}")
+        self.target, path = spec.split(":", 1)
+        self.path = path.rstrip("/")
+        host = re.sub(r"[^\w.-]", "_", self.target.split("@")[-1])
+        self.local = Path(cache_root) / host / Path(self.path).name
+        self.local.mkdir(parents=True, exist_ok=True)
+        for stale in self.local.glob(".partial-*"):          # downloads interrupted by closing the viewer
+            shutil.rmtree(stale, ignore_errors=True)
+        self._lock = threading.Lock()
+        self._busy: dict[str, threading.Event] = {}         # subject -> set when its download has finished
+
+    def _ssh(self, command: str, **kwargs) -> subprocess.Popen:
+        return subprocess.Popen(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", self.target, command],
+                                **kwargs)
+
+    def run(self, command: str, timeout: float = 300) -> str:
+        """Output of a shell command on the remote machine (raises on failure)."""
+        p = self._ssh(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        out, err = p.communicate(timeout=timeout)
+        if p.returncode:
+            raise RuntimeError(f"ssh {self.target} {command!r} failed ({p.returncode}): {err.strip()}")
+        return out
+
+    def _download(self, rel: str) -> None:
+        """Stream <remote run>/<rel> (a file or folder) into the mirror as a tar archive, via a temporary folder."""
+        tmp = self.local / f".partial-{rel.replace('/', '_')}"
+        shutil.rmtree(tmp, ignore_errors=True)
+        tmp.mkdir(parents=True)
+        p = self._ssh(f"tar -C {shlex.quote(self.path)} -cf - {shlex.quote(rel)}",
+                      stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            with tarfile.open(fileobj=p.stdout, mode="r|") as tar:
+                tar.extractall(tmp, filter="data")
+        finally:
+            err = p.stderr.read().decode(errors="replace")
+            p.wait()
+        if p.returncode:
+            shutil.rmtree(tmp, ignore_errors=True)
+            raise RuntimeError(f"downloading {self.target}:{self.path}/{rel} failed: {err.strip()}")
+        dest = self.local / rel
+        if dest.exists():
+            shutil.rmtree(dest) if dest.is_dir() else dest.unlink()
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        (tmp / rel).replace(dest)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    def fetch_subject(self, subject: str) -> Path:
+        """The local copy of a subject folder, downloaded first if needed (waits for a running prefetch of it)."""
+        marker = self.local / subject / self.MARKER
+        while True:
+            if marker.exists():
+                return self.local / subject
+            with self._lock:
+                event = self._busy.get(subject)
+                if event is None:
+                    event = self._busy[subject] = threading.Event()
+                    mine = True
+                else:
+                    mine = False
+            if not mine:
+                event.wait()
+                continue
+            try:
+                print(f"[remote] downloading {subject} from {self.target}:{self.path} ...", flush=True)
+                self._download(subject)
+                marker.write_text("")
+            finally:
+                with self._lock:
+                    self._busy.pop(subject, None)
+                event.set()
+
+    def prefetch(self, subject: str) -> None:
+        """Download a subject in the background (errors are only reported)."""
+        def work():
+            try:
+                self.fetch_subject(subject)
+            except Exception as exc:                          # noqa: BLE001
+                print(f"[remote] prefetch of {subject} failed: {exc}", file=sys.stderr)
+        if not (self.local / subject / self.MARKER).exists():
+            threading.Thread(target=work, daemon=True).start()
+
+    def fetch_run_config(self) -> None:
+        """overall_metrics/run_config.json (the run's settings: mask annealing, line sampling, PSF), if present."""
+        try:
+            self._download("overall_metrics/run_config.json")
+        except RuntimeError as exc:
+            print(f"[remote] no run_config.json: {exc}", file=sys.stderr)
+
+    def list_subjects(self) -> list[str]:
+        """The run's subjects with images, from overall_metrics/motion_summary.csv (one row per subject; listing the
+        run directory itself is slow on a large cohort), in numerical order."""
+        out = self.run(f"tail -n +2 {shlex.quote(self.path + '/overall_metrics/motion_summary.csv')} | cut -d, -f1,2")
+        status = {}
+        for line in out.splitlines():
+            sid, _, st = line.partition(",")
+            if sid.strip():
+                status[sid.strip()] = st.strip()               # append-only: the latest row of a subject wins
+        return sorted((sid for sid, st in status.items() if st != "no_images"), key=lambda x: (len(x), x))
+
+
+SUBJECT_FOCUS: dict[str, str] = {}      # subject -> slice to profile first, from a --subjects list (read_subject_list)
+
+
+def focus_slice(image: str, index: int) -> str:
+    """The viewer's name of slice `index` of an image as written in the alignment CSVs: SAX 5 -> SA[05], LAX_4Ch 0 ->
+    LA_4Ch (a single slice keeps the view name), ao 0 -> ao."""
+    view = from_disk(image)
+    return f"{view}[{index:02d}]" if view == "SA" else view
+
+
+def read_subject_list(items: list[str]) -> list[str]:
+    """Subject ids from --subjects: each item is a subject id or a text file with one subject per line (its first
+    whitespace / comma separated token; lines starting with '#' and non-numeric tokens, e.g. a header, are skipped).
+    Order kept, duplicates dropped. Lines of a worst_cases.py list (subject, value, image, slice, ...) also give the
+    slice where the subject is worst: it is the one profiled first (SUBJECT_FOCUS)."""
+    out = []
+    for item in items:
+        p = Path(item)
+        if p.is_file():
+            for line in p.read_text().splitlines():
+                toks = line.split()
+                if not toks or toks[0].startswith("#"):
+                    continue
+                tok = re.split(r"[\s,]+", line.strip(), maxsplit=1)[0]
+                if not tok.isdigit():
+                    continue
+                out.append(tok)
+                if len(toks) >= 4 and toks[3].isdigit() and tok not in SUBJECT_FOCUS:
+                    SUBJECT_FOCUS[tok] = focus_slice(toks[2], int(toks[3]))
+        else:
+            out += [t for t in re.split(r"[\s,]+", item) if t]
+    return list(dict.fromkeys(out))
 
 
 # ----------------------------------------------------------------------------
@@ -929,6 +1248,7 @@ class SliceViewer:
 
     # --- per-subject lifecycle ---------------------------------------------------
     def _reset_scene_state(self):
+        self._blur_text = None                       # text next to "Image blurring" (built by _build_ui with a config)
         self.entries: list[dict] = []
         self._entry_by_key: dict[tuple, dict] = {}
         self._mask_items: list[dict] = []
@@ -947,6 +1267,11 @@ class SliceViewer:
         self._hist_slider = None
         self._knob = {}
         self._scalar_bar = None
+        self._profile_scroll = 0.0                   # scroll position (charts, fractional) of the chart rectangles
+        self._scroll_target = 0.0                    # where the scroll animation is heading
+        self._n_profile_items = 0
+        self._pcache = None                          # intersections and chart data of the current state (see
+                                                     # _update_profiles / _render_profiles)
 
     def _text(self, *args, **kwargs):
         actor = self.pl.add_text(*args, **kwargs)
@@ -1071,6 +1396,11 @@ class SliceViewer:
             self._build_slices()
         self._build_overlays()
         names = [e["name"] for e in self.entries]
+        focus = loaded.get("profile")                    # e.g. a --subjects list's worst slice of this subject
+        if focus in names:
+            if focus != self.profile_key:
+                self._profile_scroll = self._scroll_target = 0.0
+            self.profile_key = focus
         if self.profile_key not in names:
             sa = [n for n, e in zip(names, self.entries) if e["view"] == "SA"]
             self.profile_key = sa[len(sa) // 2] if sa else (names[0] if names else None)
@@ -1164,7 +1494,7 @@ class SliceViewer:
             self._move_values.append(pl.add_text("", position=(mx + 102, my + 3), font_size=8,
                                                  color="white"))
         my = MOVE_TOP
-        momentary_x = MOVE_X + 232                   # right of "Manual correction SA(xx)"
+        momentary_x = MOVE_X + 266                   # right of "Manual correction LA_4Ch" (the longest)
         holder = {}
 
         def _reset(_state, h=holder):
@@ -1179,8 +1509,8 @@ class SliceViewer:
 
         # intersection charts (persistent; filled per subject / step / frame): intensity profiles on
         # top, below them one chart per intersection with the selected metric per point
-        def new_chart(row):
-            ch = pv.Chart2D(size=(PROFILE_W, PROFILE_H), loc=(PROFILE_X, PROFILE_Y0 + row * PROFILE_PITCH),
+        def new_chart():                                     # placed by _layout_charts when shown
+            ch = pv.Chart2D(size=(PROFILE_W, 0.08), loc=(PROFILE_X, PROFILE_Y0),
                             x_label="", y_label="", grid=False)
             ch.background_color = (0.10, 0.10, 0.10, 0.85)
             ch.border_color = (0.35, 0.35, 0.35)
@@ -1196,10 +1526,22 @@ class SliceViewer:
             ch.visible = False
             return ch
 
+        # one overlay renderer per chart rectangle (layer 1: transparent, not interactive -- the camera keeps
+        # following the main renderer); its viewport is the rectangle, which clips the charts scrolled past its edges
+        pl.ren_win.SetNumberOfLayers(max(2, pl.ren_win.GetNumberOfLayers()))
+        self._chart_rens = {}
+        for name in ("profile", "metric"):
+            ren = PvRenderer(pl, border=False)
+            ren.SetLayer(1)
+            ren.InteractiveOff()
+            ren.SetViewport(0.0, 0.0, 0.01, 0.01)
+            pl.ren_win.AddRenderer(ren)
+            self._chart_rens[name] = ren
+
         x0 = np.array([0.0, 1.0])
         self._profile_charts, self._metric_charts = [], []
-        for k in range(PROFILE_SLOTS):
-            ch = new_chart(2 * PROFILE_SLOTS - 1 - k)
+        for k in range(PROFILE_VISIBLE + 1):              # + 1: while scrolling, a chart is partly in view at each end
+            ch = new_chart()
             ch.y_axis.tick_locations = (0, 128, 255)
             ch.y_axis.tick_labels = ("0", "128", "255")
             plots = {}
@@ -1210,10 +1552,10 @@ class SliceViewer:
             plots["cursor"] = ch.line(np.array([0.0, 0.0]), np.array([0.0, 255.0]), color=HOVER_COLOR, width=1.5)
             plots["cursor"].visible = False
             ch.y_range = [0, 255]
-            pl.add_chart(ch)
-            self._profile_charts.append({"chart": ch, "plots": plots, "item": None})
+            self._chart_rens["profile"].add_chart(ch)
+            self._profile_charts.append({"chart": ch, "plots": plots, "item": None, "bound": None})
 
-            ch = new_chart(PROFILE_SLOTS - 1 - k)
+            ch = new_chart()
             # as the profile charts: thin over the whole intersection, thick where it enters the loss, mask bar
             plots = {"zero": ch.line(x0, x0 * 0, color=(0.4, 0.4, 0.4), width=1.0),
                      "full": ch.line(x0, x0 * np.nan, color=PROFILE_LOSS_COLOR, width=1.0),
@@ -1221,8 +1563,42 @@ class SliceViewer:
                      "mask": ch.line(x0, x0 * np.nan, color=MASK_CONTOUR_COLOR, width=2.0),
                      "cursor": ch.line(np.array([0.0, 0.0]), np.array([0.0, 1.0]), color=HOVER_COLOR, width=1.5)}
             plots["cursor"].visible = False
-            pl.add_chart(ch)
+            self._chart_rens["metric"].add_chart(ch)
             self._metric_charts.append({"chart": ch, "plots": plots, "item": None})
+        self._scroll_timer = None
+        pl.iren.interactor.AddObserver("TimerEvent", lambda *_: self._scroll_tick())
+
+        # the two chart rectangles: frame, scroll track and thumb (2D actors, normalised viewport coordinates)
+        self._rects = {}
+        for name in ("profile", "metric"):
+            parts = {}
+            for part, color, filled in (("frame", RECT_COLOR, False), ("track", SCROLL_TRACK_COLOR, True),
+                                        ("thumb", SCROLL_THUMB_COLOR, True)):
+                poly = (pv.PolyData(np.zeros((4, 3)), faces=np.array([4, 0, 1, 2, 3])) if filled
+                        else pv.PolyData(np.zeros((4, 3)), lines=np.array([5, 0, 1, 2, 3, 0])))
+                mapper = vtkPolyDataMapper2D()
+                mapper.SetInputData(poly)
+                coord = vtkCoordinate()
+                coord.SetCoordinateSystemToNormalizedViewport()
+                mapper.SetTransformCoordinate(coord)
+                actor = vtkActor2D()
+                actor.SetMapper(mapper)
+                actor.GetProperty().SetColor(*color)
+                actor.GetProperty().SetLineWidth(1.0)
+                actor.SetVisibility(False)
+                pl.renderer.AddViewProp(actor)
+                parts[part] = (poly, actor)
+            self._rects[name] = {"parts": parts, "box": None}
+        # mouse wheel over a rectangle: scroll the charts (and keep the camera from zooming; the interactor style
+        # listens at priority 0, this observer runs first and aborts the event)
+        iren = pl.iren.interactor
+        for evt, step in (("MouseWheelForwardEvent", -1), ("MouseWheelBackwardEvent", +1)):
+            holder = {}
+
+            def _wheel(obj, _evt, step=step, holder=holder):
+                if self._on_wheel(step):
+                    obj.GetCommand(holder["tag"]).SetAbortFlag(1)
+            holder["tag"] = iren.AddObserver(evt, _wheel, 10.0)
 
         # hover: a tick across the intersection line at the hovered position, burned into both slices
         self._hover = None                                   # (chart slot, t along the line) or None
@@ -1405,22 +1781,37 @@ class SliceViewer:
             e = self._entry_by_key.get(kb)
             nx, ny = (e["slice"]["grey"].shape[:2] if e is not None else (np.nan, np.nan))
             centre_b.append([(nx - 1) / 2.0, (ny - 1) / 2.0, 0.0])
-        rgb = np.array([LINE_COLORS.get(k, (255, 255, 255)) for k in df["kind"]], dtype=np.uint8)
-        n = len(df)
+        kinds = list(df["kind"])
+        virtual = [False] * len(df)
+        # pairs missing from lines.csv that enter the loss at an earlier, wider mask dilation (see _virtual_lines)
+        for v in self._virtual_lines({(a, b) for a, b in zip(keys_a, keys_b)}):
+            keys_a.append(v["ka"]); keys_b.append(v["kb"]); kinds.append(v["kind"]); virtual.append(True)
+            x0, d = np.vstack([x0, v["x0"]]), np.vstack([d, v["d"]])
+            t_used = np.vstack([t_used, [np.nan, np.nan]]); t_img = np.vstack([t_img, v["t_img"]])
+            centre_b.append(v["centre_b"])
+        rgb = np.array([LINE_COLORS.get(k, (255, 255, 255)) for k in kinds], dtype=np.uint8)
+        n = len(keys_a)
         self._line_items = {"keys_a": keys_a, "keys_b": keys_b, "x0": x0, "d": d,
                             "t_used": t_used, "t_used_nominal": t_used.copy(), "t_used_cache": {},
                             "t_img": t_img, "centre_b": np.array(centre_b), "n": n,
-                            "per_slice": []}
+                            "virtual": np.array(virtual, bool), "per_slice": []}
         # every slice gets its own burned-in copy of the lines it is part of
         for e in self.entries:
             idx = np.array([i for i in range(n) if e["key"] in (keys_a[i], keys_b[i])], dtype=int)
             if not idx.size:
                 continue
             k = len(idx)
-            item = {"entry": e, "idx": idx}
+            # LA-LA lines on this slice: the colour of the view they cross (LA_PARTNER_COLORS)
+            col = rgb[idx].copy()
+            la_la = np.array([keys_a[i][0] != "SA" and keys_b[i][0] != "SA" for i in idx])
+            for j, i in enumerate(idx):
+                if la_la[j]:
+                    other = keys_b[i] if keys_a[i] == e["key"] else keys_a[i]
+                    col[j] = LA_PARTNER_COLORS.get(other[0], col[j])
+            item = {"entry": e, "idx": idx, "rgb": col, "la_la": la_la}
             for name, width, opacity in (("img", LINE_IMG_WIDTH, 0.45), ("used", LINE_USED_WIDTH, 1.0)):
                 mesh = pv.PolyData(np.zeros((4 * k, 3)), lines=burn_cells(k))   # line cells only, no vertices
-                mesh.cell_data["rgb"] = np.concatenate([rgb[idx], rgb[idx]])
+                mesh.cell_data["rgb"] = np.concatenate([col, col])
                 item[name + "_mesh"] = mesh
                 item[name + "_actor"] = self._mesh(mesh, scalars="rgb", rgb=True, line_width=width, opacity=opacity,
                                                    lighting=False, show_scalar_bar=False,
@@ -1449,13 +1840,74 @@ class SliceViewer:
             return
         x0, d, li["t_used"] = self._line_geometry(snap)
         li["cur_x0"], li["cur_d"] = x0, d
+        off = li.get("virtual", np.zeros(li["n"], bool)) & ~np.isfinite(li["t_used"]).all(1)  # virtual, not in loss
         for name in ("used", "img"):
             t = li["t_" + name]                                 # (N, 2)
             t = np.where(np.isfinite(t), t, li["t_img"][:, :1])  # no loss points: zero-length segment
+            t = np.where(off[:, None], li["t_img"][:, :1], t)
             seg = np.stack([x0 + t[:, :1] * d, x0 + t[:, 1:] * d], axis=1)   # (N, 2, 3)
             for item in li["per_slice"]:
                 A = self._affine_for(item["entry"], snap)
-                item[name + "_mesh"].points = burn_points(seg[item["idx"]], A)
+                segs, cols = self._dashed(item, seg[item["idx"]], A)
+                if not len(segs):                                # placeholder: a zero-length segment on the slice
+                    first = seg[item["idx"][0], 0]
+                    segs, cols = np.stack([first, first])[None], item["rgb"][:1]
+                mesh = pv.PolyData(burn_points(segs, A), lines=burn_cells(len(segs)))
+                mesh.cell_data["rgb"] = np.concatenate([cols, cols])
+                item[name + "_mesh"].copy_from(mesh)
+
+    def _dashed(self, item: dict, seg: np.ndarray, A: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """The segments (K, 2, 3) and colours (K, 3) to burn into one slice: its lines as they are, except LA-LA
+        lines that coincide on this slice (directions within COINCIDE_DEG, midpoints within COINCIDE_MM of the other
+        line, in the slice plane), which are cut into DASH_MM dashes along a common axis and interleaved: dash k
+        belongs to the k mod m-th of the m coinciding lines, so each keeps its own colour where they overlap."""
+        n = np.cross(A[:3, 0], A[:3, 1]); n /= np.linalg.norm(n)
+        p = seg - ((seg - A[:3, 3]) @ n)[..., None] * n                     # in the slice plane
+        rows = np.flatnonzero(item["la_la"])
+        groups = []
+        for i in rows:
+            di = p[i, 1] - p[i, 0]
+            li_ = np.linalg.norm(di)
+            for g in groups:
+                j = g[0]
+                dj = p[j, 1] - p[j, 0]
+                lj = np.linalg.norm(dj)
+                if li_ < 1e-6 or lj < 1e-6:
+                    continue
+                cos = abs(di @ dj) / (li_ * lj)
+                mid = p[i].mean(0) - p[j, 0]
+                off = np.linalg.norm(mid - (mid @ dj) / lj ** 2 * dj)
+                if cos >= np.cos(np.radians(COINCIDE_DEG)) and off <= COINCIDE_MM:
+                    g.append(i)
+                    break
+            else:
+                groups.append([i])
+        dashed = {i for g in groups if len(g) > 1 for i in g}
+        segs = [seg[i] for i in range(len(seg)) if i not in dashed]
+        cols = [item["rgb"][i] for i in range(len(seg)) if i not in dashed]
+        for g in groups:
+            if len(g) < 2:
+                continue
+            u = p[g[0], 1] - p[g[0], 0]
+            u /= np.linalg.norm(u)
+            for r, i in enumerate(g):
+                s0, s1 = p[i] @ u                                          # positions along the common axis
+                if abs(s1 - s0) < 1e-9:
+                    continue
+                lo, hi = min(s0, s1), max(s0, s1)
+                for kk in range(int(np.floor(lo / DASH_MM)), int(np.floor(hi / DASH_MM)) + 1):
+                    if kk % len(g) != r:
+                        continue
+                    a_, b_ = max(lo, kk * DASH_MM), min(hi, (kk + 1) * DASH_MM)
+                    if b_ <= a_:
+                        continue
+                    fa, fb = (a_ - s0) / (s1 - s0), (b_ - s0) / (s1 - s0)
+                    segs.append(np.stack([seg[i, 0] + fa * (seg[i, 1] - seg[i, 0]),
+                                          seg[i, 0] + fb * (seg[i, 1] - seg[i, 0])]))
+                    cols.append(item["rgb"][i])
+        if not segs:
+            return np.zeros((0, 2, 3)), np.zeros((0, 3), np.uint8)
+        return np.array(segs), np.array(cols, dtype=np.uint8)
 
     def _line_geometry(self, snap: dict):
         """(x0, d, t_used) of every SA-LA / LA-LA line at `snap` (manual offsets included): the intersection
@@ -1624,6 +2076,8 @@ class SliceViewer:
     def set_profile(self, name: str):
         if name not in self._entry_by_name():
             return
+        if name != self.profile_key:
+            self._profile_scroll = self._scroll_target = 0.0
         self.profile_key = name
         for n, w in self._profile_radios.items():
             w.GetRepresentation().SetState(int(n == name))
@@ -1632,8 +2086,14 @@ class SliceViewer:
         self._update_profiles()
         self.pl.render()
 
+    def _menu_entries(self) -> list[dict]:
+        """The slices in the order of the left-hand menu: the aortic slice, then the LA views (VIEWS order), then the
+        SA slices (any other view after the LA views, before SA)."""
+        rank = {"ao": 0, "SA": 2}
+        return sorted(self.entries, key=lambda e: rank.get(e["view"], 1))      # stable: VIEWS / slice order within
+
     def step_profile(self, step: int):
-        names = [e["name"] for e in self.entries]
+        names = [e["name"] for e in self._menu_entries()]                      # , / . walk the menu top-down
         if names:
             i = names.index(self.profile_key) if self.profile_key in names else 0
             self.set_profile(names[(i + step) % len(names)])
@@ -1670,15 +2130,27 @@ class SliceViewer:
 
     def _heart_dist(self, e: dict) -> np.ndarray | None:
         """Distance (mm) of every voxel of LA slice e to the heart (its segmentation, union over frames), as the
-        alignment script computes it; None without a segmentation."""
-        if "heart_dist" not in e:
+        alignment script computes it -- with the run's --apex-extend-mm the heart region first swept toward the apex
+        (apical_sweep, at the acquired geometry); None without a segmentation."""
+        extend = float((getattr(self, "config", None) or {}).get("apex_extend_mm") or 0.0)
+        if e.get("heart_dist_extend") != extend:
             seg = e["slice"]["seg"]
             if seg is None or not (seg > 0).any():
                 e["heart_dist"] = None
             else:
                 A = e["slice"]["affine"]
                 sp = (np.linalg.norm(A[:3, 0]), np.linalg.norm(A[:3, 1]))
-                e["heart_dist"] = distance_transform_edt(~(seg > 0).any(-1), sampling=sp)
+                heart = (seg > 0).any(-1)
+                if extend > 0:
+                    snap0 = self.snapshots[0]["affines"]
+                    sa = sorted((x for x in self.entries if x["view"] == "SA"), key=lambda x: x["key"][1])
+                    apex = apex_direction([(snap0.get(x["key"], x["slice"]["affine"]), x["slice"]["grey"].shape[:2],
+                                            x["slice"]["seg"]) for x in sa],
+                                          [(snap0.get(x["key"], x["slice"]["affine"]), x["slice"]["seg"])
+                                           for x in self.entries if x["view"] != "SA"])
+                    heart = apical_sweep(heart, snap0.get(e["key"], A), apex, extend)
+                e["heart_dist"] = distance_transform_edt(~heart, sampling=sp)
+            e["heart_dist_extend"] = extend
         return e["heart_dist"]
 
     def _mask_contour_ijk(self, key: tuple, dil: float | None):
@@ -1704,10 +2176,69 @@ class SliceViewer:
         self._dil_ijk_cache[cache_key] = out
         return out
 
+    def _virtual_lines(self, existing: set) -> list[dict]:
+        """Candidate pairs missing from lines.csv. lines.csv holds the lines of the nominal mask dilation, but with
+        mask annealing (--mask-dilation-start-mm) the optimizer rebuilds its lines at every stage, and at the wider
+        early dilations more pairs have --min-line-mm inside the mask (e.g. Ao x 4Ch, basal / apical SA x LA). Each
+        such pair is rebuilt here as motion_gradient.intersection_line does at the acquired geometry (direction
+        n_a x n_b, anchored at the centre of plane b, the --line-extent-mm / --line-step-mm grid, the part inside
+        both images); whether and where it enters the loss at a step is decided by _stage_t_used. Pairs: two images
+        crossing at --min-pair-angle-deg or more, one of them a LA view with a segmentation (a mask that anneals),
+        not two stacks of several slices (thinned by candidate_pairs). None without mask annealing."""
+        cfg = getattr(self, "config", None) or {}
+        if cfg.get("mask_dilation_start_mm") is None or cfg.get("mask_dilation_mm") is None:
+            return []
+        snap0 = self.snapshots[0]
+        ext, step = float(cfg.get("line_extent_mm", 150.0)), float(cfg.get("line_step_mm", 0.5))
+        cos_max = math.cos(math.radians(float(cfg.get("min_pair_angle_deg", 20.0))))
+        T = np.arange(-ext, ext + 1e-6, step)
+        n_slices = {}
+        for e in self.entries:
+            n_slices[e["view"]] = n_slices.get(e["view"], 0) + 1
+
+        def frame(e):
+            A = snap0["affines"].get(e["key"], e["slice"]["affine"])
+            nrm = np.cross(A[:3, 0], A[:3, 1])
+            return A, nrm / np.linalg.norm(nrm)
+
+        def inside(e, A, pts):
+            nx, ny = e["slice"]["grey"].shape[:2]
+            vox = (np.linalg.inv(A) @ np.column_stack([pts, np.ones(len(pts))]).T)[:2]
+            return (vox[0] >= 0) & (vox[0] <= nx - 1) & (vox[1] >= 0) & (vox[1] <= ny - 1)
+
+        out = []
+        for i, a in enumerate(self.entries):
+            for b in self.entries[i + 1:]:
+                if a["view"] == b["view"] or (n_slices[a["view"]] > 1 and n_slices[b["view"]] > 1):
+                    continue
+                if (a["key"], b["key"]) in existing or (b["key"], a["key"]) in existing:
+                    continue
+                if not any(x["view"] != "SA" and self._heart_dist(x) is not None for x in (a, b)):
+                    continue
+                (Aa, na), (Ab, nb) = frame(a), frame(b)
+                if abs(float(na @ nb)) > cos_max:
+                    continue
+                d = np.cross(na, nb)
+                d /= np.linalg.norm(d)
+                nx, ny = b["slice"]["grey"].shape[:2]
+                cb_ijk = [(nx - 1) / 2.0, (ny - 1) / 2.0, 0.0]
+                cb = (Ab @ np.append(cb_ijk, 1.0))[:3]
+                x0 = np.linalg.solve(np.stack([na, nb, d]), np.array([na @ Aa[:3, 3], nb @ Ab[:3, 3], d @ cb]))
+                pts = x0 + T[:, None] * d
+                ok = inside(a, Aa, pts) & inside(b, Ab, pts)
+                if not ok.any():
+                    continue
+                out.append(dict(ka=a["key"], kb=b["key"], x0=x0, d=d, t_img=[T[ok].min(), T[ok].max()],
+                                centre_b=cb_ijk, kind="SA-LA" if "SA" in (a["view"], b["view"]) else "LA-LA"))
+        return out
+
     def _stage_t_used(self, dil: float | None) -> np.ndarray:
         """Loss range (t_lo, t_hi) of every SA-LA / LA-LA line at dilation `dil`: as intersection_line, the first
         and last point (--line-step-mm) at the acquired geometry inside both images and inside the dilated mask of
-        either LA plane. The logged (nominal) ranges at the nominal dilation or without the segmentations."""
+        either LA plane. The logged (nominal) ranges at the nominal dilation or without the segmentations, and
+        for lines without any LA mask (SA-Ao: masked by the fixed SA-SA cylinder, which does not anneal). Virtual
+        lines (_virtual_lines, not in lines.csv) enter only where --min-line-mm of them is inside the mask, as
+        build_lines keeps them; elsewhere (NaN, NaN): not in the loss at that dilation."""
         li = self._line_items
         cfg = getattr(self, "config", None) or {}
         if dil is None or cfg.get("mask_dilation_mm") is None or abs(dil - float(cfg["mask_dilation_mm"])) < 1e-9:
@@ -1716,12 +2247,17 @@ class SliceViewer:
             return li["t_used_cache"][dil]
         snap0 = self.snapshots[0]
         step_mm = float(cfg.get("line_step_mm", 0.5))
+        ext = float(cfg.get("line_extent_mm", 150.0))
+        grid = np.arange(-ext, ext + 1e-6, step_mm)
+        min_pts = float(cfg.get("min_line_mm", 40.0)) / step_mm
+        virtual = li.get("virtual", np.zeros(li["n"], bool))
         out = li["t_used_nominal"].copy()
         for i in range(li["n"]):
             lo, hi = li["t_img"][i]
             if not (np.isfinite(lo) and np.isfinite(hi)):
                 continue
-            t = np.arange(lo, hi + 1e-6, step_mm)
+            t = (grid[(grid >= lo - 1e-6) & (grid <= hi + 1e-6)] if virtual[i]
+                 else np.arange(lo, hi + 1e-6, step_mm))
             pts = li["x0"][i] + t[:, None] * li["d"][i]
             inside = np.zeros(len(t), bool)
             have = False
@@ -1734,7 +2270,8 @@ class SliceViewer:
                     inside |= m
                     have = True
             if have:
-                out[i] = (t[inside].min(), t[inside].max()) if inside.any() else (np.nan, np.nan)
+                enough = inside.sum() >= min_pts if virtual[i] else inside.any()   # (virtual: kept as build_lines)
+                out[i] = (t[inside].min(), t[inside].max()) if enough else (np.nan, np.nan)
         li["t_used_cache"][dil] = out
         return out
 
@@ -1775,6 +2312,21 @@ class SliceViewer:
             inside ^= path.contains_points(vox)
         return inside
 
+    def _in_cylinder(self, e: dict, o: dict, snap: dict, pts: np.ndarray) -> np.ndarray | None:
+        """For a line between an SA slice and the aortic slice (no segmentation, so no LA mask): which world points
+        lie inside the SA-SA cylinder (radius around the long axis of this snapshot, long_axis.csv), the mask
+        motion_gradient.build_lines gives these lines; None for any other line or without long_axis.csv."""
+        if {e["view"], o["view"]} != {"SA", "ao"} or not self.overlays.get("long_axis"):
+            return None
+        axis = self.overlays["long_axis"].get((snap["step"], bool(snap["is_best"])))
+        if axis is None:
+            return None
+        p0, ell, r = axis
+        ell = ell / np.linalg.norm(ell)
+        rel = pts - p0
+        perp = rel - (rel @ ell)[:, None] * ell
+        return (perp * perp).sum(1) <= r * r
+
     # --- profiles as the loss sees them -----------------------------------------------
     def _loss_state(self, step: int) -> tuple[float, float]:
         """(PSF scale, in-plane blur sigma in mm) the optimizer used at `step` (motion_gradient.align)."""
@@ -1783,13 +2335,17 @@ class SliceViewer:
         psf_s0 = 1.0 if cfg.get("no_psf") else float(cfg.get("psf_scale_start", 1.0) or 1.0)
         psf_steps = int(round(float(cfg.get("psf_anneal_frac", 0.6)) * steps)) if psf_s0 > 1.0 else 0
         scale = psf_s0 + (1.0 - psf_s0) * step / psf_steps if step < psf_steps else 1.0
+        # as motion_gradient.align: from --blur-sigma linearly down to --blur-sigma-end over --blur-frac of the run, then
+        # held; --blur-frac 0: --blur-sigma throughout; applied rounded up to 0.2 mm (its blur_quantum)
         b0 = float(cfg.get("blur_sigma", 0.0) or 0.0)
+        b_end = min(float(cfg.get("blur_sigma_end", 0.0) or 0.0), b0)
         b_frac = float(cfg.get("blur_frac", 0.6))
         if b0 > 0 and b_frac <= 0:                       # --blur-frac 0: constant blur for the whole run
             sigma = b0
         else:
             b_steps = int(round(b_frac * steps)) if b0 > 0 else 0
-            sigma = b0 * max(0.0, 1.0 - step / b_steps) if step < b_steps else 0.0
+            sigma = b_end + (b0 - b_end) * (1.0 - step / b_steps) if step < b_steps else b_end
+        sigma = math.ceil(sigma / BLUR_QUANTUM_MM) * BLUR_QUANTUM_MM if sigma > 0 else 0.0
         return scale, sigma
 
     def _band(self, scale: float) -> tuple[np.ndarray, np.ndarray]:
@@ -1891,11 +2447,16 @@ class SliceViewer:
         self.pl.render()
 
     def _profile_items(self, snap: dict) -> list[dict]:
-        """The intersections of the picked slice: (other slice name, start, unit dir, t_img, t_used)."""
+        """Every intersection of the picked slice, in chart order: (other slice, start, unit dir, t_img, t_used,
+        in_loss). SA slice: its SA-LA lines (2Ch, 3Ch, 4Ch, Ao) and its SA-SA crossing. LA view (Ao included): first
+        its crossings with the other LA views, then with every SA slice that crosses it inside both images (by slice
+        index) -- the loss line where the pair has one (lines.csv), else the planes' crossing at the shown poses
+        (in_loss False: no loss part; e.g. Ao x 4Ch, too far from the heart masks or too shallow for the loss). The
+        chart rectangles show PROFILE_VISIBLE of them at a time (scrolled with the mouse wheel)."""
         e = self._entry_by_name().get(self.profile_key)
         if e is None:
             return []
-        out = []
+        out, with_sa = [], []
         li = self._line_items
         if li is not None:
             x0, d, t_used = self._line_geometry(snap)
@@ -1904,12 +2465,31 @@ class SliceViewer:
                 if e["key"] not in (ka, kb):
                     continue
                 other = kb if ka == e["key"] else ka
-                if e["view"] != "SA" and other[0] == "SA":
-                    continue                              # LA views: only their LA-LA pairs
                 oe = self._entry_by_key.get(other)
                 if oe is None:
                     continue
-                out.append(dict(other=oe, x0=x0[i], d=d[i], t_img=li["t_img"][i], t_used=t_used[i]))
+                item = dict(other=oe, x0=x0[i], d=d[i], t_img=li["t_img"][i], t_used=t_used[i],
+                            in_loss=bool(np.isfinite(t_used[i]).all()))     # at this step's mask dilation
+                (with_sa if e["view"] != "SA" and other[0] == "SA" else out).append(item)
+        if e["view"] != "SA":
+            have = {r["other"]["key"] for r in out + with_sa}
+            Ae = self._pose(e["key"], snap)
+            for oe in self.entries:                       # pairs without a loss line: the geometric crossing
+                if oe["key"] == e["key"] or oe["key"] in have or Ae is None:
+                    continue
+                Ao = self._pose(oe["key"], snap)
+                cs = None if Ao is None else crossing_segment(Ae, e["slice"]["grey"].shape, Ao,
+                                                             oe["slice"]["grey"].shape)
+                if cs is None and oe["view"] == "SA":
+                    continue                              # SA slices not crossing this view inside both images
+                item = dict(other=oe, x0=None, in_loss=False)
+                if cs is not None:
+                    item.update(x0=cs[0], d=cs[1], t_img=np.array([cs[2], cs[3]]), t_used=np.array([np.nan, np.nan]))
+                (with_sa if oe["view"] == "SA" else out).append(item)
+            out.sort(key=lambda r: (VIEWS.index(r["other"]["view"]) if r["other"]["view"] in VIEWS else len(VIEWS),
+                                    r["other"]["key"][1]))
+            out += sorted(with_sa, key=lambda r: r["other"]["key"][1])
+        else:
             out.sort(key=lambda r: VIEWS.index(r["other"]["view"]))
         if e["view"] == "SA":
             sl = e["key"][1]
@@ -1931,7 +2511,7 @@ class SliceViewer:
                         if len(uh):
                             item["t_used"] = np.sort((segs["used"][uh[0]] - a) @ item["d"])
                 out.append(item)
-        return out[:PROFILE_SLOTS]
+        return out
 
     def _profile_metric(self, e: dict, it: dict, snap: dict, t: np.ndarray, ya: np.ndarray, yb: np.ndarray,
                         used: np.ndarray):
@@ -2076,12 +2656,13 @@ class SliceViewer:
                 curve[idx] = np.fmax(curve[idx], d)
         return float(np.nanmax(curve)) if np.isfinite(curve).any() else None, curve
 
-    def _chart_data(self, snap: dict) -> list[dict]:
-        """Per chart slot at `snap` (current frame): the intersection item and, where the slices cross,
-        its profiles (t, ya, yb, used, mode_txt) and the selected metric (mname, mval, ct, curve)."""
+    def _chart_data(self, snap: dict, items: list[dict] | None = None) -> list[dict]:
+        """Per intersection at `snap` (current frame; `items`, default all of _profile_items): the item and,
+        where the slices cross, its profiles (t, ya, yb, used, mode_txt) and the selected metric (mname, mval, ct,
+        curve)."""
         e = self._entry_by_name().get(self.profile_key)
         out = []
-        for it in self._profile_items(snap):
+        for it in (self._profile_items(snap) if items is None else items):
             c = dict(it=it)
             if it["x0"] is not None:
                 t = np.arange(it["t_img"][0], it["t_img"][1] + 1e-6, PROFILE_STEP_MM)
@@ -2096,77 +2677,244 @@ class SliceViewer:
         return out
 
     def _metric_ranges(self, data: list[dict]) -> list:
-        """Per chart slot: (min, max) of the full metric curve over every history snapshot, so the metric
-        charts keep one y scale while scrubbing the history; None where a slot never has a curve.
-        Computed at the frame shown when it is (re)built -- slice, metric, profile mode or manual
-        offsets changed (~0.6 s for 50 snapshots) -- and only widened afterwards when another frame's
-        curve (`data`, the shown one) leaves it, so stepping through the cine stays fast."""
+        """Per shown chart: (min, max) of the full metric curve over every history snapshot, so the metric
+        charts keep one y scale while scrubbing the history; None where an intersection never has a curve.
+        Cached per intersection, computed when it first comes into view, at the frame shown then -- slice, metric,
+        profile mode or manual offsets changed (~0.15 s per intersection for 50 snapshots) -- and only widened
+        afterwards when another frame's curve (`data`, the shown ones) leaves it, so stepping through the cine and
+        scrolling stay fast."""
         key = (self.run_index, self.subject_index, self.profile_key, self.metric,
                self.show_psf and self.config is not None,
                tuple(sorted((k, tuple(np.round(v, 6))) for k, v in self.offsets.items())))
         cache = getattr(self, "_range_cache", None)
         if cache is None or cache[0] != key:
-            lo = np.full(PROFILE_SLOTS, np.inf)
-            hi = np.full(PROFILE_SLOTS, -np.inf)
+            self._range_cache = cache = (key, {})
+        ranges = cache[1]
+
+        def ident(it):
+            return it["other"]["key"], bool(it.get("sa_sa"))
+
+        missing = {ident(c["it"]) for c in data} - set(ranges)
+        if missing:
+            acc = {k: [np.inf, -np.inf] for k in missing}
             for snap in self.snapshots:
-                for k, c in enumerate(self._chart_data(snap)):
+                its = [it for it in self._profile_items(snap) if ident(it) in missing]
+                for c in self._chart_data(snap, its):
                     cv = c.get("full")
                     if cv is not None and np.isfinite(cv).any():
-                        lo[k] = min(lo[k], float(np.nanmin(cv)))
-                        hi[k] = max(hi[k], float(np.nanmax(cv)))
-            self._range_cache = cache = (key, lo, hi)
-        _, lo, hi = cache
-        for k, c in enumerate(data[:PROFILE_SLOTS]):
+                        r = acc[ident(c["it"])]
+                        r[0], r[1] = min(r[0], float(np.nanmin(cv))), max(r[1], float(np.nanmax(cv)))
+            ranges.update(acc)
+        out = []
+        for c in data:
+            r = ranges.setdefault(ident(c["it"]), [np.inf, -np.inf])
             cv = c.get("full")
             if cv is not None and np.isfinite(cv).any():
-                lo[k] = min(lo[k], float(np.nanmin(cv)))
-                hi[k] = max(hi[k], float(np.nanmax(cv)))
-        return [(float(l), float(h)) if np.isfinite(l) else None for l, h in zip(lo, hi)]
+                r[0], r[1] = min(r[0], float(np.nanmin(cv))), max(r[1], float(np.nanmax(cv)))
+            out.append((float(r[0]), float(r[1])) if np.isfinite(r[0]) else None)
+        return out
 
     def _update_profiles(self):
+        """Recompute the intersection charts for the current state (slice, step, frame, toggles, offsets...): drop
+        the cached intersections and chart data, then draw (_render_profiles)."""
+        self._pcache = None
+        for slot in getattr(self, "_profile_charts", []):
+            slot["bound"] = None
+        self._render_profiles()
+
+    def _render_profiles(self):
+        """Draw the charts at the current scroll position: the intersections from base = floor(scroll) on fill the
+        PROFILE_VISIBLE + 1 chart slots (a slot is only refilled when its intersection changes; chart data are
+        cached until _update_profiles), which are then placed at their fractional positions (_position_charts)."""
         charts = getattr(self, "_profile_charts", [])
         if not charts or not self.entries:
             return
         snap = self.snapshots[self.snap_index]
-        data = self._chart_data(snap) if self.show_profiles or self.show_metric_profiles else []
-        ranges = self._metric_ranges(data) if data and self.show_metric_profiles else [None] * PROFILE_SLOTS
-        e = self._entry_by_name().get(self.profile_key)
+        if self._pcache is None:
+            items = self._profile_items(snap) if self.show_profiles or self.show_metric_profiles else []
+            self._pcache = {"items": items, "data": {}}
+        items, cache = self._pcache["items"], self._pcache["data"]
+        n = self._n_profile_items = len(items)
+        smax = float(max(0, n - PROFILE_VISIBLE))
+        self._profile_scroll = float(np.clip(self._profile_scroll, 0.0, smax))
+        self._scroll_target = float(np.clip(self._scroll_target, 0.0, smax))
+        self._layout_charts(n)
+        base = int(np.floor(self._profile_scroll + 1e-9))
         for k, (slot, mslot) in enumerate(zip(charts, self._metric_charts)):
-            ch, pl_ = slot["chart"], slot["plots"]
-            slot["item"] = mslot["item"] = None
-            if k >= len(data):
-                ch.visible = mslot["chart"].visible = False
+            i = base + k
+            if i >= n:
+                slot["item"] = mslot["item"] = slot["bound"] = None
+                slot["chart"].visible = mslot["chart"].visible = False
                 continue
-            c = data[k]
-            it = c["it"]
-            ch.visible, mslot["chart"].visible = self.show_profiles, self.show_metric_profiles
-            names = f"{label(e['name'])} \u00d7 {label(it['other']['name'])}"
-            if it["x0"] is None:
-                ch.title = f"{names}: no crossing"
-                for p_ in pl_.values():
-                    p_.update(np.array([0.0, 1.0]), np.array([np.nan, np.nan]))
-                self._fill_metric_chart(mslot, f"{names}: no crossing", None, None, None, None, None, None)
+            if slot["bound"] == i:
                 continue
-            t, ya, yb, used, mname, mval = c["t"], c["ya"], c["yb"], c["used"], c["mname"], c["mval"]
-            ch.title = (f"{names}   {mname} {mval:.2f}{c['mode_txt']}" if mval is not None
-                        else f"{names}   {mname} -{c['mode_txt']}")
-            for side, y in (("a", ya), ("b", yb)):
-                pl_[side + "_img"].update(t, y)
-                pl_[side + "_used"].update(t, np.where(used, y, np.nan))
-            masks = [m for m in (self._in_mask(e, snap, c["pts"]), self._in_mask(it["other"], snap, c["pts"]))
-                     if m is not None]
-            in_mask = np.logical_or.reduce(masks) if masks else np.zeros(len(t), bool)
-            pl_["mask"].update(t, np.where(in_mask, float(PROFILE_MASK_Y), np.nan))
-            xr = [float(t[0]), float(t[-1]) if len(t) > 1 else float(t[0]) + 1.0]
-            ch.x_range = xr
-            ch.y_range = [0, 255]
-            item = dict(e=e, other=it["other"], x0=it["x0"], d=it["d"], t=t, ya=ya, yb=yb, names=names,
-                        title=ch.title, ct=c["ct"], curve=c["full"], mname=mname)
-            slot["item"] = mslot["item"] = item
-            item["mtitle"], item["mrange"] = self._fill_metric_chart(
-                mslot, f"{names}   {mname} per point", c["ct"], c["curve"], c["full"], xr, ranges[k],
-                (t, in_mask))
+            if i not in cache:
+                c = self._chart_data(snap, [items[i]])[0]
+                c["range"] = self._metric_ranges([c])[0] if self.show_metric_profiles else None
+                cache[i] = c
+            self._fill_slot(k, cache[i], snap)
+            slot["bound"] = i
+        self._position_charts()
         self._draw_hover()
+
+    def _fill_slot(self, k: int, c: dict, snap: dict):
+        """Draw intersection `c` (see _chart_data) into chart slot k of both sets."""
+        slot, mslot = self._profile_charts[k], self._metric_charts[k]
+        ch, pl_ = slot["chart"], slot["plots"]
+        e = self._entry_by_name().get(self.profile_key)
+        slot["item"] = mslot["item"] = None
+        it = c["it"]
+        ch.visible, mslot["chart"].visible = self.show_profiles, self.show_metric_profiles
+        names = f"{label(e['name'])} \u00d7 {label(it['other']['name'])}" + \
+            ("  (not in loss)" if it.get("in_loss") is False else "")
+        if it["x0"] is None:
+            ch.title = f"{names}: no crossing"
+            for p_ in pl_.values():
+                p_.update(np.array([0.0, 1.0]), np.array([np.nan, np.nan]))
+            self._fill_metric_chart(mslot, f"{names}: no crossing", None, None, None, None, None, None)
+            return
+        t, ya, yb, used, mname, mval = c["t"], c["ya"], c["yb"], c["used"], c["mname"], c["mval"]
+        ch.title = (f"{names}   {mname} {mval:.2f}{c['mode_txt']}" if mval is not None
+                    else f"{names}   {mname} -{c['mode_txt']}")
+        for side, y in (("a", ya), ("b", yb)):
+            pl_[side + "_img"].update(t, y)
+            pl_[side + "_used"].update(t, np.where(used, y, np.nan))
+        masks = [m for m in (self._in_mask(e, snap, c["pts"]), self._in_mask(it["other"], snap, c["pts"]),
+                             self._in_cylinder(e, it["other"], snap, c["pts"]))
+                 if m is not None]
+        in_mask = np.logical_or.reduce(masks) if masks else np.zeros(len(t), bool)
+        pl_["mask"].update(t, np.where(in_mask, float(PROFILE_MASK_Y), np.nan))
+        xr = [float(t[0]), float(t[-1]) if len(t) > 1 else float(t[0]) + 1.0]
+        ch.x_range = xr
+        ch.y_range = [0, 255]
+        item = dict(e=e, other=it["other"], x0=it["x0"], d=it["d"], t=t, ya=ya, yb=yb, names=names,
+                    title=ch.title, ct=c["ct"], curve=c["full"], mname=mname)
+        slot["item"] = mslot["item"] = item
+        item["mtitle"], item["mrange"] = self._fill_metric_chart(
+            mslot, f"{names}   {mname} per point", c["ct"], c["curve"], c["full"], xr, c.get("range"),
+            (t, in_mask))
+
+    def _rect_boxes(self) -> dict:
+        """(x0, y0, x1, y1) of the shown chart rectangles (normalised): intensity on top, metric below, splitting
+        the right column (PROFILE_Y0 .. PROFILE_TOP); a single shown set takes the whole column."""
+        sets = [n for n, on in (("profile", self.show_profiles), ("metric", self.show_metric_profiles)) if on]
+        if not sets:
+            return {}
+        h = (PROFILE_TOP - PROFILE_Y0 - (len(sets) - 1) * RECT_GAP) / len(sets)
+        out, top = {}, PROFILE_TOP
+        for n in sets:
+            out[n] = (RECT_X0, top - h, RECT_X1, top)
+            top -= h + RECT_GAP
+        return out
+
+    def _layout_charts(self, n_items: int):
+        """Frame each shown chart rectangle, set its chart renderer's viewport to the rectangle's inside and, with
+        more than PROFILE_VISIBLE intersections, draw its scroll bar (thumb: the shown window within the list, at
+        the current fractional scroll position)."""
+        boxes = self._rect_boxes()
+        V = PROFILE_VISIBLE
+        h = self.pl.window_size[1]
+
+        def quad(part, x0, y0, x1, y1):
+            poly, actor = part
+            poly.points = np.array([[x0, y0, 0.0], [x1, y0, 0.0], [x1, y1, 0.0], [x0, y1, 0.0]])
+            poly.Modified()
+            actor.SetVisibility(True)
+
+        for name in ("profile", "metric"):
+            r = self._rects[name]
+            for _, actor in r["parts"].values():
+                actor.SetVisibility(False)
+            r["box"] = box = boxes.get(name) if n_items else None
+            ren = self._chart_rens[name]
+            if box is None:
+                ren.SetViewport(0.0, 0.0, 0.001, 0.001)
+                continue
+            x0, y0, x1, y1 = box
+            ren.SetViewport(PROFILE_X, y0 + RECT_PAD, PROFILE_X + PROFILE_W, y1 - RECT_PAD)
+            pitch = (y1 - y0 - 2 * RECT_PAD + PROFILE_GAP) / V
+            self._chart_px_h = (pitch - PROFILE_GAP) * h
+            quad(r["parts"]["frame"], x0, y0, x1, y1)
+            if n_items > V:
+                ty0, ty1 = y0 + RECT_PAD, y1 - RECT_PAD
+                quad(r["parts"]["track"], SCROLL_X0, ty0, SCROLL_X0 + SCROLL_W, ty1)
+                top = ty1 - self._profile_scroll / n_items * (ty1 - ty0)
+                quad(r["parts"]["thumb"], SCROLL_X0, top - V / n_items * (ty1 - ty0), SCROLL_X0 + SCROLL_W, top)
+
+    def _position_charts(self):
+        """Place every filled chart slot at its fractional position in its renderer: intersection i sits (i -
+        scroll) chart pitches below the top, so the slots slide smoothly and the renderer viewport clips the ones
+        partly out of view. The pixel geometry is set directly (pyvista's loc only takes positions inside the
+        renderer); size stays in sync with it so pyvista does not re-place the chart on render."""
+        V = PROFILE_VISIBLE
+        gap = PROFILE_GAP * self.pl.window_size[1]
+        base = int(np.floor(self._profile_scroll + 1e-9))
+        for name, slots in (("profile", self._profile_charts), ("metric", self._metric_charts)):
+            if self._rects[name]["box"] is None:
+                continue
+            rw, rh = self._chart_rens[name].GetSize()
+            if rw < 2 or rh < 2:
+                continue
+            pitch = (rh + gap) / V
+            size_h = min(1.0, (pitch - gap) / rh)
+            for k, slot in enumerate(slots):
+                ch = slot["chart"]
+                if self._profile_charts[k]["bound"] is None:
+                    continue
+                bottom = rh - (base + k - self._profile_scroll) * pitch - (pitch - gap)
+                ch.size = (1.0, size_h)
+                ch._loc = (0.0, float(np.clip(bottom / rh, 0.0, 1.0)))
+                ch._geometry = (0, int(round(bottom)), int(rw), int(size_h * rh))
+
+    def _on_wheel(self, step: int) -> bool:
+        """Mouse wheel: over a chart rectangle, scroll both rectangles by one chart (`step` -1 up, +1 down) and
+        return True (the event is consumed: no camera zoom); elsewhere False."""
+        x, y = self.pl.iren.interactor.GetEventPosition()
+        w, h = self.pl.window_size
+        for r in getattr(self, "_rects", {}).values():
+            box = r["box"]
+            if box is not None and box[0] * w <= x <= box[2] * w and box[1] * h <= y <= box[3] * h:
+                self.scroll_profiles(step)
+                return True
+        return False
+
+    def scroll_profiles(self, step: float):
+        """Scroll the intersection charts by `step` wheel notches (SCROLL_STEP charts each), clamped to the list;
+        the move is animated (_scroll_tick) -- off screen it jumps."""
+        smax = float(max(0, self._n_profile_items - PROFILE_VISIBLE))
+        target = float(np.clip(self._scroll_target + step * SCROLL_STEP, 0.0, smax))
+        if target == self._scroll_target and target == self._profile_scroll:
+            return
+        self._scroll_target = target
+        if pv.OFF_SCREEN or self.pl.off_screen:
+            self.set_scroll(target)
+            return
+        if self._scroll_timer is None:
+            self._scroll_timer = self.pl.iren.interactor.CreateRepeatingTimer(SCROLL_TIMER_MS)
+
+    def set_scroll(self, pos: float):
+        """Show the charts at scroll position `pos` (charts from the top, fractional) without animating."""
+        smax = float(max(0, self._n_profile_items - PROFILE_VISIBLE))
+        self._profile_scroll = self._scroll_target = float(np.clip(pos, 0.0, smax))
+        self._hover = None
+        self._render_profiles()
+        self.pl.render()
+
+    def _scroll_tick(self):
+        """One animation frame: move the scroll position SCROLL_EASE of the way to the target (ease-out); stop the
+        timer once there."""
+        if self._scroll_timer is None:
+            return
+        d = self._scroll_target - self._profile_scroll
+        if abs(d) < 0.01:
+            self._profile_scroll = self._scroll_target
+            self.pl.iren.interactor.DestroyTimer(self._scroll_timer)
+            self._scroll_timer = None
+        else:
+            self._profile_scroll += d * SCROLL_EASE if abs(d) * SCROLL_EASE > 0.01 else np.sign(d) * 0.01
+        self._hover = None
+        self._render_profiles()
+        self.pl.render()
 
     def _fill_metric_chart(self, mslot: dict, title: str, t, curve, full, xr, rng, mask):
         """Draw the per-point metric curves of one intersection as its intensity profiles: thin over the whole
@@ -2191,10 +2939,13 @@ class SliceViewer:
         pad = max(0.05 * span, 0.05)
         lo, hi = dmin - pad, dmax + pad
         dec = 2 if span < 2 else 1 if span < 20 else 0          # tick rounding stays inside the padding
+        # the tick labels need ~TICK_LABEL_PX between them: as a fraction of the data span on this chart's plot area
+        plot_px = max(1.0, getattr(self, "_chart_px_h", 80) - CHART_FRAME_PX)
+        sep = max(0.2, TICK_LABEL_PX / plot_px * (hi - lo) / max(span, 1e-12))
         if dmin < 0 < dmax:                                     # 0, plus the extremes not crowding it
-            ticks = tuple(v for v in (dmin, 0.0, dmax) if v == 0.0 or abs(v) > 0.2 * span)
+            ticks = tuple(v for v in (dmin, 0.0, dmax) if v == 0.0 or abs(v) > sep * span)
         else:
-            ticks = (dmin, (dmin + dmax) / 2, dmax)
+            ticks = (dmin, (dmin + dmax) / 2, dmax) if sep <= 0.5 else (dmin, dmax)
         ticks = tuple(dict.fromkeys(round(v, dec) for v in ticks))
         p["full"].update(t, full)
         p["curve"].update(t, curve if curve is not None else np.full(len(t), np.nan))
@@ -2217,17 +2968,20 @@ class SliceViewer:
         w, h = self.pl.window_size
         hover = None
         for k, slots in enumerate(zip(getattr(self, "_profile_charts", []), getattr(self, "_metric_charts", []))):
-            for slot in slots:
+            for name, slot in zip(("profile", "metric"), slots):
                 ch, it = slot["chart"], slot["item"]
                 if it is None or not ch.visible:
                     continue
-                (cx, cy), (cw, chh) = ch.loc, ch.size
-                if not (cx * w <= x <= (cx + cw) * w and cy * h <= y <= (cy + chh) * h):
+                # the chart in window pixels: its renderer's viewport offset plus its geometry, clipped to the viewport
+                vp = self._chart_rens[name].GetViewport()
+                ox, oy = vp[0] * w, vp[1] * h
+                cx, cy, cw, chh = ch._geometry
+                if not (ox + cx <= x <= ox + cx + cw and max(oy + cy, vp[1] * h) <= y <= min(oy + cy + chh, vp[3] * h)):
                     continue
                 p1, p2 = ch.x_axis.GetPoint1(), ch.x_axis.GetPoint2()
-                if p2[0] - p1[0] >= 1 and p1[0] <= x <= p2[0]:
+                if p2[0] - p1[0] >= 1 and ox + p1[0] <= x <= ox + p2[0]:
                     lo, hi = ch.x_range
-                    hover = (k, lo + (x - p1[0]) / (p2[0] - p1[0]) * (hi - lo))
+                    hover = (k, lo + (x - ox - p1[0]) / (p2[0] - p1[0]) * (hi - lo))
                 break
             if hover is not None:
                 break
@@ -2319,7 +3073,17 @@ class SliceViewer:
         self._apply_metric_values()
         self._update_knob_labels()
         self._update_header()
+        self._update_blur_text()
         self._update_profiles()
+
+    def _update_blur_text(self):
+        """The in-plane blur sigma (mm) the optimizer used at the shown step (--blur-sigma annealed over --blur-frac
+        of the run, see _loss_state), next to the 'Image blurring' toggle; 0 mm once it no longer blurs."""
+        txt = getattr(self, "_blur_text", None)
+        if txt is None or not self.snapshots:
+            return
+        _, sigma = self._loss_state(self.snapshots[self.snap_index]["step"])
+        txt.SetInput(f"{sigma:.1f} mm" if sigma > 0 else "0 mm")       # (the panel font has no sigma glyph)
 
     # --- outline colour by metric --------------------------------------------
     def _metric_value(self, e: dict, snap: dict) -> float:
@@ -2627,7 +3391,7 @@ class SliceViewer:
             y -= ROW_PITCH
 
         add_row("Segmentation  [s]", self._on_seg_toggle, self.show_seg, "seg")
-        add_row("Outlines  [o]", self._on_outline_toggle, True, "outlines")
+        add_row("Outlines  [o]", self._on_outline_toggle, self.show_outlines, "outlines")
         if self._mask_items:
             add_row("Dilated mask contour  [m]", self._on_mask_toggle, self.show_mask, "mask")
         if self._line_items is not None:
@@ -2640,25 +3404,30 @@ class SliceViewer:
         add_row("Metric profiles  [n]", self._on_metric_profiles_toggle, self.show_metric_profiles, "metric_profiles")
         if self.config is not None:
             add_row("Apply PSF to profile  [y]", self._on_psf_toggle, self.show_psf, "psf")
+            # the optimizer's in-plane blur at the shown step, right of the toggle (updated per step: _update_blur_text)
+            self._blur_text = self._text("", position=(BLUR_TEXT_X, y + 4), font_size=8, color="#bbbbbb")
             add_row("Image blurring  [g]", self._on_blur_toggle, self.show_blur, "blur")
         y -= 8
+        # every checkbox shows the actual state: on a run change the slices are kept with their visibility (load_index)
         if "SA" in self.data:
-            add_row("All SA  [a]", lambda v: self._set_group("SA", v), True, "all_sa")
-        if any(v.startswith("LA") for v in self.data):
-            add_row("All LA  [l]", lambda v: self._set_group("LA", v), True, "all_la")
+            add_row("All SA  [a]", lambda v: self._set_group("SA", v),
+                    all(e["visible"] for e in self.entries if e["view"] == "SA"), "all_sa")
+        if any(v != "SA" for v in self.data):                # (LA views and the aortic slice)
+            add_row("All LA  [l]", lambda v: self._set_group("LA", v),
+                    all(e["visible"] for e in self.entries if e["view"] != "SA"), "all_la")
         y -= 8
         # column headers above the slice rows: the outline metric (value column) and "profile"
         self._text("profile", position=(PROFILE_RADIO_X + 7, y + ROW_PITCH - 4), font_size=7,
                    color="#bbbbbb").GetTextProperty().SetJustificationToCentered()
         self._value_header = self._text("", position=(PANEL_X_VAL, y + ROW_PITCH - 4), font_size=7,
                                         color="#bbbbbb")
-        for e in self.entries:
+        for e in self._menu_entries():
             self._profile_radios[e["name"]] = pl.add_radio_button_widget(
                 lambda n=e["name"]: self.set_profile(n), "profile", value=(e["name"] == self.profile_key),
                 position=(PROFILE_RADIO_X, y + 3), size=14, border_size=3,
                 color_on="#ffa726", color_off="#555555", background_color="#303030")
             self._row_value[e["name"]] = self._text("", position=(PANEL_X_VAL, y + 2), font_size=9, color="white")
-            add_row(self._row_label(e), self._make_slice_cb(e), True, e["name"])
+            add_row(self._row_label(e), self._make_slice_cb(e), e["visible"], e["name"])
 
         # Outline-colour metric (radio group: exactly one active); each row also shows the
         # subject-level value of its metric at the shown step (filled by _update_header)
@@ -2736,19 +3505,27 @@ class SliceViewer:
 
 
     # --- callbacks -------------------------------------------------------
+    def _sync_group_boxes(self):
+        """'All SA' / 'All LA' show ticked exactly when every slice of their group is shown."""
+        self._set_checkbox_state("all_sa", all(e["visible"] for e in self.entries if e["view"] == "SA"))
+        self._set_checkbox_state("all_la", all(e["visible"] for e in self.entries if e["view"] != "SA"))
+
     def _make_slice_cb(self, e: dict):
         def cb(value: bool):
             e["visible"] = bool(value)
             self._set_checkbox_state(e["name"], e["visible"])
+            self._sync_group_boxes()
             self._apply_visibility()
             self.pl.render()
         return cb
 
     def _set_group(self, prefix: str, value: bool):
         for e in self.entries:
-            if e["view"].startswith(prefix):
+            # "LA": every non-SA view, the aortic slice included (it is handled like a LA view)
+            if e["view"].startswith(prefix) or (prefix == "LA" and e["view"] != "SA"):
                 e["visible"] = bool(value)
                 self._set_checkbox_state(e["name"], e["visible"])
+        self._sync_group_boxes()
         self._apply_visibility()
         self.pl.render()
 
@@ -2911,6 +3688,43 @@ def _first_instance(subject_dir: Path) -> int | None:
     return None
 
 
+def run_config_for(run_dir: Path, metrics_dir: Path, history: dict) -> dict | None:
+    """The settings the subject was aligned with. A run directory aligned into again with other settings keeps one
+    config per start (run_config.json, then run_config_<YYYYMMDD-HHMMSS>.json, see motion_gradient.write_run_config);
+    the subject's is the newest one started before it was aligned (the timestamp in its metrics/summary.csv, else its
+    history's modification time). Everything the viewer rebuilds per step (blur, PSF scale, mask annealing stage)
+    depends on it, e.g. --steps."""
+    om = run_dir / "overall_metrics"
+    starts = []
+    for path in om.glob("run_config*.json"):
+        m = re.search(r"run_config_(\d{8}-\d{6})\.json$", path.name)
+        try:
+            t = datetime.strptime(m.group(1), "%Y%m%d-%H%M%S").timestamp() if m else path.stat().st_mtime
+        except (OSError, ValueError):
+            continue
+        starts.append((t, path))
+    if not starts:
+        print(f"[warn] {om / 'run_config.json'} missing: profiles can only show raw intensities", file=sys.stderr)
+        return None
+    starts.sort()
+    aligned = None
+    try:
+        row = pd.read_csv(metrics_dir / "summary.csv").iloc[-1]
+        aligned = datetime.fromisoformat(str(row["timestamp"])).timestamp()
+    except Exception:                                    # noqa: BLE001 (no summary / timestamp)
+        hist = metrics_dir / HISTORY_CSV
+        aligned = hist.stat().st_mtime if hist.exists() else None
+    path = starts[-1][1] if aligned is None else next((p for t, p in reversed(starts) if t <= aligned + 1), starts[0][1])
+    config = json.loads(path.read_text())
+    n = history.get("n_steps")
+    if len(starts) > 1:
+        print(f"[config] {path.name} (one of {len(starts)} configs of this run directory)")
+    if n and config.get("steps") and int(config["steps"]) != int(n):
+        print(f"[warn] {path.name}: steps={config['steps']} but the history runs to step {n}: per-step "
+              f"reconstructions (blur, PSF, mask annealing) may be off", file=sys.stderr)
+    return config
+
+
 def load_subject_run(run_dir: Path, subject: str, instance: int | None = None, cache: dict | None = None) -> dict:
     """Everything the viewer needs for one subject of a run. The images are read from <run>/<subject>/ (current
     layout) or, for older runs, from <run>/<subject>/Instance_<n>/. `cache` (a dict kept by the caller) holds the
@@ -2959,10 +3773,7 @@ def load_subject_run(run_dir: Path, subject: str, instance: int | None = None, c
                 if A is not None and not np.allclose(A, s["affine"], atol=5e-3):
                     print(f"[warn] {s['file']}: NIfTI affine differs from the history's best pose "
                           f"(max |diff| {np.abs(A - s['affine']).max():.3f})", file=sys.stderr)
-    cfg_path = run_dir / "overall_metrics" / "run_config.json"
-    config = json.loads(cfg_path.read_text()) if cfg_path.exists() else None
-    if config is None:
-        print(f"[warn] {cfg_path} missing: profiles can only show raw intensities", file=sys.stderr)
+    config = run_config_for(run_dir, metrics_dir, history)
     title = f"UKBB {subject}" + (f" / Instance_{instance}" if instance is not None else "")
     if model in POSE_NOTES:
         title += f"   [{POSE_NOTES[model]}]"
@@ -2983,6 +3794,17 @@ def parse_args(argv=None):
     ap.add_argument("--run-dir", type=Path, default=None,
                     help="explicit run directory containing <subject>/ (images + metrics/) "
                          "(overrides --align-root/--run)")
+    ap.add_argument("--remote", default=None, metavar="USER@HOST:/RUN_DIR",
+                    help="a run directory on another machine, read over ssh (key authentication): every subject is "
+                         "downloaded once into --cache-dir when shown (the next one in the background). Subjects: "
+                         "--subjects, else every subject of its overall_metrics/motion_summary.csv")
+    ap.add_argument("--cache-dir", type=Path, default=REMOTE_CACHE,
+                    help="where --remote subjects are kept (<cache>/<host>/<run name>/<subject>/; delete freely). "
+                         "Default: %(default)s")
+    ap.add_argument("--subjects", nargs="+", default=None, metavar="ID_OR_FILE",
+                    help="the subjects to step through with [ / ], in this order: subject ids and/or text files with "
+                         "one subject per line (first token; e.g. a list written by worst_cases.py, whose slice column "
+                         "also picks the slice profiled first). Default: all subjects of the run")
     ap.add_argument("--instance", type=int, default=None,
                     help="older runs only: imaging instance folder (default: the first Instance_<n> found, else none)")
     ap.add_argument("--start", default="best",
@@ -3012,6 +3834,11 @@ def parse_args(argv=None):
 
 def main(argv=None):
     args = parse_args(argv)
+    listed = read_subject_list(args.subjects) if args.subjects else None
+    if listed is not None and not listed:
+        sys.exit("--subjects: no subject ids found")
+    if args.remote:
+        return main_remote(args, listed)
 
     run_dir = args.run_dir or find_run_dir(args.align_root, args.subject, args.run)
     if run_dir is None:
@@ -3019,9 +3846,12 @@ def main(argv=None):
                  + (f" for subject {args.subject}" if args.subject else ""))
     run_dir = Path(run_dir)
 
-    subjects = _subjects_in_run(run_dir)
+    subjects_for = _subjects_in_run
+    if listed is not None:                               # --subjects: those of the list the run has, in list order
+        subjects_for = lambda run: [s for s in listed if _is_subject_dir(Path(run) / s)]   # noqa: E731
+    subjects = subjects_for(run_dir)
     if not subjects:
-        sys.exit(f"No aligned subject in {run_dir}")
+        sys.exit(f"No aligned subject in {run_dir}" + (" from --subjects" if listed is not None else ""))
     if args.subject is not None:
         if args.subject not in subjects:
             if (run_dir / args.subject).is_dir():
@@ -3044,7 +3874,7 @@ def main(argv=None):
     image_cache = {}                                     # the last subject's images, reused across runs
 
     def loader(run: Path, subject: str) -> dict:
-        return load_subject_run(run, subject, args.instance, image_cache)
+        return dict(load_subject_run(run, subject, args.instance, image_cache), profile=SUBJECT_FOCUS.get(subject))
 
     start = None
     if args.start == "end":
@@ -3056,7 +3886,57 @@ def main(argv=None):
         pv.OFF_SCREEN = True
 
     viewer = SliceViewer(
-        runs, _subjects_in_run, loader, run_index=run_index,
+        runs, subjects_for, loader, run_index=run_index,
+        subject=args.subject, subject_index=args.subject_index,
+        frame=args.frame, show_seg=not args.no_seg, seg_alpha=args.seg_alpha, start=start,
+        metric=args.metric, show_mask=args.mask, show_lines=args.lines, show_sa_lines=args.sa_lines,
+        show_radius=args.radius, show_profiles=not args.no_profiles,
+        show_metric_profiles=not args.no_metric_profiles,
+        show_psf=not args.raw_profiles, show_blur=args.blur,
+    )
+    if args.screenshot is not None:
+        viewer.show(screenshot=str(args.screenshot), auto_close=True)
+        print(f"Saved {args.screenshot}")
+    else:
+        viewer.show()
+
+
+def main_remote(args, listed: list[str] | None):
+    """--remote: view a run on another machine through a local cache (RemoteRun). One run only (no { } run
+    navigation); [ / ] step through --subjects (or all of the run's subjects), downloading each when shown."""
+    remote = RemoteRun(args.remote, args.cache_dir)
+    print(f"Remote run {remote.target}:{remote.path}, cached in {remote.local}")
+    remote.fetch_run_config()
+    subjects = listed if listed is not None else remote.list_subjects()
+    if not subjects:
+        sys.exit("No subjects to show")
+    if args.subject is not None and args.subject not in subjects:
+        subjects = [args.subject] + subjects
+    elif args.subject is None and not 0 <= args.subject_index < len(subjects):
+        sys.exit(f"Subject index {args.subject_index} out of bounds ({len(subjects)} subjects).")
+    print(f"{len(subjects)} subject(s) to step through")
+
+    image_cache = {}
+
+    def loader(run: Path, subject: str) -> dict:
+        try:
+            remote.fetch_subject(subject)
+        except RuntimeError as exc:
+            sys.exit(str(exc))
+        i = subjects.index(subject) if subject in subjects else -1
+        for nxt in subjects[i + 1:i + 2] + subjects[max(i - 1, 0):i]:   # the next (and previous) in the background
+            remote.prefetch(nxt)
+        return dict(load_subject_run(run, subject, args.instance, image_cache), profile=SUBJECT_FOCUS.get(subject))
+
+    start = None
+    if args.start == "end":
+        start = 10 ** 9
+    elif args.start != "best":
+        start = int(args.start)
+    if args.screenshot is not None:
+        pv.OFF_SCREEN = True
+    viewer = SliceViewer(
+        [remote.local], lambda run: subjects, loader, run_index=0,
         subject=args.subject, subject_index=args.subject_index,
         frame=args.frame, show_seg=not args.no_seg, seg_alpha=args.seg_alpha, start=start,
         metric=args.metric, show_mask=args.mask, show_lines=args.lines, show_sa_lines=args.sa_lines,
