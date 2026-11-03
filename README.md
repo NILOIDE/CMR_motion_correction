@@ -4,17 +4,21 @@ Inter-slice motion estimation and correction for cardiac cine MRI: UK Biobank SA
 cine slices and stacks as NIfTI or DICOM. A 3D viewer lets you inspect the results.
 
 Every cine acquisition (each short-axis slice, each long-axis view) is taken in its own breath-hold. As a result, the
-slices often disagree about where the heart is in scanner space. This pipeline estimates a rigid pose correction for
-every slice by comparing image intensities along the lines where pairs of slices intersect. It then writes the
-corrected images back in the format they were read in.
+slices often disagree about where the heart is in scanner space. This slice-alignment pipeline
+estimates a rigid pose correction for every SAX slice and long-axis view by optimizing the similarity in image
+intensities along the lines where two slices intersect (uses local NCC as a default metric). All slices are penalized
+for moving too far from their initial parameters to prevent drift. 
+It then writes the corrected images back in the format they were read in.
+
 
 ![Optimization process in the 3D viewer (slice_viewer_3d.py)](media/optimization_sa09.gif)
 
 #### Note: This project was vibe-coded within a couple of days. All praise Claude Code.
 
--------------------------
 
-## Pipeline
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+## Motion correction pipeline
 
 ```
 <root>/<subject>/...                      -> your data, one folder per subject (NIfTI or DICOM; layouts below)
@@ -201,7 +205,7 @@ the final pose, and the best of these is saved.
 > **Note:** a schedule that lasts the whole run (`--mask-anneal-frac`, `--blur-frac` or `--psf-anneal-frac` set to 1)
 > leaves no tracking window, and the final pose is used.
 
-#### Keeping slices close to their acquired pose
+#### Keeping slices close to their acquired pose:
 
 Across the UK Biobank, 99.9% of the slice corrections are below about 23 mm and 8°. A slice that moves much further has
 almost certainly gone wrong, which mostly happens in subjects with few slices. Three mechanisms prevent it, from soft
@@ -215,7 +219,7 @@ to hard:
 A weak **gauge** penalty on the mean pose of all slices (`--gauge`) removes the freedom to move every slice together,
 which would not change the score. Setting any of these to 0 switches it off.
 
-#### One run, step by step
+#### Example of metrics along optimization:
 
 The figure below shows one subject aligned with the default settings. On the left are the schedules described above;
 on the right the metrics of the poses at each step. All metrics are computed with the final 20 mm mask and without
@@ -224,8 +228,39 @@ blur, so the steps are comparable.
 ![One alignment run with the default settings](media/metrics.png)
 
 After a quick jump in the first 20 steps, the metrics keep improving steadily while the mask, blur and slice
-profile tighten: Dice levels off around step 600, while NCC keeps rising until the end. For this subject (1000071), NCC
+profile tighten: Dice levels off around step 600, while NCC keeps rising until the end. For this subject, NCC
 rises from 0.72 to 0.86, Dice from 0.61 to 0.77, and the mean Hausdorff distance drops from 30 mm to 18 mm.
+
+
+## Running on a SLURM cluster
+
+`submit_alignment.sh` aligns a cohort with `--logging` (metrics and history); `submit_alignment_nolog.sh` writes the
+aligned images only. Both resume an interrupted run (`--skip-processed`), and large cohorts can be split into chunks of
+subject folders:
+
+```
+sbatch submit_alignment.sh --run-name my_run --start-index 0 --end-index 10000
+sbatch submit_alignment.sh --run-name my_run --start-index 10000 --end-index 20000
+```
+
+## Speed
+
+Three things keep the GPU busy:
+
+- **Batching:** several subjects are aligned in one optimization (`--batch-size`). With the default 0, the first batch
+  measures the GPU memory a subject needs, then the batch size doubles for as long as that speeds things up.
+- **Worker processes:** loading, preparing the intersection lines and writing the outputs run in parallel processes
+  (`--workers`, up to about the number of CPU cores).
+- **Coarse early steps:** the first half of the run samples every 4th cine frame and every 2nd line point
+  (`--coarse-frac`, `--coarse-frame-stride`, `--coarse-point-stride`).
+
+Seconds per subject with the default settings (1000 steps):
+
+| Machine | Workers | `--logging true` | `--logging false` |
+|---|---|---|---|
+| RTX 5070 GPU (8 GB), Intel i7-13650HX | 8 | 2.3s | 1.5s |
+| NVIDIA A40 (46 GB), AMD EPYC 7662 | 40 | 1.3s | 1.2s |
+
 
 ### Changing the settings
 
@@ -248,8 +283,9 @@ The figures in this section are made from one subject by `media/make_readme_figu
 ```
 python media/make_readme_figures.py <ukbb_dir>/<subject>
 ```
-
-## Viewing the results
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+## Visualizing results in the 3D viewer
 
 ### `slice_viewer_3d.py`
 
@@ -291,42 +327,9 @@ python worst_cases.py --remote user@host:/path/to/run             # runs on the 
 
 `worst_cases_commands.txt` lists ready-made viewer commands for every list.
 
-## Running on a SLURM cluster
 
-`submit_alignment.sh` aligns a cohort with `--logging` (metrics and history); `submit_alignment_nolog.sh` writes the
-aligned images only. Both resume an interrupted run (`--skip-processed`), and large cohorts can be split into chunks of
-subject folders:
-
-```
-sbatch submit_alignment.sh --run-name my_run --start-index 0 --end-index 10000
-sbatch submit_alignment.sh --run-name my_run --start-index 10000 --end-index 20000
-```
-
-`download_ukbb.py` downloads subjects in batches over SSH. UK Biobank data may only be stored on approved,
-access-restricted infrastructure; never download it to personal machines.
-
-## Speed
-
-Three things keep the GPU busy:
-
-- **Batching:** several subjects are aligned in one optimization (`--batch-size`). With the default 0, the first batch
-  measures the GPU memory a subject needs, then the batch size doubles for as long as that speeds things up.
-- **Worker processes:** loading, preparing the intersection lines and writing the outputs run in parallel processes
-  (`--workers`, up to about the number of CPU cores).
-- **Coarse early steps:** the first half of the run samples every 4th cine frame and every 2nd line point
-  (`--coarse-frac`, `--coarse-frame-stride`, `--coarse-point-stride`).
-
-Seconds per UK Biobank subject with the default settings (1000 steps):
-
-| Machine | Workers | `--logging true` | `--logging false` |
-|---|---|---|---|
-| Laptop: RTX 5070 Laptop GPU (8 GB), Intel i7-13650HX | 8 | 2.3s | 1.5s |
-| Cluster: NVIDIA A40 (46 GB), AMD EPYC 7662 | 40 | 1.3s | not measured |
-
-The laptop numbers are for 64 subjects, including start-up and the end-of-run figures; the GPU is the limit there, and
-batch sizes from 8 to 24 run equally fast. The cluster number is the rate of a full-cohort run (`submit_alignment.sh`),
-which puts all 57,700 UK Biobank subjects with metrics at about 21 hours.
-
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
 ## Dependencies
 
 - `numpy`, `pandas`, `scipy`
@@ -339,6 +342,63 @@ which puts all 57,700 UK Biobank subjects with metrics at about 21 hours.
 pip install numpy pandas scipy nibabel pydicom torch pyvista matplotlib
 ```
 
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+## General statistics:
+###  UK Biobank
+
+The numbers below are from the first 40,484 subjects of the UK Biobank. Segmentations are generated by the trained 
+nn-Unet models offered by Ugurlu et al.
+
+Finding shows that optimizing over intersection intensity similarity (local NCC) leads to improvement in
+segmentation similarity along the intersection too: 
+
+![alignment dice](media/alignment_dice.png)
+
+**NOTE:** Segmentations are not always accurate. This is especially the case for apical segmentations. Furthermore, 
+across different views, basal segmentations disagree, often leading to poor Dice scores despite manual checks 
+showing good alignment. 
+
+
+**Visualized examples:**
+
+Subject with large apical misalignment. Motion corrected parameters result in a large parameter shift beyond the
+10 mm threshold, triggering rejection. Similarly, the intersection NCC prior to motion correction triggers the
+rejection criteria.
+![alignment example 1](media/alignment_example_1.png)
+
+Subject with slightly misaligned LA 4ch view, leading to NCC and DICE of all SA intersection to increase.
+However, only 1 mid-ventricular SA slice triggers the rejection criteria.
+
+![alignment example 2](media/alignment_example_2.png)
+
+An example of no motion being present.
+
+![alignment example 3](media/alignment_example_3.png)
+
+
+**General statistics on computed translations:**
+
+![alignment translation](media/alignment_translation.png)
+
+- **Slices beyond the apex move most**: a median in-plane translation of 3.8 mm, against 1.6 mm for the kept slices and
+  1.7 mm beyond the base. Their poses rest on short apical profiles with little heart in them, so every judgement uses
+  only the kept slices (the coverage test's range).
+- **Motion per subject** (top right): the largest in-plane translation of a kept slice. Leaving out the 5 / 10 / 20 %
+  of the kept subjects that moved most means a limit of 12.5 / 10.0 / 7.6 mm.
+
+**General statistics on computed rotations:**
+
+![alignment rotation](media/alignment_rotation.png)
+
+- **Rotation**: medians of 1.1° in-plane and 2.7° in total for the kept slices (1.7° and 4.1° beyond the apex);
+  reported, not judged (the tilt rests on three crossing lines only).
+
+
+  
+
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
 ## References
 
 [1] Ugurlu, D., Qian, S., Fairweather, E., Mauger, C., Ruijsink, B., Dal Toso, L., Deng, Y.,
