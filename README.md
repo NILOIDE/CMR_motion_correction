@@ -293,9 +293,9 @@ python worst_cases.py --remote user@host:/path/to/run             # runs on the 
 
 ## Running on a SLURM cluster
 
-`submit_alignment.sh` aligns a cohort with `--logging` (metrics and history); `submit_alignment_uint8.sh` writes the
-aligned images only, as uint8. Both resume an interrupted run (`--skip-processed`), and large cohorts can be split into
-chunks of subject folders:
+`submit_alignment.sh` aligns a cohort with `--logging` (metrics and history); `submit_alignment_nolog.sh` writes the
+aligned images only. Both resume an interrupted run (`--skip-processed`), and large cohorts can be split into chunks of
+subject folders:
 
 ```
 sbatch submit_alignment.sh --run-name my_run --start-index 0 --end-index 10000
