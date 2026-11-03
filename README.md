@@ -305,6 +305,28 @@ sbatch submit_alignment.sh --run-name my_run --start-index 10000 --end-index 200
 `download_ukbb.py` downloads subjects in batches over SSH. UK Biobank data may only be stored on approved,
 access-restricted infrastructure; never download it to personal machines.
 
+## Speed
+
+Three things keep the GPU busy:
+
+- **Batching:** several subjects are aligned in one optimization (`--batch-size`). With the default 0, the first batch
+  measures the GPU memory a subject needs, then the batch size doubles for as long as that speeds things up.
+- **Worker processes:** loading, preparing the intersection lines and writing the outputs run in parallel processes
+  (`--workers`, up to about the number of CPU cores).
+- **Coarse early steps:** the first half of the run samples every 4th cine frame and every 2nd line point
+  (`--coarse-frac`, `--coarse-frame-stride`, `--coarse-point-stride`).
+
+Seconds per UK Biobank subject with the default settings (1000 steps):
+
+| Machine | Workers | `--logging true` | `--logging false` |
+|---|---|---|---|
+| Laptop: RTX 5070 Laptop GPU (8 GB), Intel i7-13650HX | 8 | 2.3s | 1.5s |
+| Cluster: NVIDIA A40 (46 GB), AMD EPYC 7662 | 40 | 1.3s | not measured |
+
+The laptop numbers are for 64 subjects, including start-up and the end-of-run figures; the GPU is the limit there, and
+batch sizes from 8 to 24 run equally fast. The cluster number is the rate of a full-cohort run (`submit_alignment.sh`),
+which puts all 57,700 UK Biobank subjects with metrics at about 21 hours.
+
 ## Dependencies
 
 - `numpy`, `pandas`, `scipy`
