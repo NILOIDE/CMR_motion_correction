@@ -1,43 +1,51 @@
 # CMR Motion Correction
 
-Inter-slice motion estimation and correction for cardiac cine MRI (UK Biobank SAX/LAX acquisitions, or any set of
-cine slices and stacks as NIfTI or DICOM), plus a 3D viewer for inspecting alignment results.
+Inter-slice motion estimation and correction for cardiac cine MRI: UK Biobank SAX/LAX acquisitions, or any set of
+cine slices and stacks as NIfTI or DICOM. A 3D viewer lets you inspect the results.
 
-Different cine acquisitions (each short-axis slice, each long-axis view or stack) are breath-held independently, so
-they commonly disagree about where the heart actually is in scanner space. This pipeline estimates a rigid pose
-correction per slice by comparing image intensities along the 3D lines where pairs of planes intersect, then writes
-out the motion-corrected images in the format they were read in.
+Every cine acquisition (each short-axis slice, each long-axis view) is taken in its own breath-hold. As a result, the
+slices often disagree about where the heart is in scanner space. This slice-alignment pipeline
+estimates a rigid pose correction for every SAX slice and long-axis view by optimizing the similarity in image
+intensities along the lines where two slices intersect (uses local NCC as a default metric). All slices are penalized
+for moving too far from their initial parameters to prevent drift. 
+It then writes the corrected images back in the format they were read in.
 
-These the motion corrected slices (as well as the intermediate optimization process) can be visualized using the
-provided visualization tool.
+
 ![Optimization process in the 3D viewer (slice_viewer_3d.py)](media/optimization_sa09.gif)
 
 #### Note: This project was vibe-coded within a couple of days. All praise Claude Code.
 
--------------------------
 
-
-## Pipeline
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+## Motion correction pipeline
 
 ```
 <root>/<subject>/...                      -> your data, one folder per subject (NIfTI or DICOM; layouts below)
             |
             v
-moco_nifti.py  /  moco_dicom.py           -> entry points: load a subject (NIfTI / DICOM), hand its slices to the
-            |                                motion correction, write the corrected images in the same format
+moco_nifti.py  /  moco_dicom.py           -> entry points: load a subject, run the motion correction,
+            |                                write the corrected images in the same format
             v
-motion_gradient.py                        -> the motion correction (library): estimates per-slice rigid poses
-            |                                (+ optional metrics/figures)
+motion_gradient.py                        -> the motion correction (library): per-slice rigid poses,
+            |                                plus optional metrics and figures (--logging)
             v
-slice_viewer_3d.py  /  slice_viewer_dicom.py   -> interactive 3D viewers over the optimization history
-                                                 (UKBB NIfTI runs / DICOM runs with hundreds of slices)
+slice_viewer_3d.py  /  slice_viewer_dicom.py   -> interactive 3D viewers of the optimization history
 ```
 
-### `moco_nifti.py` (UK Biobank NIfTI)
+A first run and a look at its result:
 
-Expects UK Biobank cine SAX/LAX acquisitions as NIfTI, one folder per subject, used as is: no preparation step.
-Each subject folder is searched recursively (wrapper folders such as `Instance_2` don't matter), and files are
-classified by name:
+```
+python moco_nifti.py --root <ukbb_dir> --out-root <alignment_dir> --run-name my_run
+python slice_viewer_3d.py --run-dir <alignment_dir>/my_run
+```
+
+## Input data
+
+### UK Biobank NIfTI (`moco_nifti.py`)
+
+Point `--root` at a folder with one subfolder per subject. No preparation is needed: each subject folder is searched
+recursively, and files are classified by name.
 
 ```
 <root>/
@@ -47,33 +55,27 @@ classified by name:
       LAX_2Ch.nii.gz               # LAX views (X, Y, 1, T); any other NIfTI is a LAX image of its own
       LAX_3Ch.nii.gz
       LAX_4Ch.nii.gz
+      ao.nii.gz                    # optional aortic slice
       nnUNet_segs/                 # optional; matched to their image by name (SAX slices by position)
         SAX_nnUNetSeg.nii.gz
         LAX_2Ch_nnUNetSeg.nii.gz
         ...
 ```
 
-Missing images or segmentations are allowed. The nnU-Net segmentations are expected to be the ones produced by the
-[Ugurlu et al. pipeline](https://github.com/CEMRG-publications/Ugurlu_2025_PLoS_One) [1]. They define the dilated
-heart masks and the Dice / Hausdorff metrics. NIfTI headers only store the slice spacing, so the thickness is set with
-`--sax-thickness` (8 mm) / `--lax-thickness` (6 mm).
+- **Segmentations** are the nnU-Net ones of the [Ugurlu et al. pipeline](https://github.com/CEMRG-publications/Ugurlu_2025_PLoS_One) [1].
+  They define the heart masks and the Dice / Hausdorff metrics. For the SAX stack, `seg_sa.nii.gz` is preferred when
+  present. Missing images or segmentations are allowed.
+- **The aortic slice** (`ao.nii.gz`, an axial slice through the ascending aorta) is treated as one more LAX view.
+  It has no segmentation, so its lines are masked by the partner image (details below). `--use-ao false` leaves it out.
+- **Slice thickness** is not stored in NIfTI headers (only the spacing), so it is set with `--sax-thickness` (8 mm)
+  and `--lax-thickness` (6 mm).
+- **Output**, per subject: `SAX_slice<nn>.nii.gz`, `LAX_2Ch.nii.gz`, ... with the corrected affines, and the
+  segmentations in `nnUNet_segs/`. `--image-dtype uint8` saves about 30% of the disk space.
 
-Output, per subject: `SAX_slice<nn>.nii.gz`, `LAX_2Ch.nii.gz`, ... with the corrected affines, and the segmentations
-in `nnUNet_segs/`. `--image-dtype uint8` (default `uint16`) saves ~30% disk space.
+### DICOM (`moco_dicom.py`)
 
-```
-python moco_nifti.py --root <ukbb_dir> --out-root <alignment_dir>
-```
-
-### `moco_dicom.py` (DICOM)
-
-For other cine data, e.g. several stacks in different orientations. Every DICOM series (files sharing a
-`SeriesInstanceUID`) below a subject folder is one image, named after its folder. Its slices are the distinct
-positions/orientations and its cardiac frames the files at one slice (ordered by `TriggerTime` / `InstanceNumber`).
-The slice thickness comes from `SliceThickness`. Real/imaginary image pairs are combined into the magnitude. DICOM
-data has no segmentations, so the lines are masked by a disc around the centre of each stack instead
-(`--center-mask-radius-mm`, default 40 mm), grown and annealed like the heart masks (radius 120 mm at the start, 60 mm
-at the end with the default dilation); `--center-mask-radius-mm 0` uses the whole image overlap.
+For other cine data, e.g. several stacks in different orientations. Every DICOM series below a subject folder is one
+image, named after its folder; its slices are the distinct positions and its frames are ordered by `TriggerTime`.
 
 ```
 <root>/
@@ -82,48 +84,35 @@ at the end with the default dilation); `--center-mask-radius-mm 0` uses the whol
     <series_2>/...
 ```
 
-Output: every input file rewritten at the same relative path, with the corrected `ImagePositionPatient` /
-`ImageOrientationPatient` and new UIDs; pixel data are unchanged (`--image-dtype uint8` for 8-bit). With `--logging`,
-each subject's `metrics/` also gets line plots of the metrics over the optimization: `metric_trends.png` (the optimized
-objective, then NCC / LNCC / NMI per slice: mean, min / max and inter-quartile range, and the slope over the last 25% of
-the steps) and `metric_trends_stacks.png` (the same per stack), to see whether a run improved, is still improving, or
-diverged.
+DICOM data has no segmentations, so the lines are masked by a disc around the centre of each stack instead
+(`--center-mask-radius-mm`, 40 mm). The output rewrites every input file at the same relative path, with corrected
+`ImagePositionPatient` / `ImageOrientationPatient` and new UIDs. With `--logging`, `metrics/metric_trends.png` shows
+whether a run improved, is still improving, or diverged.
 
 ```
 python moco_dicom.py --root <dicom_dir>                     # output: <dicom_dir>_aligned
 python moco_dicom.py --root <dicom_dir> --pair-keep 0.25 --sample-dtype float16   # many slices, small GPU
 ```
 
-Every option is defined with a general default in `motion_gradient.build_parser`. An entry point adds its
-data-format options (slice thickness, `--image-dtype`) and repeats the options worth seeing at a glance (paths, run
-options, hardware, ...) with its own defaults: a repeated option replaces the general one (e.g. `--blur-frac` is 0.9 in
-`motion_gradient.py` and 0.1 in `moco_dicom.py`). See `--help` for everything. A new data format only needs a new entry
-script that loads a subject into a list of 2D+time slices (`motion_gradient.SliceImage`: cine, affine, thickness,
-optional segmentation) and writes them back with the corrected affines.
+## How the alignment works (`motion_gradient.py`)
 
-### `motion_gradient.py`
+`motion_gradient.py` is the motion correction itself; the entry points above call it. In this section we first look at
+the idea, then walk through what happens during a run.
 
-The motion correction, used by the entry points (not run on its own).
+### The idea
 
-Every two slices whose acquired normals differ by at least `--min-pair-angle-deg` (20°) are paired. Slices of one
-stack never pair. Between densely spaced stacks the pairs are thinned to partners about a slice thickness apart
-(`--pair-spacing-mm`). For each pair it samples intensity profiles along their 3D intersection line (with a PSF band
-for the slice thickness, restricted to a dilated heart mask where segmentations exist) and optimizes a rigid pose per
-slice (PyTorch, SGD/Adam) to maximize agreement across cardiac phases. Optional SAX-stack regularizers keep
-neighbouring slices from tilting, drifting apart, or crossing. The crossing terms (`--sax-sax-weight`: image
-dissimilarity along the line where a slice crosses the one above / below it; `--sax-gap-reg`: a gap barrier) act on
-every stack, so also on the oblique DICOM stacks (exposed in `moco_dicom.py`). With `--logging`, it also writes per-subject and
-dataset-level metrics (CSV) and figures (PNG) under the run directory. The method builds on the intersection-line
-intensity-matching approach of [Stolt-Ansó et al.](https://arxiv.org/pdf/2404.00767) [2].
+Every slice gets a **rigid pose**: a 3D translation and a 3D rotation, both starting at zero (the acquired geometry).
+To score a set of poses, we pair every two slices whose orientations differ by at least 20°
+(`--min-pair-angle-deg`) and sample both images along their **intersection line**. If both slices are in the right
+place, the two intensity profiles along that line should look alike.
 
-We found best results with plain SGD (the default, no momentum) rather than Adam. There is also a substantial amount
-of non-rigid deformation in the torso between acquisitions (the heart itself moves close to rigidly, but the
-surrounding anatomy does not), so the intersection-line optimization is restricted to a dilated foreground (heart)
-mask derived from the LAX segmentations, rather than the full extent of each line, to keep it from being pulled off
-by non-rigid motion further out.
+We measure the agreement with the **local normalized cross-correlation** (`--metric lncc`): the profiles are compared
+in 20 mm windows sliding along the line, so every stretch of the line has to match on its own. The score is averaged
+over 10 cardiac phases (`--n-frames`) and over all lines. An optimizer (PyTorch, plain SGD) then moves the slices to
+maximize it.
 
-The pose model (`--dof`, default 6) depends on which images a subject has. A segmented LAX view counts only if its
-segmentation contains the heart; an unsegmented image takes part unmasked.
+How many degrees of freedom a slice gets depends on the images a subject has. With few crossing orientations, a
+slice's tilt cannot be determined and is not optimized:
 
 | Available images                                                   | Optimized with `--dof 6`                 |
 |--------------------------------------------------------------------|------------------------------------------|
@@ -131,77 +120,285 @@ segmentation contains the heart; an unsegmented image takes part unmasked.
 | 2, or single-slice LAX views only                                  | translation + in-plane rotation (4-DOF)  |
 | fewer than 2                                                       | nothing (images written unaligned)       |
 
-With fewer crossing orientations, a plane's tilt is unconstrained, and optimizing it leads to degenerate solutions.
-`--dof 4` forces translation + in-plane rotation, and `--dof 3` translation only. Every image present is always
-written to the output folder; images that could not be aligned keep their acquired affine. The `pose_model` column of
-the summary CSV records which model each subject used.
+The `pose_model` column of the summary CSV records which model a subject used. Every image is always written to the
+output; images that could not be aligned keep their acquired pose.
 
-This script has a large number of tuning options (optimizer/schedule, blur coarse-to-fine, stack regularizers,
-similarity metric, point-spread-function model, mask annealing, ...); see the module docstring for the full method
-description and `--help` of either entry point for every flag.
+The method builds on the intersection-line intensity matching of [Stolt-Ansó et al.](https://arxiv.org/pdf/2404.00767) [2].
+
+### How an alignment run proceeds
+
+A run does not optimize the same score from start to finish. Several things change over its 1000 steps (`--steps`):
+the learning rate, the heart mask, the image blur and the slice profile. Wide, smooth settings at the start help the
+slices find their rough position; tight, sharp settings at the end refine it. All numbers below are the defaults.
+
+#### Learning rate
+
+With plain **SGD** (`--optimizer sgd`), a slice moves by the learning rate times its gradient. There is one learning
+rate for translations (`--lr`, 80) and one for rotations (`--rot-lr`, 20).
+
+Both **decay linearly** to 50% of their start value over the run (`--lr-schedule linear`). Why decay at all? At every
+step only a random 80% of the lines is used (`--pair-keep`), which makes the gradient noisy. Large early steps move the
+slices quickly; smaller late steps let them settle instead of jittering around the optimum.
+
+#### Heart mask and its dilation
+
+The heart moves almost rigidly between breath-holds, but the chest wall and the liver do not. We therefore only use
+the part of each line that lies inside a **heart mask**, built from each LAX view's segmentation:
+
+1. **Heart region:** every pixel that a heart label covers in any cardiac frame.
+2. **Apex extension:** the region is swept 20 mm toward the apex along the LV long axis (`--apex-extend-mm`). Apical
+   segmentations are often incomplete; without this step the apical SAX slices keep few supervised points.
+3. **Dilation:** the region is grown by a margin. Only line points inside the grown mask enter the score.
+
+The dilation shrinks from 80 mm to 20 mm over the first 80% of the run (`--mask-dilation-start-mm`,
+`--mask-dilation-mm`, `--mask-anneal-frac`). A wide mask gives the optimizer context while the slices are still far
+off; the tight mask at the end lets the heart alone decide the final pose.
+
+![Heart mask: annealed dilation and the apex extension](media/mask.png)
+
+The dilation changes in 6 stages (`--anneal-stages`), and all intersection lines are rebuilt at each stage:
+
+| Steps    | 0-132 | 133-266 | 267-399 | 400-532 | 533-666 | 667-799 | 800-1000 |
+|----------|-------|---------|---------|---------|---------|---------|----------|
+| Dilation | 80 mm | 70 mm   | 60 mm   | 50 mm   | 40 mm   | 30 mm   | 20 mm    |
+
+> **Note: lines come and go.** A line only takes part if at least 40 mm of it lie inside both images and the mask
+> (`--min-line-mm`). A pair of slices can therefore contribute at a wide dilation and drop out once the mask is tight.
+> The 3D viewer marks such pairs as "(not in loss)" at the steps where they do not contribute.
+
+Images without a segmentation have no mask of their own: their lines with a LAX view use that view's mask. The aortic
+slice is compared with the SAX slices only within 120 mm of the LV long axis (`--sax-sax-radius-mm`).
+
+#### Annealed blurring
+
+A profile with many small, sharp features gives a score with many small local optima. To avoid getting stuck early,
+we work **coarse-to-fine**: all images are blurred in-plane with a Gaussian that narrows over the run.
+
+The blur starts at a sigma of 5 mm (`--blur-sigma`), decreases linearly to 2 mm over the first 80% of the run
+(`--blur-sigma-end`, `--blur-frac`), and then stays at 2 mm. The applied sigma moves in steps of 0.2 mm. The blur is
+only used inside the optimization; the saved images are never blurred.
+
+![Coarse-to-fine blur](media/blur.png)
+
+At 2 mm the profile keeps its main edges but loses the finest detail, which keeps the score smooth until the end. At
+5 mm only the large structures (blood pool, myocardium) remain.
+
+#### Slice profile (PSF)
+
+A slice is not infinitely thin: a SAX slice is 8 mm thick, a LAX view 6 mm. When we sample one image along a line,
+we therefore average it across the slab of the other slice, weighted by that slice's profile (the **point-spread
+function**, `--psf-model pulse`).
+
+Like the blur, this band starts wider than physical, 3 times the slice profile (`--psf-scale-start`), and narrows to
+the physical width over the first 90% of the run (`--psf-anneal-frac`). Unlike the blur, it smooths an image only
+across the intersection line, not along it.
+
+![Slice profile (PSF)](media/psf.png)
+
+#### Choosing the final pose
+
+The saved pose is not simply the last one. Scores computed with a wide mask or a strong blur cannot be compared with
+scores at the end of the run, so the optimizer only starts tracking the **best pose** once every schedule has finished:
+from step 900 by default. From there, the full score (all lines) is computed every 10 steps (`--eval-every`) and for
+the final pose, and the best of these is saved.
+
+> **Note:** a schedule that lasts the whole run (`--mask-anneal-frac`, `--blur-frac` or `--psf-anneal-frac` set to 1)
+> leaves no tracking window, and the final pose is used.
+
+#### Keeping slices close to their acquired pose:
+
+Across the UK Biobank, 99.9% of the slice corrections are below about 23 mm and 8°. A slice that moves much further has
+almost certainly gone wrong, which mostly happens in subjects with few slices. Three mechanisms prevent it, from soft
+to hard:
+
+- **Step cap:** at most 2 mm and 1° per optimizer step (`--max-step-mm`, `--max-step-deg`).
+- **Dead-zone priors:** free within 20 mm and 10° of the acquired pose; beyond that, a penalty grows with the square of
+  the excess (`--shift-prior`, `--shift-free-mm`, `--rot-prior`, `--rot-free-deg`).
+- **Hard limits:** never more than 50 mm or 20° (`--max-shift-mm`, `--max-rot-deg`).
+
+A weak **gauge** penalty on the mean pose of all slices (`--gauge`) removes the freedom to move every slice together,
+which would not change the score. Setting any of these to 0 switches it off.
+
+#### Example of metrics along optimization:
+
+The figure below shows one subject aligned with the default settings. On the left are the schedules described above;
+on the right the metrics of the poses at each step. All metrics are computed with the final 20 mm mask and without
+blur, so the steps are comparable.
+
+![One alignment run with the default settings](media/metrics.png)
+
+After a quick jump in the first 20 steps, the metrics keep improving steadily while the mask, blur and slice
+profile tighten: Dice levels off around step 600, while NCC keeps rising until the end. For this subject, NCC
+rises from 0.72 to 0.86, Dice from 0.61 to 0.77, and the mean Hausdorff distance drops from 30 mm to 18 mm.
+
+
+## Running on a SLURM cluster
+
+`submit_alignment.sh` aligns a cohort with `--logging` (metrics and history); `submit_alignment_nolog.sh` writes the
+aligned images only. Both resume an interrupted run (`--skip-processed`), and large cohorts can be split into chunks of
+subject folders:
+
+```
+sbatch submit_alignment.sh --run-name my_run --start-index 0 --end-index 10000
+sbatch submit_alignment.sh --run-name my_run --start-index 10000 --end-index 20000
+```
+
+## Speed
+
+Three things keep the GPU busy:
+
+- **Batching:** several subjects are aligned in one optimization (`--batch-size`). With the default 0, the first batch
+  measures the GPU memory a subject needs, then the batch size doubles for as long as that speeds things up.
+- **Worker processes:** loading, preparing the intersection lines and writing the outputs run in parallel processes
+  (`--workers`, up to about the number of CPU cores).
+- **Coarse early steps:** the first half of the run samples every 4th cine frame and every 2nd line point
+  (`--coarse-frac`, `--coarse-frame-stride`, `--coarse-point-stride`).
+
+Seconds per subject with the default settings (1000 steps):
+
+| Machine | Workers | `--logging true` | `--logging false` |
+|---|---|---|---|
+| RTX 5070 GPU (8 GB), Intel i7-13650HX | 8 | 2.3s | 1.5s |
+| NVIDIA A40 (46 GB), AMD EPYC 7662 | 40 | 1.3s | 1.2s |
+
+
+### Changing the settings
+
+Every option has a general default in `motion_gradient.build_parser`. An entry point repeats the options worth seeing
+at a glance with its own defaults, which replace the general ones (e.g. `--sample-dtype` is float32 in
+`motion_gradient.py` and float16 in `moco_nifti.py`). `--help` on either entry point lists everything.
+
+To try a variant, align a small batch of subjects into its own run directory and compare:
+
+```
+python moco_nifti.py --root <ukbb_dir> --out-root <alignment_dir> --run-name test_blur05 --start-index 0 --end-index 25 --blur-sigma-end 0.5
+```
+
+Use a new `--run-name` for every variant. A second run into the same directory overwrites the subjects' images, so
+only the newest variant can be opened in the viewer.
+
+The figures in this section are made from one subject by `media/make_readme_figures.py`, using the code itself
+(including a fresh alignment for the metrics figure). Regenerate them after changing a default:
+
+```
+python media/make_readme_figures.py <ukbb_dir>/<subject>
+```
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+## Visualizing results in the 3D viewer
 
 ### `slice_viewer_3d.py`
 
-Interactive PyVista viewer that renders every SAX slice and LAX view as a textured quad in
-scanner/world space, using the poses from a `moco_nifti.py` run's optimization history
-(`metrics/history.csv`). A slider scrubs through optimization steps; segmentation overlays,
-per-plane similarity-metric coloring, intersection lines and mask contours can be toggled.
-It reads the UK Biobank NIfTI layout (SAX slices, `LAX_2Ch` / `3Ch` / `4Ch`, `nnUNet_segs/`), not DICOM runs.
+An interactive PyVista viewer for `moco_nifti.py` runs. Every slice is drawn in scanner space at its pose; a slider
+scrubs through the optimization steps. Segmentations, metric-coloured outlines, intersection lines and mask contours
+can be toggled. On the right, the intensity profiles along the selected slice's intersection lines are shown as the
+loss sees them, with the selected metric per point below (scroll with the mouse wheel).
 
 ```
-python slice_viewer_3d.py                      # most recently created run, its first subject
-python slice_viewer_3d.py <subject-id>               # a specific subject
-python slice_viewer_3d.py <subject-id> --run <run-name>
+python slice_viewer_3d.py                                    # newest run, its first subject
+python slice_viewer_3d.py <subject-id> --run <run-name>           # a given subject and run
+python slice_viewer_3d.py --remote user@host:/path/to/run --subjects worst_cases/slice_shift_max.txt
 ```
 
-See the module docstring for the full keyboard/mouse interaction reference.
+With `--remote`, subjects are read over ssh from another machine and downloaded once into a local cache. `--subjects`
+steps through a list of subjects with `[` / `]`, e.g. one written by `worst_cases.py`. The module docstring lists every
+key and mouse action.
 
 ### `slice_viewer_dicom.py`
 
-Viewer for `moco_dicom.py` runs, built for subjects with hundreds of slices (e.g. several stacks of 40-60 slices).
-Slices are grouped by stack (series), and only a subset is drawn at a time. Each stack shows its current slice and
-optionally +-w neighbours, which its ghost button turns into faint outlines in the stack's colour: selecting a slice
-moves the other stacks to the slices passing through it, each stack's slice slider scrolls through its slices, and a
-button jumps every stack to its worst slice by the chosen metric (NCC / LNCC / NMI, or motion from the acquired pose). The selected slice (keys or double click) shows its
-metrics and its intensity profiles against the crossing slice of each other stack, plus against the slices before and
-after it in its own stack (where the poses make them cross; the `--sax-sax-weight` lines, also drawn in 3D with the
-neighbour-lines toggle). As in `slice_viewer_3d.py`, two toggles show the images as the loss saw them at the shown
-step: image blurring (the coarse-to-fine in-plane blur, on the slices and in the profiles) and PSF in profiles (each
-profile averaged across the other slice's slab). Pixel data are read from the run's input DICOMs and the poses from
-its history (`--logging`).
+The viewer for `moco_dicom.py` runs, built for subjects with hundreds of slices. Slices are grouped by stack, and only
+a subset is drawn at a time: each stack shows its current slice and optionally a few neighbours. A button jumps every
+stack to its worst slice by the chosen metric.
 
 ```
-python slice_viewer_dicom.py                                   # newest run under --align-root, first subject
 python slice_viewer_dicom.py vol1302 --run <run-name> --neighbours 3
 ```
 
-### `analyze_alignment.py`
+### Finding the worst cases (`worst_cases.py`)
 
-Pre- vs post-optimization alignment of every subject of a run (made with `--logging`), as sortable CSVs in
-`<run>/overall_metrics/alignment_analysis/`: `alignment_subjects.csv` (one row per subject), `alignment_slices.csv`
-(one row per subject-slice) and `alignment_lines.csv` (one row per intersection line). Each metric has `_pre`
-(acquired geometry), `_post` (saved pose) and `_delta` columns: mean NCC / LNCC / NMI / Dice / Hausdorff, the worst
-line's NCC / Dice / Hausdorff, the mean over the worst 10% of lines, and the correction (largest / mean translation and
-rotation). It also writes and prints the best / worst N subjects and subject-slices per metric.
+On a large cohort you cannot look at every subject. `worst_cases.py` ranks the subjects of a run by many metrics
+(largest single-slice motion, worst slice Dice, NCC lost by the alignment, ...). It writes one list per metric,
+worst first, with the slice where each subject is worst.
 
 ```
-python analyze_alignment.py <run_dir>                        # ranked by the post-optimization values
-python analyze_alignment.py <run_dir> --stage pre --top 10   # the best / worst aligned as acquired
+python worst_cases.py --run-dir <alignment_dir>/<run> --top 50
+python worst_cases.py --remote user@host:/path/to/run             # runs on the server, only the lists come back
 ```
 
+`worst_cases_commands.txt` lists ready-made viewer commands for every list.
+
+
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
 ## Dependencies
 
 - `numpy`, `pandas`, `scipy`
-- `nibabel` (NIfTI I/O)
-- `pydicom` (DICOM I/O, `moco_dicom.py`)
+- `nibabel` (NIfTI I/O), `pydicom` (DICOM I/O)
 - `torch` (pose optimization)
-- `pyvista` (3D viewer)
-- `matplotlib` (figures, `--logging`)
+- `pyvista` (3D viewers)
+- `matplotlib` (figures)
 
 ```
 pip install numpy pandas scipy nibabel pydicom torch pyvista matplotlib
 ```
 
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+## General statistics:
+###  UK Biobank
+
+The numbers below are from the first 40,484 subjects of the UK Biobank. Segmentations are generated by the trained 
+nn-Unet models offered by Ugurlu et al.
+
+Finding shows that optimizing over intersection intensity similarity (local NCC) leads to improvement in
+segmentation similarity along the intersection too: 
+
+![alignment dice](media/alignment_dice.png)
+
+**NOTE:** Segmentations are not always accurate. This is especially the case for apical segmentations. Furthermore, 
+across different views, basal segmentations disagree, often leading to poor Dice scores despite manual checks 
+showing good alignment. 
+
+
+**Visualized examples:**
+
+Subject with large apical misalignment. Motion corrected parameters result in a large parameter shift beyond the
+10 mm threshold, triggering rejection. Similarly, the intersection NCC prior to motion correction triggers the
+rejection criteria.
+![alignment example 1](media/alignment_example_1.png)
+
+Subject with slightly misaligned LA 4ch view, leading to NCC and DICE of all SA intersection to increase.
+However, only 1 mid-ventricular SA slice triggers the rejection criteria.
+
+![alignment example 2](media/alignment_example_2.png)
+
+An example of no motion being present.
+
+![alignment example 3](media/alignment_example_3.png)
+
+
+**General statistics on computed translations:**
+
+![alignment translation](media/alignment_translation.png)
+
+- **Slices beyond the apex move most**: a median in-plane translation of 3.8 mm, against 1.6 mm for the kept slices and
+  1.7 mm beyond the base. Their poses rest on short apical profiles with little heart in them, so every judgement uses
+  only the kept slices (the coverage test's range).
+- **Motion per subject** (top right): the largest in-plane translation of a kept slice. Leaving out the 5 / 10 / 20 %
+  of the kept subjects that moved most means a limit of 12.5 / 10.0 / 7.6 mm.
+
+**General statistics on computed rotations:**
+
+![alignment rotation](media/alignment_rotation.png)
+
+- **Rotation**: medians of 1.1° in-plane and 2.7° in total for the kept slices (1.7° and 4.1° beyond the apex);
+  reported, not judged (the tilt rests on three crossing lines only).
+
+
+  
+
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
 ## References
 
 [1] Ugurlu, D., Qian, S., Fairweather, E., Mauger, C., Ruijsink, B., Dal Toso, L., Deng, Y.,
