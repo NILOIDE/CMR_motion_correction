@@ -136,6 +136,7 @@ from collections import deque
 import dataclasses
 import multiprocessing
 import os
+import pickle
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
@@ -3479,9 +3480,9 @@ def _worker_init():
 
 
 def load_job(load, is_complete, subj_dir: Path, out_dir: Path, args):
-    """Worker process: SKIPPED_JOB when --skip-processed finds the subject complete, else (subject, data, pre) -- the
-    subject without its pixels (the main process only needs its slices' geometry and identity; the images are
-    written by save_job, which reads them again), its prepare_subject() (the frames used, masks and distance maps)
+    """Worker process: SKIPPED_JOB when --skip-processed finds the subject complete, else (subject, data, pre) pickled
+    to bytes (unpack_loaded) -- the subject without its pixels (the main process only needs its slices' geometry and
+    identity; the images are written by save_job, which reads them again), its prepare_subject() (the frames used, masks and distance maps)
     and its prepare_lines() (intersection lines of every mask stage), None when it has nothing to align. The CPU
     work of loading and preparing runs here, in parallel."""
     if args.skip_processed and is_complete(subj_dir, out_dir):
@@ -3499,7 +3500,16 @@ def load_job(load, is_complete, subj_dir: Path, out_dir: Path, args):
     pre = prepare_lines(data, args, on_lines) if data is not None and (data["sax"] or data["lax"]) else None
     light = Subject(subject.subject_id, [dataclasses.replace(s, data=None, seg=None) for s in subject.slices],
                     subject.status)
-    return light, data, pre
+    # sent back as one byte string (plain pickle: tensors by value). Returned as objects, the result would go through
+    # torch's multiprocessing pickler, which on Linux shares every CPU tensor through a file descriptor of its own --
+    # hundreds per subject (its lines), so a few queued subjects exceed the open-file limit (OSError: [Errno 24] Too
+    # many open files) and every load fell back to the main process
+    return pickle.dumps((light, data, pre), protocol=pickle.HIGHEST_PROTOCOL)
+
+
+def unpack_loaded(res):
+    """load_job's result as (subject, data, pre), or SKIPPED_JOB."""
+    return pickle.loads(res) if isinstance(res, bytes) else res
 
 
 def save_job(load, save, subj_dir: Path, affines: list, out_dir: Path, args) -> None:
@@ -4108,12 +4118,12 @@ def run(ap: argparse.ArgumentParser, args, load, save, is_complete) -> tuple[Pat
                 process: a worker can fail to send back a subject it loaded fine (Windows pipes refuse large writes
                 under memory pressure: WinError 1450), while a real load error fails again here as well."""
                 try:
-                    return fut.result()
+                    return unpack_loaded(fut.result())
                 except Exception as err:  # noqa: BLE001
                     print(f"\nLoading {subj.name} in a worker failed ({type(err).__name__}: {err}); retrying here",
                           flush=True)
                     try:
-                        return load_job(load, is_complete, subj, run_dir / subj.name, args)
+                        return unpack_loaded(load_job(load, is_complete, subj, run_dir / subj.name, args))
                     except Exception as err2:  # noqa: BLE001
                         return err2
 
