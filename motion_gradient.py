@@ -137,7 +137,7 @@ import dataclasses
 import multiprocessing
 import os
 import pickle
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from itertools import combinations
@@ -2145,7 +2145,7 @@ def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]
                 body(smp)
         torch.cuda.current_stream().wait_stream(side)
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph, capture_error_mode="thread_local"):   # (run() may finish a batch meanwhile)
+        with torch.cuda.graph(graph):
             body(smp)
         with torch.no_grad():
             for p, v in zip(params, saved_p):
@@ -2502,8 +2502,7 @@ def align_batch(ctxs: list[dict], args, device) -> list[dict]:
     res = align(final, args, stages or None, groups=groups, models=[c["model"] for c in ctxs], anneal_ends=ends)
     # with logging, the reported metrics of every subject (acquired pose, saved pose, every history snapshot) are
     # evaluated for the whole batch at once -- they are per line, so the shared sampler gives each subject's own
-    # values -- instead of one evaluation per subject and snapshot; on first use in finish_alignment (batch_metrics),
-    # so that run() can do it while the next batch aligns
+    # values -- instead of one evaluation per subject and snapshot; on first use in finish_alignment (batch_metrics)
     shared = dict(final=final, planes=planes, res=res, metrics=None) if getattr(args, "logging", True) else None
     out, m0 = [], 0
     for g, c in enumerate(ctxs):
@@ -2761,18 +2760,6 @@ def finish_subjects(ctxs: list, results: dict, args, device) -> list:
         except Exception as e:  # noqa: BLE001
             out.append(e)
     return out
-
-
-def finish_on_stream(ctxs: list, results: dict, args, device, stream) -> tuple[list, float]:
-    """finish_subjects on its own CUDA stream (run(): in a background thread, while the next batch aligns on the
-    main stream). The caller makes `stream` wait for the main stream first; the stream is synchronized before
-    returning, so nothing of these subjects is still in use on the GPU once their memory is released. Returns the
-    results and the seconds taken."""
-    t0 = time.time()
-    with torch.cuda.stream(stream):
-        out = finish_subjects(ctxs, results, args, device)
-    stream.synchronize()
-    return out, time.time() - t0
 
 
 RELMOTION_COLUMNS = ["subject_id", "kind", "slice_a", "slice_b", "n_pairs", "dx_mm", "dy_mm", "dz_mm",
@@ -3472,7 +3459,7 @@ def fmt_row(row: dict) -> dict:
 
 # arguments that only affect input/output/bookkeeping, not the result, and are therefore left out of run names
 NAME_EXCLUDED = {"root", "out_root", "run_name", "logging", "history_every", "no_cuda_graph", "max_subjects", "skip_processed",
-                 "device", "workers", "step_progress", "no_overlap"}
+                 "device", "workers", "step_progress"}
 HISTORY_EVERY = 0.02    # with --logging: pose/metric snapshot every this fraction of the run (plus step 0 and the best pose)
 def _worker_init():
     """Worker processes of run(): one thread each (the run has as many processes as --workers), no GPU."""
@@ -3522,6 +3509,20 @@ AUTO_BATCH_PROBE = 4     # --batch-size 0: subjects in the first batch, which me
 AUTO_BATCH_FILL = 0.8    # ... the share of the GPU memory free at the start that a batch may fill
 AUTO_BATCH_MAX = 64      # ... at most this many subjects per batch
 AUTO_BATCH_GAIN = 0.1    # ... the batch size doubles while the alignment time per subject drops by more than this
+CUDA_LOST_EXIT = 75      # run()'s exit code when the GPU context is lost; submit_alignment*.sh then start it again
+
+
+def cuda_lost(device) -> bool:
+    """Whether this process's CUDA context is unusable. After some CUDA errors (cudaErrorUnknown, an illegal memory
+    access, a driver fault) every later GPU call fails the same way; an out-of-memory error leaves it usable."""
+    if device.type != "cuda":
+        return False
+    try:
+        torch.ones(1, device=device).add_(1).cpu()
+        torch.cuda.synchronize(device)
+        return False
+    except Exception:  # noqa: BLE001
+        return True
 RESCAN_SECONDS = 30.0   # how often --root is rescanned for new subjects while others are still queued
 SKIPPED_JOB = "__skipped__"   # load_job(): the subject was found complete (--skip-processed)
 
@@ -3964,10 +3965,6 @@ def build_parser(description: str) -> argparse.ArgumentParser:
                         "stays (a GPU gains nothing from batches beyond the size that saturates it). A batch that "
                         "still runs out of memory is split in halves, and later batches shrink. On the CPU, or with "
                         "the terms above, 0 means 1. Default: %(default)s")
-    g.add_argument("--no-overlap", action="store_true",
-                   help="With --logging on a GPU, a batch's metrics and history are computed in a background thread "
-                        "while the next batch aligns (the GPU would otherwise idle meanwhile); this computes them "
-                        "before the next batch starts instead (same results; for debugging)")
     g.add_argument("--no-cuda-graph", action="store_true",
                    help="Run each optimization step eagerly instead of replaying a captured CUDA graph (same result, "
                         "slower; for debugging)")
@@ -4080,12 +4077,6 @@ def run(ap: argparse.ArgumentParser, args, load, save, is_complete) -> tuple[Pat
             free0 = torch.cuda.mem_get_info(device)[0] if auto_batch else 0
             probing, tuning, mem_max, tune_best = auto_batch, auto_batch, AUTO_BATCH_MAX, None
             align_stats = {}                                  # OOM splits (align_subjects)
-            # with logging on a GPU, a batch's metrics and history (finish_subjects) are computed in a background
-            # thread on a CUDA stream of its own while the next batch aligns
-            overlap = args.logging and device.type == "cuda" and not getattr(args, "no_overlap", False)
-            finisher = ThreadPoolExecutor(max_workers=1) if overlap else None
-            finish_stream = torch.cuda.Stream(device) if overlap else None
-            pending = None                                    # the batch being finished in the background
 
             def top_up():
                 """Keep 2 x --workers (at least 2 x --batch-size) subjects loading ahead. When the known subjects run out, rescan --root for
@@ -4127,17 +4118,30 @@ def run(ap: argparse.ArgumentParser, args, load, save, is_complete) -> tuple[Pat
                     except Exception as err2:  # noqa: BLE001
                         return err2
 
-            def complete(entries, todo, res, t_align):
-                """Write the results of a finished batch: `res` is (finish_subjects results, seconds), or the future of
-                finish_on_stream's."""
-                try:
-                    outs, t_finish = res.result() if hasattr(res, "result") else res
-                except Exception as err:  # noqa: BLE001
-                    traceback.print_exception(err)
-                    outs, t_finish = [err] * len(todo), 0.0
+            def stop_if_cuda_lost(errors):
+                """After a CUDA error that leaves the GPU context unusable, every later subject would fail the same
+                way within milliseconds (a full-cohort run marked thousands as failed): stop instead, once the images
+                being written are done, with exit code CUDA_LOST_EXIT -- submit_alignment*.sh then start the run
+                again in a fresh process, which resumes where it stopped (--skip-processed)."""
+                if not errors or not cuda_lost(device):
+                    return
+                err = errors[0]
+                print(f"\nThe CUDA context is lost ({type(err).__name__}: {str(err).splitlines()[0] if str(err) else ''}); "
+                      f"stopping with exit code {CUDA_LOST_EXIT} so that the run can be restarted", flush=True)
+                for _, _, job in save_jobs:
+                    try:
+                        job.result()
+                    except Exception:  # noqa: BLE001
+                        pass
+                ex.shutdown(wait=True, cancel_futures=True)
+                raise SystemExit(CUDA_LOST_EXIT)
+
+            def complete(entries, todo, outs, seconds):
+                """Write the results of a finished batch (finish_subjects), which took `seconds` in all."""
+                stop_if_cuda_lost([o for o in outs if isinstance(o, Exception)])
                 for e, o in zip(todo, outs):
                     e["out"] = o
-                write_entries(entries, (t_align + t_finish) / len(entries))   # the batch's time, shared
+                write_entries(entries, seconds / len(entries))   # the batch's time, shared by its subjects
 
             def write_entries(entries, seconds):
                 """Write the rows, outputs and progress of a batch's subjects (complete)."""
@@ -4261,29 +4265,16 @@ def run(ap: argparse.ArgumentParser, args, load, save, is_complete) -> tuple[Pat
                                                     for e in todo], [e["data"] for e in todo], [e["pre"] for e in todo],
                                                    align_stats)
                 t_align = time.time() - t0
+                stop_if_cuda_lost([r for r in list(ctxs) + list(results.values()) if isinstance(r, Exception)])
                 n_live = sum(1 for c in ctxs if not isinstance(c, Exception) and c["lines"])
-                if pending is not None:                  # the previous batch, finished meanwhile
-                    complete(*pending)
-                    pending = None
-                if overlap and todo and not probe:
-                    finish_stream.wait_stream(torch.cuda.current_stream(device))
-                    pending = (entries, todo, finisher.submit(finish_on_stream, ctxs, results, args, device,
-                                                              finish_stream), t_align)
-                else:
-                    t1 = time.time()
-                    if probe:
-                        align_peak = torch.cuda.max_memory_allocated(device) - base
-                        before = torch.cuda.memory_allocated(device)
-                        torch.cuda.reset_peak_memory_stats(device)
-                    outs = finish_subjects(ctxs, results, args, device) if todo else []
-                    if probe and n_live:                  # --batch-size 0: the memory bound, from this batch
-                        finish_peak = torch.cuda.max_memory_allocated(device) - before
-                        probing = False
-                        per = (max(0, align_peak) + (max(0, finish_peak) if overlap else 0)) / n_live
-                        mem_max = int(max(1, min(AUTO_BATCH_MAX, AUTO_BATCH_FILL * free0 // max(per, 1))))
-                        print(f"\n[batch] --batch-size 0: a subject takes ~{per / 2 ** 20:.0f} MiB of GPU memory "
-                              f"({free0 / 2 ** 30:.1f} GiB were free): at most {mem_max} per batch", flush=True)
-                    complete(entries, todo, (outs, time.time() - t1), t_align)
+                outs = finish_subjects(ctxs, results, args, device) if todo else []
+                if probe and n_live:                      # --batch-size 0: the memory bound, from this batch
+                    probing = False
+                    per = max(0, torch.cuda.max_memory_allocated(device) - base) / n_live
+                    mem_max = int(max(1, min(AUTO_BATCH_MAX, AUTO_BATCH_FILL * free0 // max(per, 1))))
+                    print(f"\n[batch] --batch-size 0: a subject takes ~{per / 2 ** 20:.0f} MiB of GPU memory "
+                          f"({free0 / 2 ** 30:.1f} GiB were free): at most {mem_max} per batch", flush=True)
+                complete(entries, todo, outs, time.time() - t0)
                 del ctxs, results
                 if tuning and not probing and n_live >= max(2, int(0.75 * batch_size)):
                     per_t = t_align / n_live                     # alignment seconds per subject at this size
@@ -4302,11 +4293,6 @@ def run(ap: argparse.ArgumentParser, args, load, save, is_complete) -> tuple[Pat
                     print(f"\n[batch] --batch-size 0: down to {batch_size} subjects per batch", flush=True)
                 if not queue:                              # subjects written while these were aligned
                     top_up()
-            if pending is not None:
-                complete(*pending)
-                pending = None
-            if finisher is not None:
-                finisher.shutdown(wait=True)
             for name, what, job in save_jobs:
                 try:
                     job.result()

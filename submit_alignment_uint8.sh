@@ -35,16 +35,25 @@ RUN_NAME="aligned_subjects_v2_uint8"          # outputs: $OUT_ROOT/$RUN_NAME/<su
 cd "$REPO_DIR" || { echo "Error: repository directory not found"; exit 1; }
 [ -f moco_nifti.py ] || { echo "Error: moco_nifti.py not found in $REPO_DIR (submit from the repo root)"; exit 1; }
 
-# Run the alignment using srun; arguments passed to sbatch come last and override the defaults here
-srun python -u moco_nifti.py \
-    --root "$DATA_DIR" \
-    --out-root "$OUT_ROOT" \
-    --run-name "$RUN_NAME" \
-    --skip-processed \
-    --logging false \
-    --image-dtype uint8 \
-    --workers "$SLURM_CPUS_PER_TASK" \
-    --batch-size 0 \
-    --device cuda \
-    --sample-dtype float16 \
-    "$@"
+# Run the alignment using srun; arguments passed to sbatch come last and override the defaults here.
+# Exit code 75: the process lost its CUDA context (a GPU error that makes every later GPU call fail); a new process
+# starts with a fresh one and resumes where the last stopped (--skip-processed), up to MAX_RESTARTS times.
+MAX_RESTARTS=10
+for attempt in $(seq 0 $MAX_RESTARTS); do
+    srun python -u moco_nifti.py \
+        --root "$DATA_DIR" \
+        --out-root "$OUT_ROOT" \
+        --run-name "$RUN_NAME" \
+        --skip-processed \
+        --logging false \
+        --image-dtype uint8 \
+        --workers "$SLURM_CPUS_PER_TASK" \
+        --batch-size 0 \
+        --device cuda \
+        --sample-dtype float16 \
+        "$@"
+    status=$?
+    [ "$status" -eq 75 ] || break
+    echo "CUDA context lost: restarting ($((attempt + 1)) of $MAX_RESTARTS) ..."
+done
+exit $status
