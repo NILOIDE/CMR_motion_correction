@@ -13,12 +13,15 @@ script (<run>/<subject>/metrics/history.csv): one affine per plane for step 0
 optimisation step the displayed affines come from, plus the subject-level
 metrics of that step from history_summary.csv when present.
 
-The pixel data are read from the run's NIfTIs in <run>/<subject>/ (older runs: <run>/<subject>/Instance_<n>/):
+The pixel data are read from the run's NIfTIs in <run>/<subject>/ -- with several modalities (acquisitions, see
+moco_nifti.py) one folder per modality, <run>/<subject>/<modality>/ (older runs: <run>/<subject>/Instance_<n>/):
     <SA>_slice00.nii.gz, <SA>_slice01...   one file per SA slice
-    <LA>_2Ch.nii.gz / <LA>_3Ch / <LA>_4Ch
+    <LA>_2Ch.nii.gz / <LA>_3Ch / <LA>_4Ch  any other image as <name>.nii.gz (<name>_sliceNN.nii.gz: a stack)
     nnUNet_segs/<same name>_nnUNetSeg.nii.gz
 (a single <SA>.nii.gz volume is also accepted; <SA> / <LA> are the alignment script's
-on-disk spellings, see ON_DISK).
+on-disk spellings, see ON_DISK). With several modalities the images are named <modality>/<image>, as in the run's
+CSVs; the panel lists the slices of one modality at a time (see "Modality tabs" below). A single-frame image
+(end-diastole) is shown at every cardiac phase.
 
 Any of the views may be missing. Slices that were not part of the alignment (no rows in
 history.csv, e.g. a LA view without a segmentation) are shown at their saved pose for every
@@ -45,6 +48,12 @@ Interaction
     Slider "optimization history" (bottom)   scrub through the pose snapshots
     Slider "cardiac phase" (below it)         time frame of the cine
     Checkboxes (left)   segmentation, outlines, all SA, all LA, every individual slice
+    Modality tabs (left, above All SA / All LA; subjects with several modalities): one tab per modality,
+                        clicked or stepped through with v / V, picks the modality whose slices the panel lists
+                        (All SA / All LA, the digit keys and , / . act on it; picking a slice of another
+                        modality to profile switches to its tab). The checkbox left of each tab shows / hides
+                        all slices of that modality (key h: the active tab's). Charts name a slice of another
+                        modality than the profiled one with its <modality>/ prefix
     Radio buttons       which per-plane metric of history.csv colours the slice outlines and is
                         shown in the intersection profile charts: NCC, LNCC, NMI, Dice or Hausdorff
                         (red = bad, green = good, grey = no value; LNCC needs runs logged after it
@@ -133,8 +142,10 @@ Interaction
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import math
+import os
 import re
 import shlex
 import shutil
@@ -142,6 +153,7 @@ import subprocess
 import sys
 import tarfile
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -157,14 +169,30 @@ from vtkmodules.vtkRenderingCore import vtkActor2D, vtkCoordinate, vtkPolyDataMa
 
 ALIGN_ROOT = Path(r"C:\Users\Nil\Documents\data\ukbb_alignment")
 REMOTE_CACHE = Path.home() / ".cache" / "cmr_slice_viewer"   # downloaded subjects of remote runs (--remote)
-# data keys: file names and CSV values. "ao": the UKBB aortic slice (ao.nii.gz, a single axial slice through the
-# ascending aorta, without segmentation), shown and handled like a LA view; skipped when the file is absent
-VIEWS = ["SA", "LA_2Ch", "LA_3Ch", "LA_4Ch", "ao"]
+# Views (image_view): SA, LA_2Ch, LA_3Ch, LA_4Ch, ao -- the UKBB aortic slice (ao.nii.gz, a single axial slice through
+# the ascending aorta, without segmentation), shown and handled like a LA view, as is any other image
 
 
 def label(name: str) -> str:
-    """Display form of a view / slice / line-kind name: SA -> SA, LA -> LA (the data keep SA / LA), ao -> Ao."""
-    return "Ao" if name == "ao" else name.replace("SA", "SA").replace("LA", "LA")
+    """Display form of a view / slice / line-kind name: SA -> SA, LA -> LA (the data keep SA / LA), ao -> Ao (also
+    after a modality prefix, <modality>/ao)."""
+    head, sep, base = name.rpartition("/")
+    return head + sep + ("Ao" if base == "ao" else base)
+
+
+VIEW_RANK = {"SA": 0, "LA_2Ch": 1, "LA_3Ch": 2, "LA_4Ch": 3, "ao": 5}      # order of a modality's images (others: 4)
+
+
+def image_view(image: str) -> str:
+    """The view of an image name (viewer spelling, without its <modality>/ prefix), classified as the alignment script
+    does (moco_nifti.image_kind): SA, LA_2Ch / LA_3Ch / LA_4Ch, else the name itself (e.g. ao; handled like a LA view)."""
+    base = image.rpartition("/")[2]
+    m = re.search(r"([234])[_\- ]?ch(?![a-z])", base, re.I)
+    if m:
+        return f"LA_{m.group(1)}Ch"
+    if re.search(r"(^|[^a-z])(sa|short[_\- ]?axis)([^a-z]|$)", base, re.I):
+        return "SA"
+    return base
 
 SEG_SUBDIR = "nnUNet_segs"
 SEG_SUFFIX = "_nnUNetSeg.nii.gz"
@@ -295,10 +323,21 @@ SCROLL_TRACK_COLOR = (0.20, 0.20, 0.20)
 SCROLL_THUMB_COLOR = (0.70, 0.70, 0.70)
 SCROLL_STEP = 0.5                           # charts scrolled per mouse-wheel notch
 SCROLL_EASE = 0.45                          # fraction of the remaining distance covered per animation frame
-SCROLL_TIMER_MS = 15                        # animation frame interval
+SCROLL_TIMER_MS = 15                        # animation frame interval (also the background work's timer, _tick)
+IDLE_BUDGET_S = 0.012                       # background work per timer tick (metric-chart ranges, colour prefetch) ...
+IDLE_BUDGET_SCROLL_S = 0.004                # ... and while the charts scroll
+COLOR_CACHE_MB = 400                        # slice colours kept per (slice, frame, display settings, blur level)
+CHART_CACHE_MB = 200                        # chart data kept per (step, frame, intersection) of the profiled slice
 TICK_LABEL_PX = 12                          # min vertical distance (px) between two y tick labels
 CHART_FRAME_PX = 34                         # chart height (px) taken by its title and x axis, not the plot area
 NAV_RIGHT_W = 380                          # width (px) of the run / subject navigation block, top right
+MODALITY_COLOR = "#ce93d8"                 # the active modality tab
+TAB_X1 = 284                               # modality tabs: right end of the strip (px; left of the orientation axes)
+TABS_PER_ROW = 2                           # more modalities wrap onto further rows of tabs
+TAB_CHAR_PX = 7.5                          # approx. width of a tab label character (font size 7); longer names
+                                           # are shortened to fit their tab
+TAB_COLORS = {True: ("#4a3a55", MODALITY_COLOR, MODALITY_COLOR),   # active tab: fill, frame, label
+              False: ("#2a2a2a", "#555555", "#9e9e9e")}
 HEADER_TOP_DY = 14                         # header (title, run name) top edge, px below the window top
 HIST_SLIDER_Y, FRAME_SLIDER_Y = 0.03, 0.075  # bottom sliders (normalised height of their tubes)
 SLIDER_TITLE_GAP = 14                      # px between a bottom slider's title and its tube
@@ -333,19 +372,20 @@ ROW_PITCH = 24
 # Image loading
 # ----------------------------------------------------------------------------
 def _as_4d(arr: np.ndarray) -> np.ndarray:
-    """Return array as (x, y, z, t)."""
+    """Return array as (x, y, z, t): a 3D array is one slice (x, y, t), a 2D one one slice with one frame (x, y)."""
     if arr.ndim == 2:
         return arr[:, :, None, None]
     if arr.ndim == 3:
-        return arr[:, :, :, None]
+        return arr[:, :, None, :]
     if arr.ndim == 4:
         return arr
     raise ValueError(f"Unexpected array dimensionality {arr.ndim}")
 
 
 def _n_frames_on_disk(img) -> int:
-    """Number of cine frames of a NIfTI image (its 4th dimension; 1 for a 2D / 3D image), from the header."""
-    return int(img.shape[3]) if len(img.shape) > 3 else 1
+    """Number of cine frames of a NIfTI image, from the header: its last axis for (x, y, z, t) and (x, y, t), 1 for a
+    2D image (x, y)."""
+    return int(img.shape[-1]) if len(img.shape) >= 3 else 1
 
 
 def apex_direction(sax: list[tuple[np.ndarray, tuple, np.ndarray | None]],
@@ -427,7 +467,7 @@ def _read_frames(img, frames: list[int], dtype=np.float32) -> np.ndarray:
     n_disk = _n_frames_on_disk(img)
     if frames == list(range(n_disk)):
         return _as_4d(np.asarray(img.dataobj, dtype=dtype))
-    if len(img.shape) > 3:
+    if len(img.shape) >= 3:                                         # the time axis is the last one
         step = frames[1] - frames[0] if len(frames) > 1 else n_disk
         if frames == list(range(frames[0], n_disk, step))[:len(frames)] and frames[0] + step * len(frames) >= n_disk:
             return _as_4d(np.asarray(img.dataobj[..., frames[0]::step], dtype=dtype))
@@ -439,34 +479,46 @@ def _slice_index(path: Path) -> int:
     return int(m.group(1)) if m else 0
 
 
-def find_view_files(base: Path, view: str) -> tuple[str | None, list[Path]]:
+def find_images(subject_dir: Path) -> list[dict]:
     """
-    Locate the image file(s) of a view.
+    The images of a subject folder as the alignment script writes them (moco_nifti.save): every folder holding NIfTI
+    files is one modality (segmentation folders, metrics/ and hidden folders aside); in it <name>.nii.gz is an image (a
+    single slice or a stack) and <name>_slice<nn>.nii.gz are the slices of the image <name>. With several modalities an
+    image is named <modality>/<name> (the folder relative to subject_dir), as in the run's CSVs, else <name>; names in
+    the viewer's spelling (from_disk).
 
-    Returns ("volume", [path]) when <view>.nii.gz exists, otherwise
-    ("slices", [path_00, path_01, ...]) for per-slice files <view>_sliceNN.nii.gz
-    sorted by slice index, or (None, []) when nothing is found.
+    Returns [{"image", "view" (image_view), "modality" ("" for subject_dir itself), "mode": "volume" | "slices",
+    "paths"}]: the modalities in folder order, each with its SA image(s) first, then the LA views, other images and
+    the aortic slice (VIEW_RANK).
     """
-    vol = base / f"{to_disk(view)}{NII_SUFFIX}"
-    if vol.exists():
-        return "volume", [vol]
-    files = [p for p in base.glob(f"{to_disk(view)}_slice*{NII_SUFFIX}") if SLICE_RE.search(p.name)]
-    if files:
-        return "slices", sorted(files, key=_slice_index)
-    return None, []
+    groups = []
+    for folder, dirs, _files in os.walk(subject_dir):
+        dirs[:] = sorted(d for d in dirs if not d.startswith(".") and d != METRICS_SUBDIR and "seg" not in d.lower())
+        files = sorted((q for q in Path(folder).iterdir() if q.is_file() and q.name.endswith(NII_SUFFIX)
+                        and not q.name.startswith(".")), key=lambda q: q.name)
+        if files:
+            rel = Path(folder).relative_to(subject_dir).as_posix()
+            groups.append(("" if rel == "." else rel, files))
+    multi = len(groups) > 1
+    out = []
+    for modality, files in groups:
+        stems = {}
+        for q in files:
+            m = SLICE_RE.search(q.name)
+            stems.setdefault(q.name[:m.start()] if m else q.name[:-len(NII_SUFFIX)], []).append(q)
+        images = []
+        for stem, paths in stems.items():
+            vol = [q for q in paths if not SLICE_RE.search(q.name)]      # <stem>.nii.gz wins over <stem>_sliceNN
+            mode, paths = ("volume", vol[:1]) if vol else ("slices", sorted(paths, key=_slice_index))
+            image = from_disk(f"{modality}/{stem}" if multi else stem)
+            images.append(dict(image=image, view=image_view(image), modality=modality, mode=mode, paths=paths))
+        out += sorted(images, key=lambda d: (VIEW_RANK.get(d["view"], 4), d["image"]))
+    return out
 
 
-SAX_SEG_PREFERRED = "seg_sa.nii.gz"     # UKBB SAX segmentation, used before the nnU-Net one when present (same labels)
-
-
-def seg_path_for(base: Path, img_path: Path) -> Path:
-    """nnUNet_segs/<image name without .nii.gz>_nnUNetSeg.nii.gz; for the SAX stack (one volume) nnUNet_segs/seg_sa.nii.gz
-    when present (moco_nifti.py prefers it as well; its per-slice outputs carry the segmentation it used)."""
-    stem = img_path.name[: -len(NII_SUFFIX)]
-    preferred = base / SEG_SUBDIR / SAX_SEG_PREFERRED
-    if stem == to_disk("SA") and preferred.exists():
-        return preferred
-    return base / SEG_SUBDIR / f"{stem}{SEG_SUFFIX}"
+def seg_path_for(img_path: Path) -> Path:
+    """nnUNet_segs/<image file name without .nii.gz>_nnUNetSeg.nii.gz next to the image."""
+    return img_path.parent / SEG_SUBDIR / f"{img_path.name[: -len(NII_SUFFIX)]}{SEG_SUFFIX}"
 
 
 def _load_seg(seg_path: Path, img_shape: tuple, img_affine: np.ndarray, label: str, frames: list[int] | None = None):
@@ -493,50 +545,51 @@ def _load_seg(seg_path: Path, img_shape: tuple, img_affine: np.ndarray, label: s
     return seg
 
 
-def load_images(instance_dir: Path) -> dict:
+def load_images(subject_dir: Path) -> dict:
     """
-    Load all views found in an Instance_<n> directory.
+    Load every image of a subject folder (find_images).
 
-    Returns {view: {"mode": "volume"|"slices", "slices": [slice, ...]}} where each
+    Returns {image: {"mode": "volume"|"slices", "view", "modality", "slices": [slice, ...]}} where each
     slice is {"grey": (nx, ny, t) uint8, "seg": (nx, ny, t) int16 | None, with t the smallest frame count of
-    all the subject's cines and the other cines read at those phases (phase_frames; only those frames are kept),
-    "affine": 4x4 with the origin at this slice (k = 0), "index": slice index
-    within the view (0 for LA), "name": str, "file": str}.
+    the subject's cines and the other cines read at those phases (phase_frames; only those frames are kept) -- a
+    single-frame image (end-diastole) is repeated over them --, "affine": 4x4 with the origin at this slice (k = 0),
+    "index": slice index within the image (0 for a single slice), "name": str (the image, or image[NN] for a slice
+    of a stack), "file": its path relative to subject_dir}.
     """
-    if not instance_dir.is_dir():
-        raise FileNotFoundError(instance_dir)
+    if not subject_dir.is_dir():
+        raise FileNotFoundError(subject_dir)
 
-    found = {view: find_view_files(instance_dir, view) for view in VIEWS}
+    found = find_images(subject_dir)
     # All cines are shown at the phases of the one with the fewest frames (UKBB: 50; the aortic cine's 100 frames
-    # are read every other one -- frame k of the viewer is the same cardiac phase in every slice, see phase_frames)
-    counts = [_n_frames_on_disk(nib.load(str(p))) for mode, paths in found.values() if mode is not None for p in paths]
-    n_common = min(counts) if counts else 1
+    # are read every other one -- frame k of the viewer is the same cardiac phase in every slice, see phase_frames);
+    # single-frame images do not count
+    counts = [_n_frames_on_disk(nib.load(str(q))) for f in found for q in f["paths"]]
+    cines = [c for c in counts if c > 1]
+    n_common = min(cines) if cines else 1
     data = {}
-    for view in VIEWS:
-        mode, paths = found[view]
-        if mode is None:
-            print(f"[warn] {view}: no {view}{NII_SUFFIX} or {view}_sliceNN{NII_SUFFIX} "
-                  f"in {instance_dir}; skipping view", file=sys.stderr)
-            continue
-
+    for f in found:
+        image, mode = f["image"], f["mode"]
         # Collect raw slices first so intensities can be normalised over the
-        # whole view (all slices and frames) for consistent grey levels.
+        # whole image (all slices and frames) for consistent grey levels.
         raw_slices = []
-        for p in paths:
-            img = nib.load(str(p))
+        for q in f["paths"]:
+            img = nib.load(str(q))
             n_disk = _n_frames_on_disk(img)
             frames = phase_frames(n_disk, n_common)
             arr = _read_frames(img, frames)
             affine = np.asarray(img.affine, dtype=np.float64)
-            seg = _load_seg(seg_path_for(instance_dir, p), arr.shape, affine, p.name, frames)
+            seg = _load_seg(seg_path_for(q), arr.shape, affine, q.name, frames)
+            if arr.shape[3] < n_common:                    # one frame (end-diastole): shown at every phase
+                arr = np.repeat(arr, n_common, axis=3)
+                seg = None if seg is None else np.repeat(seg, n_common, axis=3)
             zooms = img.header.get_zooms()
-            thick_hdr = float(zooms[2]) if len(zooms) > 2 else float("nan")
+            thick_hdr = float(zooms[2]) if len(img.shape) >= 4 else float("nan")   # (X, Y, T): zooms[2] is time
             nz = arr.shape[2]
             if mode == "slices" and nz != 1:
-                print(f"[warn] {p.name}: expected a single slice, found {nz}; using all",
+                print(f"[warn] {q.name}: expected a single slice, found {nz}; using all",
                       file=sys.stderr)
             for k in range(nz):
-                idx = _slice_index(p) if mode == "slices" else k
+                idx = _slice_index(q) if mode == "slices" else k
                 if mode == "slices" and nz > 1:
                     idx = idx * nz + k
                 # Affine with the origin moved to this slice so that k = 0 addresses it,
@@ -548,87 +601,99 @@ def load_images(instance_dir: Path) -> dict:
                     "seg": None if seg is None else seg[:, :, k, :],
                     "affine": A0,
                     "index": idx,
-                    "file": p.name,
+                    "file": q.relative_to(subject_dir).as_posix(),
                     "thick_hdr": thick_hdr,
                     "n_frames_disk": n_disk,
                 })
-        raw_slices.sort(key=lambda s: s["index"])
+        raw_slices.sort(key=lambda r: r["index"])
 
-        lo, hi = np.percentile(np.concatenate([s["raw"].ravel() for s in raw_slices]), [1.0, 99.0])
+        lo, hi = np.percentile(np.concatenate([r["raw"].ravel() for r in raw_slices]), [1.0, 99.0])
         if hi <= lo:
             hi = lo + 1.0
+        # the raw intensities kept as int16 (half of float32): MR images are floats but mostly whole numbers, which
+        # are kept exactly (rounded, clipped to the int16 range); an image with fractional values (e.g. normalised to
+        # 0..1) is scaled to fill the int16 range instead (raw = stored * raw_scale)
+        scale = 1.0
+        if any(np.any(np.abs(r["raw"] - np.rint(r["raw"])) > 1e-3) for r in raw_slices):
+            amax = max(float(np.abs(r["raw"]).max()) for r in raw_slices)
+            scale = amax / 32767.0 if amax > 0 else 1.0
+        for r in raw_slices:
+            r["raw"] = np.clip(np.rint(r["raw"] / scale), -32768, 32767).astype(np.int16)
         slices = []
-        for s in raw_slices:
-            grey = np.clip((s["raw"] - lo) / (hi - lo), 0.0, 1.0)
-            name = view if len(raw_slices) == 1 else f"{view}[{s['index']:02d}]"
+        for r in raw_slices:
+            grey = np.clip((r["raw"] - lo) / (hi - lo), 0.0, 1.0)
+            name = image if len(raw_slices) == 1 else f"{image}[{r['index']:02d}]"
             slices.append({
                 "grey": (grey * 255.0 + 0.5).astype(np.uint8),
-                "seg": s["seg"],
-                "affine": s["affine"],
-                "index": s["index"],
+                "seg": r["seg"],
+                "affine": r["affine"],
+                "index": r["index"],
                 "name": name,
-                "file": s["file"],
-                "raw": s["raw"],                  # NIfTI intensities: what the loss compares
-                "lo": float(lo), "hi": float(hi),  # display scaling of the view (grey = (raw - lo) / (hi - lo))
-                "thick_hdr": s["thick_hdr"],
-                "n_frames_disk": s["n_frames_disk"],   # frames in the file (the cine keeps n_common of them)
+                "file": r["file"],
+                "raw": r["raw"],                  # NIfTI intensities (what the loss compares): int16 ...
+                "raw_scale": scale,               # ... times this (1 for whole-numbered images)
+                "lo": float(lo), "hi": float(hi),  # display scaling of the image (grey = (raw - lo) / (hi - lo))
+                "thick_hdr": r["thick_hdr"],
+                "n_frames_disk": r["n_frames_disk"],   # frames in the file (the cine keeps n_common of them)
             })
-        data[view] = {"mode": mode, "slices": slices}
+        data[image] = {"mode": mode, "view": f["view"], "modality": f["modality"], "slices": slices}
 
     if not data:
-        raise RuntimeError(f"No views found in {instance_dir}")
+        raise RuntimeError(f"No images found in {subject_dir}")
     return data
 
 
-def image_signature(instance_dir: Path) -> dict:
-    """What a run's images of one subject look like without reading their pixels: per image file (view, file name)
+def image_signature(subject_dir: Path) -> dict:
+    """What a run's images of one subject look like without reading their pixels: per image file (image, file path)
     its shape, data type and intensity scaling, whether it has a segmentation, and its affine (NIfTI headers only).
     Two runs of a subject with equal signatures (but for the affines) hold the same pixels: the alignment writes the
     input images with corrected affines (see reuse_images)."""
     sig = {}
-    for view in VIEWS:
-        mode, paths = find_view_files(instance_dir, view)
-        for p in paths:
-            img = nib.load(str(p))
+    for f in find_images(subject_dir):
+        for q in f["paths"]:
+            img = nib.load(str(q))
             slope, inter = img.dataobj.slope, img.dataobj.inter
-            sig[(view, p.name)] = dict(mode=mode, shape=tuple(img.shape), dtype=str(img.get_data_dtype()),
-                                       scale=(float(slope), float(inter)),
-                                       seg=seg_path_for(instance_dir, p).exists(),
-                                       affine=np.asarray(img.affine, dtype=np.float64))
+            sig[(f["image"], q.relative_to(subject_dir).as_posix())] = dict(
+                mode=f["mode"], shape=tuple(img.shape), dtype=str(img.get_data_dtype()),
+                scale=(float(slope), float(inter)), seg=seg_path_for(q).exists(),
+                affine=np.asarray(img.affine, dtype=np.float64))
     return sig
 
 
-def reuse_images(cached: dict, cached_sig: dict, instance_dir: Path) -> tuple[dict, dict] | None:
+def reuse_images(cached: dict, cached_sig: dict, subject_dir: Path) -> tuple[dict, dict] | None:
     """Another run's images of the cached subject without reading pixels: (data as load_images, signature), sharing
-    the cached slices' arrays, with the affines of instance_dir's headers (each run saves its own corrected pose).
+    the cached slices' arrays, with the affines of subject_dir's headers (each run saves its own corrected pose).
     None if any file differs in name, shape, data type, scaling or segmentation (e.g. a run saved with --image-dtype
     uint8): then everything has to be read."""
-    sig = image_signature(instance_dir)
+    sig = image_signature(subject_dir)
     strip = lambda d: {k: (v["mode"], v["shape"], v["dtype"], v["scale"], v["seg"]) for k, v in d.items()}  # noqa: E731
     if strip(sig) != strip(cached_sig):
         return None
     data = {}
-    for view, v in cached.items():
+    for image, v in cached.items():
         slices = []
-        for s in v["slices"]:
-            hdr = sig[(view, s["file"])]
-            nz = hdr["shape"][2] if len(hdr["shape"]) > 2 else 1
-            k = int(s["index"]) if v["mode"] == "volume" else (int(s["index"]) % nz if nz > 1 else 0)
+        for sl in v["slices"]:
+            hdr = sig[(image, sl["file"])]
+            nz = hdr["shape"][2] if len(hdr["shape"]) > 3 else 1
+            k = int(sl["index"]) if v["mode"] == "volume" else (int(sl["index"]) % nz if nz > 1 else 0)
             A0 = hdr["affine"].copy()                    # origin moved to this slice, as load_images
             A0[:3, 3] += k * hdr["affine"][:3, 2]
-            slices.append(dict(s, affine=A0))
-        data[view] = {"mode": v["mode"], "slices": slices}
+            slices.append(dict(sl, affine=A0))
+        data[image] = dict(v, slices=slices)
     return data, sig
 
 
-def describe_images(instance_dir: Path, data: dict) -> None:
-    print(f"[images] {instance_dir}")
-    for view, v in data.items():
-        labs = sorted({int(x) for s in v["slices"] if s["seg"] is not None for x in np.unique(s["seg"])})
+def describe_images(subject_dir: Path, data: dict) -> None:
+    print(f"[images] {subject_dir}")
+    width = max(8, max(len(label(image)) for image in data))
+    for image, v in data.items():
+        labs = sorted({int(x) for sl in v["slices"] if sl["seg"] is not None for x in np.unique(sl["seg"])})
         shape = v["slices"][0]["grey"].shape
         n_disk = v["slices"][0].get("n_frames_disk", shape[2])
-        frames = f"{shape[2]} frames" + (f" (of {n_disk}, at the same phases)" if n_disk != shape[2] else "")
-        print(f"  {label(view):8s} {v['mode']:7s} {len(v['slices']):2d} slice(s) of {shape[0]}x{shape[1]}, "
+        frames = (f"{shape[2]} frames" if n_disk == shape[2] else
+                  "1 frame (end-diastole, shown at every phase)" if n_disk == 1 else
+                  f"{shape[2]} frames (of {n_disk}, at the same phases)")
+        print(f"  {label(image):{width}s} {v['mode']:7s} {len(v['slices']):2d} slice(s) of {shape[0]}x{shape[1]}, "
               f"{frames}, seg labels={','.join(map(str, labs)) or 'none'}")
 
 
@@ -726,9 +791,10 @@ def load_overlays(metrics_dir: Path) -> dict:
              "sa_lines": {(step, is_best): {"img": (K, 2, 3), "used": (K, 2, 3)}} | None}.
     lines.csv rows: planes a/b, kind, anchor x0 and unit direction d (world, acquired
     geometry), t_used_lo/hi (sampled range) and t_img_lo/hi (inside both images).
-    sa_lines.csv: the same per neighbouring-SA-slice pair and history snapshot, already
-    at that snapshot's poses (the slices only cross once tilted); kept here as segment
-    end points, only the parts that exist (inside both images / entering the loss).
+    sa_lines.csv: the same per pair of parallel slices (neighbouring SA slices; with several modalities also the
+    nearest parallel slice of another image) and history snapshot, already at that snapshot's poses (the slices only
+    cross once tilted); kept here as segment end points, only the parts that exist (inside both images / entering the
+    loss), each with its pair of slice keys ((image, slice), (image, slice)); "sa_pairs": every pair of the file.
     """
     out = {"lines": None, "contours": {}, "sa_lines": None, "long_axis": None}
     ap = metrics_dir / LONG_AXIS_CSV
@@ -748,7 +814,10 @@ def load_overlays(metrics_dir: Path) -> dict:
             lo, hi = df[f"t_{name}_lo"].to_numpy(float), df[f"t_{name}_hi"].to_numpy(float)
             ok = np.isfinite(x0).all(1) & np.isfinite(d).all(1) & np.isfinite(lo) & np.isfinite(hi)
             segs[name] = (ok, np.stack([x0 + lo[:, None] * d, x0 + hi[:, None] * d], axis=1))
-        pair = df[["slice_a", "slice_b"]].to_numpy(int)
+        img_a = df["image_a"].astype(str).tolist() if "image_a" in df else ["SA"] * len(df)   # (older runs: SA only)
+        img_b = df["image_b"].astype(str).tolist() if "image_b" in df else ["SA"] * len(df)
+        pair = list(zip(zip(img_a, df["slice_a"].astype(int).tolist()), zip(img_b, df["slice_b"].astype(int).tolist())))
+        out["sa_pairs"] = list(dict.fromkeys(pair))
         out["sa_lines"] = {}
         keys = list(zip(df["step"].astype(int), df["is_best"].astype(int).astype(bool)))
         for key in dict.fromkeys(keys):
@@ -756,7 +825,7 @@ def load_overlays(metrics_dir: Path) -> dict:
             entry = {}
             for name, (ok, e) in segs.items():
                 entry[name] = e[rows & ok]
-                entry[name + "_pairs"] = pair[rows & ok]          # (K, 2) SA slice indices of each segment
+                entry[name + "_pairs"] = [pair[j] for j in np.flatnonzero(rows & ok)]   # slice keys of each segment
             out["sa_lines"][key] = entry
     lp = metrics_dir / LINES_CSV
     if lp.exists():
@@ -803,12 +872,13 @@ def _created(p: Path) -> float:
 
 def _is_subject_dir(p: Path) -> bool:
     """A viewable subject of a run: a numeric folder with a history (metrics/history.csv, written with
-    --logging) or at least the aligned images (<subject>/*.nii.gz, or <subject>/Instance_<n>/ in older runs)."""
+    --logging) or at least the aligned images (<subject>/*.nii.gz, or in a folder below it: one per modality, or
+    <subject>/Instance_<n>/ in older runs)."""
     if not (p.is_dir() and p.name.isdigit()):
         return False
     if (p / METRICS_SUBDIR / HISTORY_CSV).exists():
         return True
-    return any(p.glob(f"*{NII_SUFFIX}")) or any(q.is_dir() for q in p.glob("Instance_*"))
+    return any(p.glob(f"*{NII_SUFFIX}")) or any(p.glob(f"*/*{NII_SUFFIX}"))
 
 
 def runs_by_creation(align_root: Path, subject: str | None = None) -> list[Path]:
@@ -953,9 +1023,9 @@ SUBJECT_FOCUS: dict[str, str] = {}      # subject -> slice to profile first, fro
 
 def focus_slice(image: str, index: int) -> str:
     """The viewer's name of slice `index` of an image as written in the alignment CSVs: SAX 5 -> SA[05], LAX_4Ch 0 ->
-    LA_4Ch (a single slice keeps the view name), ao 0 -> ao."""
-    view = from_disk(image)
-    return f"{view}[{index:02d}]" if view == "SA" else view
+    LA_4Ch (a single slice keeps the image name), ao 0 -> ao, cine/SAX 5 -> cine/SA[05]."""
+    image = from_disk(image)
+    return f"{image}[{index:02d}]" if image_view(image) == "SA" else image
 
 
 def read_subject_list(items: list[str]) -> list[str]:
@@ -1001,33 +1071,32 @@ def corner_ijk(nx: int, ny: int) -> np.ndarray:
     ], dtype=np.float64)
 
 
-def grid_ijk(nx: int, ny: int) -> np.ndarray:
-    """Voxel-edge grid points (nx+1)*(ny+1) at k = 0, ordered i-fastest."""
-    ii, jj = np.meshgrid(np.arange(nx + 1) - 0.5, np.arange(ny + 1) - 0.5, indexing="ij")
-    return np.column_stack([ii.ravel(order="F"), jj.ravel(order="F"), np.zeros(ii.size)])
+QUAD_TCOORDS = np.array([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]])   # texture coordinates of corner_ijk
 
 
-def slice_faces(nx: int, ny: int) -> np.ndarray:
-    """
-    Quad faces for a (nx+1)x(ny+1) point grid, one cell per voxel.
-
-    Cell c = i + j*nx corresponds to voxel (i, j), so cell scalars can be
-    assigned with ``img2d.ravel(order="F")``.
-    """
-    i, j = np.meshgrid(np.arange(nx), np.arange(ny), indexing="ij")
-    i = i.ravel(order="F")
-    j = j.ravel(order="F")
-    w = nx + 1
-    p0 = i + j * w
-    p1 = (i + 1) + j * w
-    p2 = (i + 1) + (j + 1) * w
-    p3 = i + (j + 1) * w
-    return np.column_stack([np.full(i.size, 4), p0, p1, p2, p3]).ravel()
+def slice_quad(affine: np.ndarray, nx: int, ny: int) -> tuple[pv.PolyData, pv.ImageData, pv.Texture]:
+    """A slice (k = 0 of `affine`) as one textured quad: (quad, its RGB image (nx, ny), the texture). The image's
+    point (i, j) is pixel (i, j) (point index i + j nx, the order of cell_colors); the texture is not interpolated,
+    so every pixel shows as a square, and the quad spans the voxel edges."""
+    quad = pv.PolyData(voxel_to_world(affine, corner_ijk(nx, ny)), faces=np.array([4, 0, 1, 2, 3]))
+    quad.active_texture_coordinates = QUAD_TCOORDS
+    img = pv.ImageData(dimensions=(nx, ny, 1))
+    img.point_data["rgb"] = np.zeros((nx * ny, 3), np.uint8)
+    tex = pv.Texture(img)
+    tex.interpolate = False
+    tex.mipmap = False
+    tex.repeat = False
+    return quad, img, tex
 
 
-def slice_mesh(affine: np.ndarray, nx: int, ny: int) -> pv.PolyData:
-    """Flat quad mesh of a slice (k = 0 of `affine`) with one cell per voxel."""
-    return pv.PolyData(voxel_to_world(affine, grid_ijk(nx, ny)), slice_faces(nx, ny))
+def tab_texture(width: int, height: int, fill: str, frame: str) -> pv.ImageData:
+    """Rectangular button image (a modality tab): `fill` inside a one-pixel `frame`."""
+    arr = np.empty((height, width, 3), dtype=np.uint8)
+    arr[:] = pv.Color(frame).int_rgb
+    arr[1:-1, 1:-1] = pv.Color(fill).int_rgb
+    img = pv.ImageData(dimensions=(width, height, 1))
+    img.point_data["texture"] = arr.reshape(width * height, 3)
+    return img
 
 
 def checkbox_texture(rgb01, size: int = 20, border: int = 1, bg: str = "#303030") -> pv.ImageData:
@@ -1168,7 +1237,7 @@ def burn_cells(k: int) -> np.ndarray:
 
 def cell_colors(grey2d: np.ndarray, seg2d: np.ndarray | None, show_seg: bool,
                 alpha: float) -> np.ndarray:
-    """(nx*ny, 3) uint8 RGB per cell: grey image, optionally blended with seg."""
+    """(nx*ny, 3) uint8 RGB per pixel (i fastest): grey image, optionally blended with seg."""
     g = grey2d.ravel(order="F").astype(np.float32)
     rgb = np.repeat(g[:, None], 3, axis=1)
     if show_seg and seg2d is not None:
@@ -1180,6 +1249,66 @@ def cell_colors(grey2d: np.ndarray, seg2d: np.ndarray | None, show_seg: bool,
             m = s == lab
             rgb[m] = (1.0 - alpha) * rgb[m] + alpha * np.asarray(col, dtype=np.float32)
     return np.clip(rgb + 0.5, 0, 255).astype(np.uint8)
+
+
+class FrameCache:
+    """A cache capped at cap_mb of entries keyed by tuples that hold a cine frame (at position `fpos`). Reading an
+    entry marks it used; when something shown needs room, the least recently used entries go. The background
+    prefetch (put / make_room with prefetch=True) never pushes out what is near: it only replaces entries of the frame
+    furthest ahead of the shown one (frames wrap around), and only for an entry of a nearer frame -- so it fills the
+    cache from the shown frame on and follows when another frame is shown, and stops when the cache is full of
+    nearer frames."""
+
+    def __init__(self, cap_mb: float, fpos: int):
+        self.cap, self.fpos = cap_mb * 2 ** 20, fpos
+        self.clear()
+
+    def clear(self):
+        self.data, self.size, self.by_frame, self.total = {}, {}, {}, 0
+
+    def __contains__(self, key) -> bool:
+        return key in self.data
+
+    def __len__(self) -> int:
+        return len(self.data)
+
+    def get(self, key):
+        value = self.data.pop(key, None)
+        if value is not None:
+            self.data[key] = value                       # (now the most recently used)
+        return value
+
+    def _drop(self, key):
+        del self.data[key]
+        self.total -= self.size.pop(key)
+        bucket = self.by_frame[key[self.fpos]]
+        del bucket[key]
+        if not bucket:
+            del self.by_frame[key[self.fpos]]
+
+    def make_room(self, key, nbytes: int, shown_frame: int, n_frames: int) -> bool:
+        """For the prefetch: room for an entry of nbytes, replacing entries of frames further ahead than key's."""
+        ahead = lambda f: (f - shown_frame) % max(1, n_frames)  # noqa: E731
+        want = ahead(key[self.fpos])
+        while self.total + nbytes > self.cap:
+            far = max(self.by_frame, key=ahead, default=None)
+            if far is None or ahead(far) <= want:
+                return False
+            self._drop(next(iter(self.by_frame[far])))
+        return True
+
+    def put(self, key, value, nbytes: int, prefetch: bool = False, shown_frame: int = 0, n_frames: int = 1) -> bool:
+        """Store an entry (False: the prefetch found no room)."""
+        if key in self.data:
+            self._drop(key)
+        if prefetch and not self.make_room(key, nbytes, shown_frame, n_frames):
+            return False
+        self.data[key], self.size[key] = value, nbytes
+        self.total += nbytes
+        self.by_frame.setdefault(key[self.fpos], {})[key] = None
+        while not prefetch and self.total > self.cap and len(self.data) > 1:     # (least recently used first)
+            self._drop(next(iter(self.data)))
+        return True
 
 
 # ----------------------------------------------------------------------------
@@ -1230,6 +1359,16 @@ class SliceViewer:
         self._colors_sigma = 0.0                # blur (mm) the slice colours were last computed with
         self.profile_key: str | None = None     # slice whose intersections are plotted (kept across subjects)
         self.offsets: dict[tuple, np.ndarray] = {}   # manual pose offsets per slice key (reset per subject)
+        self.modalities: list[str] = []              # the subject's modalities (folder names; [""] for one)
+        self._multi = False                          # several modalities: the panel lists one at a time
+        self.listed_modality: str | None = None      # the modality whose slices the panel lists (kept across subjects)
+        self._color_cache = FrameCache(COLOR_CACHE_MB, 1)   # slice colours per (pixels, frame, settings, blur level)
+        self._color_settings = None                  # (segmentation shown, its opacity) of the cached colours
+        self._chart_cache = FrameCache(CHART_CACHE_MB, 2)   # chart data per (chart state, step, frame, intersection)
+        self._bg_full: set = set()                   # parts of the background stream whose cache is full
+        self._chart_state = None                     # the chart state (_range_key) the cache holds
+        self._timer = None                           # repeating timer of the scroll animation and background work
+        self._timer_wanted = False                   # work queued before the window's event loop runs (_ensure_timer)
         self.seg_alpha = seg_alpha
         self.verbose = verbose
         self._first_start = start           # only the first subject honours --start
@@ -1260,6 +1399,7 @@ class SliceViewer:
         self._profile_radios: dict[str, object] = {}
         self._row_text: dict[str, object] = {}
         self._row_value: dict[str, object] = {}      # slice rows: outline-metric value column
+        self._tabs: dict[str, dict] = {}             # modality tabs: widget, label, textures (_build_tabs)
         self._tex_cache: dict[str, tuple] = {}
         self._range_sliders: dict[str, object] = {}
         self._range_text: dict[str, object] = {}
@@ -1270,6 +1410,11 @@ class SliceViewer:
         self._profile_scroll = 0.0                   # scroll position (charts, fractional) of the chart rectangles
         self._scroll_target = 0.0                    # where the scroll animation is heading
         self._n_profile_items = 0
+        self._items_cache: dict = {}                 # chart intersections per (snapshot, profiled slice, offsets)
+        self._range_cache = None                     # metric-chart y ranges (_metric_ranges) ...
+        self._rjob = None                            # ... completed in the background (_range_step)
+        self._bg = None                              # the background stream (_bg_step) and the state it was made for
+        self._bg_sig = None
         self._pcache = None                          # intersections and chart data of the current state (see
                                                      # _update_profiles / _render_profiles)
 
@@ -1321,10 +1466,10 @@ class SliceViewer:
     def _same_slices(self, data: dict) -> bool:
         """Whether `data` (load_images) holds exactly the shown slices -- the same subject from another run, its
         pixels reused (load_subject_run's cache) -- so their actors can be kept (load_index)."""
-        new = [(view, s) for view in VIEWS if view in data for s in data[view]["slices"]]
+        new = [(image, s) for image, v in data.items() for s in v["slices"]]
         return len(new) == len(self.entries) and all(
-            e["view"] == view and e["name"] == s["name"] and e["slice"]["grey"] is s["grey"]
-            for e, (view, s) in zip(self.entries, new))
+            e["image"] == image and e["name"] == s["name"] and e["slice"]["grey"] is s["grey"]
+            for e, (image, s) in zip(self.entries, new))
 
     def load_index(self, index: int, run_index: int | None = None, subjects: list[str] | None = None) -> bool:
         """Show subject number `index` (clipped) of run `run_index` (default: the current run),
@@ -1388,7 +1533,7 @@ class SliceViewer:
         self.snap_index = int(np.clip(start, 0, len(self.snapshots) - 1))
 
         if same:                                         # the kept entries: this run's slice dicts (its affines)
-            new = [s for view in VIEWS if view in self.data for s in self.data[view]["slices"]]
+            new = [s for v in self.data.values() for s in v["slices"]]
             for e, s in zip(self.entries, new):
                 e["slice"] = s
                 e["in_history"] = any(e["key"] in snap["affines"] for snap in self.snapshots)
@@ -1401,9 +1546,15 @@ class SliceViewer:
             if focus != self.profile_key:
                 self._profile_scroll = self._scroll_target = 0.0
             self.profile_key = focus
-        if self.profile_key not in names:
-            sa = [n for n, e in zip(names, self.entries) if e["view"] == "SA"]
+        if self.profile_key not in names:              # the middle slice of the first SA stack
+            sa = [e for e in self.entries if e["view"] == "SA"]
+            sa = [e["name"] for e in sa if e["image"] == sa[0]["image"]] if sa else []
             self.profile_key = sa[len(sa) // 2] if sa else (names[0] if names else None)
+        self.modalities = list(dict.fromkeys(e["modality"] for e in self.entries))
+        self._multi = len(self.modalities) > 1
+        prof = self._entry_by_name().get(self.profile_key)
+        if self.listed_modality not in self.modalities or (prof is not None and focus == self.profile_key):
+            self.listed_modality = prof["modality"] if prof is not None else (self.modalities or [None])[0]
         self._build_ui()
         self._configure_metric()
         self._apply_snapshot()
@@ -1565,8 +1716,9 @@ class SliceViewer:
             plots["cursor"].visible = False
             self._chart_rens["metric"].add_chart(ch)
             self._metric_charts.append({"chart": ch, "plots": plots, "item": None})
-        self._scroll_timer = None
-        pl.iren.interactor.AddObserver("TimerEvent", lambda *_: self._scroll_tick())
+        pl.iren.interactor.AddObserver("TimerEvent", lambda *_: self._tick())
+        # background work queued before the event loop runs starts with the first render (_ensure_timer)
+        pl.add_on_render_callback(lambda *_: self._ensure_timer() if self._timer_wanted else None, render_event=False)
 
         # the two chart rectangles: frame, scroll track and thumb (2D actors, normalised viewport coordinates)
         self._rects = {}
@@ -1632,6 +1784,7 @@ class SliceViewer:
         pl.add_key_event("comma", lambda: self.step_profile(-1))
         pl.add_key_event("a", lambda: self._toggle_checkbox("all_sa"))
         pl.add_key_event("l", lambda: self._toggle_checkbox("all_la"))
+        pl.add_key_event("h", lambda: self._toggle_checkbox(f"mod_shown:{self.listed_modality}"))   # (several modalities)
         # the cine is periodic: stepping past either end wraps around
         pl.add_key_event("Left", lambda: self.set_frame((self.frame - 1) % self.n_frames))
         pl.add_key_event("Right", lambda: self.set_frame((self.frame + 1) % self.n_frames))
@@ -1639,8 +1792,10 @@ class SliceViewer:
             pl.add_key_event(str(d), lambda d=d: self._toggle_sa_slice(d))
         # pyvista binds Up/Down to camera zoom and b to point picking by default, and
         # add_key_event appends rather than replaces: drop those defaults first
-        for k in ("Up", "Down", "b"):
+        for k in ("Up", "Down", "b", "v"):
             pl.iren._key_press_event_callbacks.pop(k, None)
+        pl.add_key_event("v", lambda: self.step_modality(+1))
+        pl.add_key_event("V", lambda: self.step_modality(-1))
         pl.add_key_event("Up", lambda: self.set_snapshot(self.snap_index + 1))
         pl.add_key_event("Down", lambda: self.set_snapshot(self.snap_index - 1))
         pl.add_key_event("Home", lambda: self.set_snapshot(0))
@@ -1649,8 +1804,25 @@ class SliceViewer:
         pl.add_key_event("b", lambda: self.set_snapshot(self.history["best_index"])
                          if self.history["best_index"] is not None else None)
 
+    def _listed_entries(self) -> list[dict]:
+        """The slices the panel lists: those of the listed modality (all of them with a single modality)."""
+        return [e for e in self.entries if e["modality"] == self.listed_modality] if self._multi else self.entries
+
     def _sa_entries(self) -> list[dict]:
-        return [e for e in self.entries if e["view"].startswith("SA")]
+        return [e for e in self._listed_entries() if e["view"] == "SA"]
+
+    def _short_name(self, x: dict, ref: dict | None = None) -> str:
+        """Display name of slice x: without its <modality>/ prefix when it is of the modality of `ref` (default: the
+        listed one); the prefix is only there with several modalities."""
+        mod = ref["modality"] if ref is not None else self.listed_modality
+        if self._multi and x["modality"] == mod and x["name"].startswith(x["modality"] + "/"):
+            return label(x["name"][len(x["modality"]) + 1:])
+        return label(x["name"])
+
+    def _key_view(self, key: tuple) -> str:
+        """The view of a slice key (image, slice), also for an image the subject does not show."""
+        e = self._entry_by_key.get(key)
+        return e["view"] if e is not None else image_view(key[0])
 
     def _toggle_sa_slice(self, d: int):
         sa = self._sa_entries()
@@ -1661,7 +1833,7 @@ class SliceViewer:
         """Slice-row label: the slice name and, for the first ten SA slices, its digit key."""
         sa = [x["name"] for x in self._sa_entries()]
         d = sa.index(e["name"]) if e["name"] in sa else None
-        return label(e["name"]) + (f"  [{d}]" if d is not None and d < 10 else "")
+        return self._short_name(e) + (f"  [{d}]" if d is not None and d < 10 else "")
 
     def _update_nav_text(self):
         self._nav_text.SetInput(f"subject {self.subject_index + 1}/{len(self.subjects)}  "
@@ -1670,23 +1842,25 @@ class SliceViewer:
 
     # --- scene -----------------------------------------------------------
     def _build_slices(self):
-        for view in VIEWS:
-            if view not in self.data:
-                continue
-            for s in self.data[view]["slices"]:
+        self._color_cache.clear()                        # (new pixels)
+        self._color_settings = (bool(self.show_seg), float(self.seg_alpha))
+        named = {k[0] for snap in self.snapshots for k in snap["affines"]}
+        self._history_matches = not named or bool(named & set(self.data))   # (else load_subject_run has warned)
+        for image, v in self.data.items():
+            for s in v["slices"]:
                 nx, ny, _ = s["grey"].shape
-                key = (view, int(s["index"]))
+                key = (image, int(s["index"]))
                 in_history = any(key in snap["affines"] for snap in self.snapshots)
-                if not in_history:          # e.g. a LA view without a segmentation: written unaligned
+                if not in_history and self._history_matches:   # e.g. a LA view without a segmentation: unaligned
                     print(f"[info] {s['name']}: not part of the alignment (no rows in history.csv); shown at its "
                           f"saved (acquired) pose for every snapshot", file=sys.stderr)
-                mesh = slice_mesh(s["affine"], nx, ny)
-                mesh.cell_data["rgb"] = self._colors(s)
-                actor = self._mesh(
-                    mesh, scalars="rgb", rgb=True, lighting=False,
-                    show_scalar_bar=False, name=s["name"],
-                )
-                outline = pv.lines_from_points(voxel_to_world(s["affine"], corner_ijk(nx, ny)), close=True)
+                # one textured quad (the image as a texture, recoloured per frame: _recolor_entry), built at the
+                # slice's saved pose and moved to the pose of the shown step by its actor's matrix (_apply_snapshot)
+                A0 = np.asarray(s["affine"], dtype=np.float64)
+                quad, tex_img, tex = slice_quad(A0, nx, ny)
+                actor = self._mesh(quad, texture=tex, color="white", lighting=False, show_scalar_bar=False,
+                                   name=s["name"])
+                outline = pv.lines_from_points(voxel_to_world(A0, corner_ijk(nx, ny)), close=True)
                 outline.point_data["metric"] = np.full(outline.n_points, np.nan)
                 outline_actor = self._mesh(
                     outline, scalars="metric", cmap=OUTLINE_CMAP, clim=(0.0, 1.0),
@@ -1696,13 +1870,15 @@ class SliceViewer:
                 outline_actor.mapper.lookup_table = self._lut
                 outline_actor.mapper.SetUseLookupTableScalarRange(True)
                 self.entries.append({
-                    "name": s["name"], "view": view, "key": key, "slice": s,
-                    "grid": grid_ijk(nx, ny), "corners": corner_ijk(nx, ny),
-                    "mesh": mesh, "outline_mesh": outline,
+                    "name": s["name"], "view": v["view"], "image": image, "modality": v["modality"],
+                    "key": key, "slice": s,
+                    "tex_img": tex_img, "texture": tex, "mesh_inv": np.linalg.inv(A0), "rgb_key": None,
+                    "outline_mesh": outline,
                     "actor": actor, "outline": outline_actor, "visible": True,
                     "in_history": in_history,
                 })
                 self._entry_by_key[key] = self.entries[-1]
+                self._recolor_entry(self.entries[-1])
 
     # --- overlays: dilated-mask contours and intersection sampling lines -----------------
     def _base_affine(self, key: tuple) -> np.ndarray | None:
@@ -1745,20 +1921,14 @@ class SliceViewer:
                                    name=f"radius:{e['name']}")
                 self._radius_items.append({"entry": e, "mesh": mesh, "actor": actor, "ok": False})
 
-        # SA-SA sampling lines: stored per snapshot; burned into both SA slices of each pair
+        # SA-SA sampling lines: stored per snapshot; burned into both slices of each pair (neighbouring SA slices, and
+        # parallel slices of other images, e.g. of another modality)
         if self.overlays.get("sa_lines"):
-            self._sa_line_items = {"per_slice": []}
-            for e in self.entries:
-                if e["view"] != "SA":
-                    continue
-                item = {"entry": e}
-                for name, width, opacity in (("img", SA_LINE_IMG_WIDTH, 0.6), ("used", SA_LINE_USED_WIDTH, 1.0)):
-                    mesh = pv.PolyData(np.zeros((2, 3)), lines=np.array([2, 0, 1]))
-                    item[name + "_mesh"] = mesh
-                    item[name + "_actor"] = self._mesh(mesh, color=SA_LINE_COLOR, line_width=width, opacity=opacity,
-                                                       lighting=False, name=f"sa_lines_{name}:{e['name']}")
-                    item[name + "_count"] = 0
-                self._sa_line_items["per_slice"].append(item)
+            in_pairs = {k for pair in self.overlays.get("sa_pairs") or [] for k in pair}
+            self._sa_line_items = {"per_slice": [{"entry": e, "burned": {}} for e in self.entries
+                                                 if e["view"] == "SA" or e["key"] in in_pairs]}
+            self._add_burned_actors(self._sa_line_items, "sa_lines", (("img", SA_LINE_IMG_WIDTH, 0.6),
+                                                                      ("used", SA_LINE_USED_WIDTH, 1.0)))
 
         # Intersection lines: one segment per line, recomputed at every snapshot as the
         # intersection of the two planes at their current poses -- the line the loss samples
@@ -1773,8 +1943,8 @@ class SliceViewer:
         t_img = df[["t_img_lo", "t_img_hi"]].to_numpy(float)
         bad = ~np.isfinite(t_img).all(1)
         t_img[bad] = t_used[bad]
-        keys_a = list(zip(df["image_a"].astype(str), df["slice_a"].astype(int)))
-        keys_b = list(zip(df["image_b"].astype(str), df["slice_b"].astype(int)))
+        keys_a = list(zip(df["image_a"].astype(str).tolist(), df["slice_a"].astype(int).tolist()))
+        keys_b = list(zip(df["image_b"].astype(str).tolist(), df["slice_b"].astype(int).tolist()))
         # centre of plane b in its voxel coordinates ((X-1)/2, (Y-1)/2, 0), as in make_planes
         centre_b = []
         for kb in keys_b:
@@ -1791,36 +1961,88 @@ class SliceViewer:
             centre_b.append(v["centre_b"])
         rgb = np.array([LINE_COLORS.get(k, (255, 255, 255)) for k in kinds], dtype=np.uint8)
         n = len(keys_a)
+        # the slices of the lines (_line_geometry poses each once) and every slice's lines (_profile_items)
+        ukeys = list(dict.fromkeys(keys_a + keys_b))
+        pos = {k: u for u, k in enumerate(ukeys)}
+        by_key = {}
+        for i, (ka, kb) in enumerate(zip(keys_a, keys_b)):
+            by_key.setdefault(ka, []).append(i)
+            by_key.setdefault(kb, []).append(i)
         self._line_items = {"keys_a": keys_a, "keys_b": keys_b, "x0": x0, "d": d,
-                            "t_used": t_used, "t_used_nominal": t_used.copy(), "t_used_cache": {},
-                            "t_img": t_img, "centre_b": np.array(centre_b), "n": n,
-                            "virtual": np.array(virtual, bool), "per_slice": []}
+                            "t_used_nominal": t_used.copy(), "t_used_cache": {},
+                            "t_img": t_img, "centre_b": np.array(centre_b, dtype=float).reshape(-1, 3), "n": n,
+                            "virtual": np.array(virtual, bool), "per_slice": [],
+                            "ukeys": ukeys, "ia": np.array([pos[k] for k in keys_a], int),
+                            "ib": np.array([pos[k] for k in keys_b], int),
+                            "by_key": {k: np.array(v, int) for k, v in by_key.items()}}
         # every slice gets its own burned-in copy of the lines it is part of
         for e in self.entries:
-            idx = np.array([i for i in range(n) if e["key"] in (keys_a[i], keys_b[i])], dtype=int)
-            if not idx.size:
+            idx = self._line_items["by_key"].get(e["key"])
+            if idx is None or not idx.size:
                 continue
-            k = len(idx)
             # LA-LA lines on this slice: the colour of the view they cross (LA_PARTNER_COLORS)
             col = rgb[idx].copy()
-            la_la = np.array([keys_a[i][0] != "SA" and keys_b[i][0] != "SA" for i in idx])
+            la_la = np.array([self._key_view(keys_a[i]) != "SA" and self._key_view(keys_b[i]) != "SA" for i in idx])
             for j, i in enumerate(idx):
                 if la_la[j]:
                     other = keys_b[i] if keys_a[i] == e["key"] else keys_a[i]
-                    col[j] = LA_PARTNER_COLORS.get(other[0], col[j])
-            item = {"entry": e, "idx": idx, "rgb": col, "la_la": la_la}
-            for name, width, opacity in (("img", LINE_IMG_WIDTH, 0.45), ("used", LINE_USED_WIDTH, 1.0)):
-                mesh = pv.PolyData(np.zeros((4 * k, 3)), lines=burn_cells(k))   # line cells only, no vertices
-                mesh.cell_data["rgb"] = np.concatenate([col, col])
-                item[name + "_mesh"] = mesh
-                item[name + "_actor"] = self._mesh(mesh, scalars="rgb", rgb=True, line_width=width, opacity=opacity,
-                                                   lighting=False, show_scalar_bar=False,
-                                                   name=f"lines_{name}:{e['name']}")
-            self._line_items["per_slice"].append(item)
+                    col[j] = LA_PARTNER_COLORS.get(self._key_view(other), col[j])
+            self._line_items["per_slice"].append({"entry": e, "idx": idx, "rgb": col, "la_la": la_la, "burned": {}})
+        self._add_burned_actors(self._line_items, "lines", (("img", LINE_IMG_WIDTH, 0.45),
+                                                            ("used", LINE_USED_WIDTH, 1.0)), rgb=True)
+
+    def _add_burned_actors(self, items: dict, tag: str, kinds: tuple, rgb: bool = False):
+        """One actor per kind of burned-in line ("img", "used") holding the lines of every shown slice (_merge_burned):
+        two actors instead of two per slice."""
+        items["meshes"], items["actors"], items["count"] = {}, {}, {}
+        for name, width, opacity in kinds:
+            mesh = pv.PolyData(np.zeros((2, 3)), lines=np.array([2, 0, 1]))
+            if rgb:
+                mesh.cell_data["rgb"] = np.zeros((1, 3), np.uint8)
+                actor = self._mesh(mesh, scalars="rgb", rgb=True, line_width=width, opacity=opacity, lighting=False,
+                                   show_scalar_bar=False, name=f"{tag}_{name}")
+            else:
+                actor = self._mesh(mesh, color=SA_LINE_COLOR, line_width=width, opacity=opacity, lighting=False,
+                                   name=f"{tag}_{name}")
+            actor.SetVisibility(False)
+            items["meshes"][name], items["actors"][name], items["count"][name] = mesh, actor, 0
+
+    def _merge_burned(self, items: dict | None, shown: bool):
+        """Put the burned-in segments of every shown slice (item["burned"][kind] = (points (4K, 3), colours (2K, 3) or
+        None), from burn_points) into the kind's one mesh, and show it when there is something to show."""
+        if items is None or "meshes" not in items:
+            return
+        for name, mesh in items["meshes"].items():
+            parts = [it["burned"][name] for it in items["per_slice"]
+                     if it["entry"]["visible"] and name in it["burned"] and len(it["burned"][name][0])]
+            k = sum(len(pts) for pts, _ in parts) // 4
+            items["count"][name] = k if shown else 0
+            if not shown:
+                items["actors"][name].SetVisibility(False)
+                continue
+            if k:
+                new = pv.PolyData(np.concatenate([pts for pts, _ in parts]), lines=burn_cells(k))
+                if "rgb" in mesh.cell_data:
+                    new.cell_data["rgb"] = np.concatenate([cols for _, cols in parts])
+            else:                                        # placeholder (hidden)
+                new = pv.PolyData(np.zeros((2, 3)), lines=np.array([2, 0, 1]))
+                if "rgb" in mesh.cell_data:
+                    new.cell_data["rgb"] = np.zeros((1, 3), np.uint8)
+            mesh.copy_from(new)
+            items["actors"][name].SetVisibility(bool(k))
 
     def _apply_overlays(self):
-        """Move contours and lines to the planes' poses at the current snapshot."""
+        """Move contours and lines to the planes' poses at the current snapshot -- only the overlays that are shown;
+        the others are brought up to date when switched on."""
         snap = self.snapshots[self.snap_index]
+        self._apply_masks(snap)
+        self._apply_sa_lines(snap)
+        self._apply_radius(snap)
+        self._apply_lines(snap)
+
+    def _apply_masks(self, snap: dict):
+        if not self.show_mask:
+            return
         dil = self._dilation(snap["step"])
         for m in self._mask_items:
             if m["dil"] != dil:                          # (re)build the contour for this step's dilation
@@ -1833,16 +2055,18 @@ class SliceViewer:
             A = self._pose(m["key"], snap)
             if A is not None and m["ijk"] is not None:
                 m["mesh"].points = voxel_to_world(A, m["ijk"][0])
-        self._apply_sa_lines(snap)
-        self._apply_radius(snap)
+
+    def _apply_lines(self, snap: dict):
+        """The burned-in intersection lines at `snap` (when shown): each slice's own copy of its lines (_dashed), all
+        in two meshes (_merge_burned)."""
         li = self._line_items
-        if li is None:
+        if li is None or not self.show_lines:
             return
-        x0, d, li["t_used"] = self._line_geometry(snap)
-        li["cur_x0"], li["cur_d"] = x0, d
-        off = li.get("virtual", np.zeros(li["n"], bool)) & ~np.isfinite(li["t_used"]).all(1)  # virtual, not in loss
+        x0, d, t_used = self._line_geometry(snap)
+        t_cur = {"used": t_used, "img": li["t_img"]}
+        off = li.get("virtual", np.zeros(li["n"], bool)) & ~np.isfinite(t_used).all(1)  # virtual, not in loss
         for name in ("used", "img"):
-            t = li["t_" + name]                                 # (N, 2)
+            t = t_cur[name]                                     # (N, 2)
             t = np.where(np.isfinite(t), t, li["t_img"][:, :1])  # no loss points: zero-length segment
             t = np.where(off[:, None], li["t_img"][:, :1], t)
             seg = np.stack([x0 + t[:, :1] * d, x0 + t[:, 1:] * d], axis=1)   # (N, 2, 3)
@@ -1852,9 +2076,8 @@ class SliceViewer:
                 if not len(segs):                                # placeholder: a zero-length segment on the slice
                     first = seg[item["idx"][0], 0]
                     segs, cols = np.stack([first, first])[None], item["rgb"][:1]
-                mesh = pv.PolyData(burn_points(segs, A), lines=burn_cells(len(segs)))
-                mesh.cell_data["rgb"] = np.concatenate([cols, cols])
-                item[name + "_mesh"].copy_from(mesh)
+                item["burned"][name] = (burn_points(segs, A), np.concatenate([cols, cols]))
+        self._merge_burned(li, True)
 
     def _dashed(self, item: dict, seg: np.ndarray, A: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """The segments (K, 2, 3) and colours (K, 3) to burn into one slice: its lines as they are, except LA-LA
@@ -1909,75 +2132,91 @@ class SliceViewer:
             return np.zeros((0, 2, 3)), np.zeros((0, 3), np.uint8)
         return np.array(segs), np.array(cols, dtype=np.uint8)
 
-    def _line_geometry(self, snap: dict):
-        """(x0, d, t_used) of every SA-LA / LA-LA line at `snap` (manual offsets included): the intersection
-        of its two posed planes, anchored at the moved centre of plane b, and the loss range of the
-        snapshot's mask dilation."""
+    def _line_geometry(self, snap: dict, idx: np.ndarray | None = None):
+        """(x0, d, t_used) of the SA-LA / LA-LA lines `idx` (default: all) at `snap` (manual offsets included): the
+        intersection of its two posed planes, anchored at the moved centre of plane b, and the loss range of the
+        snapshot's mask dilation. All lines at once (batched cross products and 3x3 solves); a line whose planes are
+        (nearly) parallel at this pose, or a plane without a pose, keeps its acquired geometry."""
         li = self._line_items
-        x0, d = li["x0"].copy(), li["d"].copy()                # acquired geometry (fallback)
-        for i in range(li["n"]):
-            Aa = self._pose(li["keys_a"][i], snap)
-            Ab = self._pose(li["keys_b"][i], snap)
-            if Aa is None or Ab is None or not np.isfinite(li["centre_b"][i]).all():
-                continue
-            na = np.cross(Aa[:3, 0], Aa[:3, 1]); na /= np.linalg.norm(na)
-            nb = np.cross(Ab[:3, 0], Ab[:3, 1]); nb /= np.linalg.norm(nb)
-            di = np.cross(na, nb)
-            nd = np.linalg.norm(di)
-            if nd < 1e-6:
-                continue                                        # planes (nearly) parallel at this pose
-            di /= nd
-            cb = (Ab @ np.append(li["centre_b"][i], 1.0))[:3]
-            rhs = np.array([na @ Aa[:3, 3], nb @ Ab[:3, 3], di @ cb])
-            x0[i] = np.linalg.solve(np.stack([na, nb, di]), rhs)
-            d[i] = di
-        return x0, d, self._stage_t_used(self._dilation(snap["step"]))
+        sel = np.arange(li["n"]) if idx is None else np.asarray(idx, dtype=int)
+        x0, d = li["x0"][sel].copy(), li["d"][sel].copy()      # acquired geometry (fallback)
+        if len(sel):
+            P = np.full((len(li["ukeys"]), 4, 4), np.nan)       # every slice of the lines posed once
+            for u, key in enumerate(li["ukeys"]):
+                A = self._pose(key, snap)
+                if A is not None:
+                    P[u] = A
+            Aa, Ab, cb_ijk = P[li["ia"][sel]], P[li["ib"][sel]], li["centre_b"][sel]
+            with np.errstate(invalid="ignore", divide="ignore"):
+                na = np.cross(Aa[:, :3, 0], Aa[:, :3, 1])
+                na /= np.linalg.norm(na, axis=1, keepdims=True)
+                nb = np.cross(Ab[:, :3, 0], Ab[:, :3, 1])
+                nb /= np.linalg.norm(nb, axis=1, keepdims=True)
+                di = np.cross(na, nb)
+                nd = np.linalg.norm(di, axis=1)
+                ok = np.isfinite(nd) & (nd >= 1e-6) & np.isfinite(cb_ijk).all(1)
+            if ok.any():
+                di = di[ok] / nd[ok, None]
+                cb = np.einsum("nij,nj->ni", Ab[ok, :3, :3], cb_ijk[ok]) + Ab[ok, :3, 3]
+                rhs = np.stack([(na[ok] * Aa[ok, :3, 3]).sum(1), (nb[ok] * Ab[ok, :3, 3]).sum(1), (di * cb).sum(1)], 1)
+                x0[ok] = np.linalg.solve(np.stack([na[ok], nb[ok], di], axis=1), rhs[..., None])[..., 0]
+                d[ok] = di
+        t_used = self._stage_t_used(self._dilation(snap["step"]))
+        return x0, d, (t_used if idx is None else t_used[sel])
 
     def _apply_sa_lines(self, snap: dict):
         """Burn the stored SA-SA segments of this snapshot into both slices of their pair
-        (none where the slices do not cross)."""
+        (none where the slices do not cross); only when shown."""
         si = self._sa_line_items
-        if si is None:
+        if si is None or not self.show_sa_lines:
             return
         segs = self._sa_segments(snap)
         for item in si["per_slice"]:
-            sl = item["entry"]["key"][1]
+            key = item["entry"]["key"]
             A = self._affine_for(item["entry"], snap)
             for name in ("img", "used"):
                 e = segs.get(name, np.zeros((0, 2, 3)))
-                pairs = segs.get(name + "_pairs", np.zeros((0, 2), int))
-                mine = e[(pairs == sl).any(1)] if len(e) else e
-                k = len(mine)
-                item[name + "_count"] = k
-                new = (pv.PolyData(burn_points(mine, A), lines=burn_cells(k)) if k
-                       else pv.PolyData(np.zeros((2, 3)), lines=np.array([2, 0, 1])))   # placeholder, hidden
-                item[name + "_mesh"].copy_from(new)
-        self._apply_sa_line_visibility()
+                pairs = segs.get(name + "_pairs", [])
+                mine = e[np.array([key in pr for pr in pairs], bool)] if len(e) else e
+                item["burned"][name] = (burn_points(mine, A), None) if len(mine) else (np.zeros((0, 3)), None)
+        self._merge_burned(si, True)
+
+    def _parallel_pairs(self) -> list[tuple]:
+        """Pairs of parallel slices (slice keys): every pair of sa_lines.csv, and the neighbouring slices of each SA
+        stack."""
+        pairs = list(self.overlays.get("sa_pairs") or [])
+        stacks = {}
+        for e in self.entries:
+            if e["view"] == "SA":
+                stacks.setdefault(e["image"], []).append(e["key"])
+        for keys in stacks.values():
+            keys = sorted(keys, key=lambda k: k[1])
+            pairs += [(a, b) for a, b in zip(keys, keys[1:]) if b[1] == a[1] + 1]
+        return list(dict.fromkeys(pairs))
 
     def _sa_segments(self, snap: dict) -> dict:
-        """SA-SA segments of this snapshot: as stored, except pairs with a manually moved slice, whose
+        """Parallel-pair (SA-SA) segments of this snapshot: as stored, except pairs with a manually moved slice, whose
         crossing is recomputed (inside both images; the loss part within the long-axis radius)."""
         segs = (self.overlays.get("sa_lines") or {}).get((snap["step"], bool(snap["is_best"])), {})
-        moved = {k[1] for k, off in self.offsets.items() if k[0] == "SA" and np.any(off)}
+        moved = {k for k, off in self.offsets.items() if np.any(off)}
         if not moved:
             return segs
-        sa = {e["key"][1]: e for e in self.entries if e["view"] == "SA"}
         axis = (self.overlays.get("long_axis") or {}).get((snap["step"], bool(snap["is_best"])))
         out = {}
         for name in ("img", "used"):
-            e, pr = segs.get(name, np.zeros((0, 2, 3))), segs.get(name + "_pairs", np.zeros((0, 2), int))
-            keep = ~np.isin(pr, list(moved)).any(1) if len(pr) else np.zeros(0, bool)
-            out[name], out[name + "_pairs"] = list(e[keep]), list(pr[keep])
-        for z in sorted(sa):
-            if z + 1 not in sa or not ({z, z + 1} & moved):
+            e, pr = segs.get(name, np.zeros((0, 2, 3))), segs.get(name + "_pairs", [])
+            keep = [j for j, pair in enumerate(pr) if not set(pair) & moved]
+            out[name], out[name + "_pairs"] = [e[j] for j in keep], [pr[j] for j in keep]
+        for ka, kb in self._parallel_pairs():
+            ea, eb = self._entry_by_key.get(ka), self._entry_by_key.get(kb)
+            if ea is None or eb is None or not {ka, kb} & moved:
                 continue
-            ea, eb = sa[z], sa[z + 1]
             cs = crossing_segment(self._pose(ea["key"], snap), ea["slice"]["grey"].shape,
                                   self._pose(eb["key"], snap), eb["slice"]["grey"].shape)
             if cs is None:
                 continue
             x0, d, lo, hi = cs
-            out["img"].append(np.stack([x0 + lo * d, x0 + hi * d])); out["img_pairs"].append([z, z + 1])
+            out["img"].append(np.stack([x0 + lo * d, x0 + hi * d])); out["img_pairs"].append((ka, kb))
             if axis is not None:                         # within the radius: |perp(x0 + t d - p)| <= r
                 p0, ell, r = axis
                 ell = ell / np.linalg.norm(ell)
@@ -1989,10 +2228,9 @@ class SliceViewer:
                     t1, t2 = (-B2 - np.sqrt(disc)) / (2 * A2), (-B2 + np.sqrt(disc)) / (2 * A2)
                     u1, u2 = max(lo, t1), min(hi, t2)
                     if u2 > u1:
-                        out["used"].append(np.stack([x0 + u1 * d, x0 + u2 * d])); out["used_pairs"].append([z, z + 1])
+                        out["used"].append(np.stack([x0 + u1 * d, x0 + u2 * d])); out["used_pairs"].append((ka, kb))
         for name in ("img", "used"):
             out[name] = np.array(out[name]).reshape(-1, 2, 3)
-            out[name + "_pairs"] = np.array(out[name + "_pairs"], dtype=int).reshape(-1, 2)
         return out
 
     def move_selected(self, param: int, sign: int):
@@ -2019,7 +2257,7 @@ class SliceViewer:
         e = self._entry_by_name().get(self.profile_key)
         off = self.offsets.get(e["key"], np.zeros(6)) if e is not None else np.zeros(6)
         n_moved = sum(bool(np.any(o)) for o in self.offsets.values())
-        self._move_text.SetInput(f"Manual correction {label(self.profile_key) if e else '-'}")
+        self._move_text.SetInput(f"Manual correction {self._short_name(e, e) if e else '-'}")
         self._reset_text.SetInput("reset all slices" + (f"  ({n_moved} moved)" if n_moved else ""))
         for k, (name, unit) in enumerate(MOVE_PARAMS):
             self._move_values[k].SetInput(f"{off[k]:+.0f} {unit}")
@@ -2027,7 +2265,7 @@ class SliceViewer:
     def _apply_radius(self, snap: dict):
         """Intersect the radius cylinder around this snapshot's long axis with every SA slice at its pose:
         each cylinder generator p + r (cos f e1 + sin f e2) + s ell meets the slice plane at one point."""
-        if not self._radius_items:
+        if not self._radius_items or not self.show_radius:
             return
         axis = self.overlays["long_axis"].get((snap["step"], bool(snap["is_best"])))
         if axis is not None:
@@ -2057,25 +2295,18 @@ class SliceViewer:
             item["actor"].SetVisibility(self.show_radius and item["ok"] and item["entry"]["visible"])
 
     def _apply_sa_line_visibility(self):
-        si = self._sa_line_items
-        if si is None:
-            return
-        for item in si["per_slice"]:
-            for name in ("img", "used"):
-                item[name + "_actor"].SetVisibility(self.show_sa_lines and item["entry"]["visible"]
-                                                    and item[name + "_count"] > 0)
+        self._merge_burned(self._sa_line_items, self.show_sa_lines)
 
     def _apply_line_visibility(self):
-        if self._line_items is None:
-            return
-        for item in self._line_items["per_slice"]:
-            for name in ("img", "used"):
-                item[name + "_actor"].SetVisibility(self.show_lines and item["entry"]["visible"])
+        self._merge_burned(self._line_items, self.show_lines)
 
     # --- intersection intensity profiles ---------------------------------------
     def set_profile(self, name: str):
-        if name not in self._entry_by_name():
+        e = self._entry_by_name().get(name)
+        if e is None:
             return
+        if self._multi and e["modality"] != self.listed_modality:     # list the modality of the profiled slice
+            self.set_listed_modality(e["modality"])
         if name != self.profile_key:
             self._profile_scroll = self._scroll_target = 0.0
         self.profile_key = name
@@ -2086,14 +2317,16 @@ class SliceViewer:
         self._update_profiles()
         self.pl.render()
 
-    def _menu_entries(self) -> list[dict]:
-        """The slices in the order of the left-hand menu: the aortic slice, then the LA views (VIEWS order), then the
-        SA slices (any other view after the LA views, before SA)."""
+    def _menu_entries(self, modality: str | None = None) -> list[dict]:
+        """The slices of a modality (default: all) in the order of the left-hand menu: the aortic slice, then the LA
+        views (VIEW_RANK order), then the SA slices (any other view after the LA views, before SA)."""
         rank = {"ao": 0, "SA": 2}
-        return sorted(self.entries, key=lambda e: rank.get(e["view"], 1))      # stable: VIEWS / slice order within
+        rows = [e for e in self.entries if modality is None or e["modality"] == modality]
+        return sorted(rows, key=lambda e: rank.get(e["view"], 1))      # stable: VIEW_RANK / slice order within
 
     def step_profile(self, step: int):
-        names = [e["name"] for e in self._menu_entries()]                      # , / . walk the menu top-down
+        names = [e["name"] for e in self._menu_entries(self.listed_modality if self._multi else None)]
+        # , / . walk the menu (of the listed modality) top-down
         if names:
             i = names.index(self.profile_key) if self.profile_key in names else 0
             self.set_profile(names[(i + step) % len(names)])
@@ -2143,7 +2376,13 @@ class SliceViewer:
                 heart = (seg > 0).any(-1)
                 if extend > 0:
                     snap0 = self.snapshots[0]["affines"]
-                    sa = sorted((x for x in self.entries if x["view"] == "SA"), key=lambda x: x["key"][1])
+                    sa = [x for x in self.entries if x["view"] == "SA"]
+                    if sa:                               # the largest SA stack (as motion_gradient.prepare_subject)
+                        n_sa = {}
+                        for x in sa:
+                            n_sa[x["image"]] = n_sa.get(x["image"], 0) + 1
+                        big = max(n_sa, key=n_sa.get)
+                        sa = sorted((x for x in sa if x["image"] == big), key=lambda x: x["key"][1])
                     apex = apex_direction([(snap0.get(x["key"], x["slice"]["affine"]), x["slice"]["grey"].shape[:2],
                                             x["slice"]["seg"]) for x in sa],
                                           [(snap0.get(x["key"], x["slice"]["affine"]), x["slice"]["seg"])
@@ -2194,7 +2433,7 @@ class SliceViewer:
         T = np.arange(-ext, ext + 1e-6, step)
         n_slices = {}
         for e in self.entries:
-            n_slices[e["view"]] = n_slices.get(e["view"], 0) + 1
+            n_slices[e["image"]] = n_slices.get(e["image"], 0) + 1
 
         def frame(e):
             A = snap0["affines"].get(e["key"], e["slice"]["affine"])
@@ -2209,7 +2448,7 @@ class SliceViewer:
         out = []
         for i, a in enumerate(self.entries):
             for b in self.entries[i + 1:]:
-                if a["view"] == b["view"] or (n_slices[a["view"]] > 1 and n_slices[b["view"]] > 1):
+                if a["image"] == b["image"] or (n_slices[a["image"]] > 1 and n_slices[b["image"]] > 1):
                     continue
                 if (a["key"], b["key"]) in existing or (b["key"], a["key"]) in existing:
                     continue
@@ -2384,20 +2623,24 @@ class SliceViewer:
         t = cfg.get("lax_thickness")
         return float(t) if t else float(e["slice"]["thick_hdr"])
 
-    def _blurred(self, e: dict, sigma: float) -> np.ndarray:
-        """Raw intensities of the current frame, in-plane Gaussian blurred with sigma mm (as LineSampler.set_blur)."""
-        key = (e["name"], self.frame, round(sigma, 4))
+    def _blurred(self, e: dict, sigma: float, frame: int | None = None, keep: bool = True) -> np.ndarray:
+        """Raw intensities of a frame (default: the shown one), in-plane Gaussian blurred with sigma mm (as
+        LineSampler.set_blur); kept for reuse (the last 64) unless keep is False."""
+        frame = self.frame if frame is None else frame
+        key = (e["name"], frame, round(sigma, 4))
         out = self._blur_cache.get(key)
         if out is None:
-            raw = e["slice"]["raw"][:, :, self.frame].astype(np.float32)
+            raw = e["slice"]["raw"][:, :, frame].astype(np.float32) * np.float32(e["slice"].get("raw_scale", 1.0))
             if sigma > 1e-6:
                 A = e["slice"]["affine"]
                 sp = (np.linalg.norm(A[:3, 0]), np.linalg.norm(A[:3, 1]))
                 raw = gaussian_filter(raw, (max(sigma / sp[0], 1e-3), max(sigma / sp[1], 1e-3)), mode="nearest",
                                       truncate=3.0)
-            if len(self._blur_cache) > 64:
-                self._blur_cache.clear()
-            self._blur_cache[key] = out = raw
+            out = raw
+            if keep:
+                if len(self._blur_cache) > 64:
+                    self._blur_cache.clear()
+                self._blur_cache[key] = out
         return out
 
     def _loss_profile(self, e: dict, other: dict, snap: dict, pts: np.ndarray, sigma: float, scale: float,
@@ -2419,11 +2662,13 @@ class SliceViewer:
             step = self._thickness(other) / sin
         else:
             m, step = np.zeros(3), 0.0
+        # every band offset in one interpolation call (zeros padding, as grid_sample), then the weighted sum
+        P = pts[None] + (np.asarray(u, float) * step)[:, None, None] * m                 # (K, L, 3)
+        vox = np.einsum("ij,klj->ikl", Ai[:2, :3], P) + Ai[:2, 3][:, None, None]        # (2, K, L)
+        vals = map_coordinates(img, vox.reshape(2, -1), order=1, mode="constant", cval=0.0).reshape(len(u), len(pts))
         prof = np.zeros(len(pts))
-        for uk, wk in zip(u, w):
-            P = pts + uk * step * m
-            vox = (Ai @ np.column_stack([P, np.ones(len(P))]).T)[:2]
-            prof += wk * map_coordinates(img, vox, order=1, mode="constant", cval=0.0)   # zeros padding, as grid_sample
+        for vk, wk in zip(vals, w):
+            prof += wk * vk
         inside = np.isfinite(self._sample(e, snap, pts))
         lo, hi = e["slice"]["lo"], e["slice"]["hi"]
         return np.where(inside, (prof - lo) / (hi - lo) * 255.0, np.nan)
@@ -2456,23 +2701,30 @@ class SliceViewer:
         e = self._entry_by_name().get(self.profile_key)
         if e is None:
             return []
+        # cached: the same per frame (only the profiles' grey values change), recomputed per step / offsets
+        ckey = (id(snap), self.profile_key, self._offsets_sig())
+        cached = self._items_cache.get(ckey)
+        if cached is not None:
+            return cached
+        if len(self._items_cache) > 4 * max(1, len(self.snapshots)):
+            self._items_cache.clear()
         out, with_sa = [], []
         li = self._line_items
-        if li is not None:
-            x0, d, t_used = self._line_geometry(snap)
-            for i in range(li["n"]):
+        idx = li["by_key"].get(e["key"]) if li is not None else None
+        if idx is not None and len(idx):
+            x0, d, t_used = self._line_geometry(snap, idx)                  # (only this slice's lines)
+            for j, i in enumerate(idx):
                 ka, kb = li["keys_a"][i], li["keys_b"][i]
-                if e["key"] not in (ka, kb):
-                    continue
                 other = kb if ka == e["key"] else ka
                 oe = self._entry_by_key.get(other)
                 if oe is None:
                     continue
-                item = dict(other=oe, x0=x0[i], d=d[i], t_img=li["t_img"][i], t_used=t_used[i],
-                            in_loss=bool(np.isfinite(t_used[i]).all()))     # at this step's mask dilation
-                (with_sa if e["view"] != "SA" and other[0] == "SA" else out).append(item)
+                item = dict(other=oe, x0=x0[j], d=d[j], t_img=li["t_img"][i], t_used=t_used[j],
+                            in_loss=bool(np.isfinite(t_used[j]).all()))     # at this step's mask dilation
+                (with_sa if e["view"] != "SA" and self._key_view(other) == "SA" else out).append(item)
+        parallel = {kb if ka == e["key"] else ka for ka, kb in self.overlays.get("sa_pairs") or [] if e["key"] in (ka, kb)}
         if e["view"] != "SA":
-            have = {r["other"]["key"] for r in out + with_sa}
+            have = {r["other"]["key"] for r in out + with_sa} | parallel      # (parallel pairs: charted below)
             Ae = self._pose(e["key"], snap)
             for oe in self.entries:                       # pairs without a loss line: the geometric crossing
                 if oe["key"] == e["key"] or oe["key"] in have or Ae is None:
@@ -2486,32 +2738,48 @@ class SliceViewer:
                 if cs is not None:
                     item.update(x0=cs[0], d=cs[1], t_img=np.array([cs[2], cs[3]]), t_used=np.array([np.nan, np.nan]))
                 (with_sa if oe["view"] == "SA" else out).append(item)
-            out.sort(key=lambda r: (VIEWS.index(r["other"]["view"]) if r["other"]["view"] in VIEWS else len(VIEWS),
-                                    r["other"]["key"][1]))
-            out += sorted(with_sa, key=lambda r: r["other"]["key"][1])
+            # (with several modalities: the profiled slice's own modality first)
+            out.sort(key=lambda r: (r["other"]["modality"] != e["modality"], VIEW_RANK.get(r["other"]["view"], 4),
+                                    r["other"]["image"], r["other"]["key"][1]))
+            out += sorted(with_sa, key=lambda r: (r["other"]["modality"] != e["modality"], r["other"]["image"],
+                                                  r["other"]["key"][1]))
         else:
-            out.sort(key=lambda r: VIEWS.index(r["other"]["view"]))
+            out.sort(key=lambda r: (r["other"]["modality"] != e["modality"], VIEW_RANK.get(r["other"]["view"], 4),
+                                    r["other"]["image"]))
+        # parallel slices: an SA slice's next neighbour in its stack (else the previous one), and the parallel
+        # slices of other images it is paired with (sa_lines.csv; e.g. the same view in another modality)
+        partners = []
         if e["view"] == "SA":
             sl = e["key"][1]
-            names = {x["key"][1]: x for x in self.entries if x["view"] == "SA"}
+            names = {x["key"][1]: x for x in self.entries if x["image"] == e["image"]}
             nb = sl + 1 if sl + 1 in names else sl - 1
             if nb in names:
-                item = dict(other=names[nb], x0=None, sa_sa=True)
-                segs = self._sa_segments(snap)
-                pairs = segs.get("img_pairs", np.zeros((0, 2), int))
-                hit = np.flatnonzero(((pairs == sl).any(1)) & ((pairs == nb).any(1))) if len(pairs) else []
-                if len(hit):
-                    a, b = segs["img"][hit[0]]
-                    length = float(np.linalg.norm(b - a))
-                    if length > 0:
-                        item.update(x0=a, d=(b - a) / length, t_img=np.array([0.0, length]),
-                                    t_used=np.array([np.nan, np.nan]))
-                        upairs = segs.get("used_pairs", np.zeros((0, 2), int))
-                        uh = np.flatnonzero(((upairs == sl).any(1)) & ((upairs == nb).any(1))) if len(upairs) else []
-                        if len(uh):
-                            item["t_used"] = np.sort((segs["used"][uh[0]] - a) @ item["d"])
-                out.append(item)
+                partners.append(names[nb])
+        for key in sorted(parallel):
+            o = self._entry_by_key.get(key)
+            if o is not None and o["image"] != e["image"] and all(o is not x for x in partners):
+                partners.append(o)
+        segs = self._sa_segments(snap) if partners else {}
+        for o in partners:
+            item = dict(other=o, x0=None, sa_sa=True)
+            pair = {e["key"], o["key"]}
+            hit = [j for j, pr in enumerate(segs.get("img_pairs", [])) if set(pr) == pair]
+            if hit:
+                a, b = segs["img"][hit[0]]
+                length = float(np.linalg.norm(b - a))
+                if length > 0:
+                    item.update(x0=a, d=(b - a) / length, t_img=np.array([0.0, length]),
+                                t_used=np.array([np.nan, np.nan]))
+                    uh = [j for j, pr in enumerate(segs.get("used_pairs", [])) if set(pr) == pair]
+                    if uh:
+                        item["t_used"] = np.sort((segs["used"][uh[0]] - a) @ item["d"])
+            out.append(item)
+        self._items_cache[ckey] = out
         return out
+
+    def _offsets_sig(self) -> tuple:
+        """The manual pose offsets as a hashable value (cache keys)."""
+        return tuple(sorted((k, tuple(np.round(v, 6))) for k, v in self.offsets.items() if np.any(v)))
 
     def _profile_metric(self, e: dict, it: dict, snap: dict, t: np.ndarray, ya: np.ndarray, yb: np.ndarray,
                         used: np.ndarray):
@@ -2676,43 +2944,200 @@ class SliceViewer:
             out.append(c)
         return out
 
+    @staticmethod
+    def _range_ident(it: dict) -> tuple:
+        return it["other"]["key"], bool(it.get("sa_sa"))
+
+    def _range_key(self) -> tuple:
+        return (self.run_index, self.subject_index, self.profile_key, self.metric,
+                self.show_psf and self.config is not None, self._offsets_sig())
+
+    def _line_in_mask(self, e: dict, other: dict, snap: dict, pts: np.ndarray) -> np.ndarray:
+        """Which points of an intersection line are inside either slice's dilated mask (or, SA x Ao, the SA-SA
+        cylinder) at `snap`: the yellow bar of its charts."""
+        masks = [m for m in (self._in_mask(e, snap, pts), self._in_mask(other, snap, pts),
+                             self._in_cylinder(e, other, snap, pts)) if m is not None]
+        return np.logical_or.reduce(masks) if masks else np.zeros(len(pts), bool)
+
+    def _chart_entry(self, si: int, it: dict, frame: int | None = None, prefetch: bool = False) -> dict | None:
+        """The chart data (as _chart_data) of intersection `it` (of snapshot si's _profile_items) at snapshot si and
+        `frame` (default: the shown one), through the chart cache: per chart state (_range_key: slice, metric,
+        profile mode, offsets), snapshot, frame and intersection, its curves as float32 plus the in-mask bar (the
+        line and its sample points are rebuilt from `it`; least recently used dropped first). prefetch: for the cache
+        only, None if it is full (CHART_CACHE_MB; prefetching does not push anything out)."""
+        frame = self.frame if frame is None else frame
+        rk = self._range_key()
+        if rk != self._chart_state:                    # another slice, metric, profile mode or offsets: start over
+            self._chart_cache.clear()
+            self._chart_state = rk
+        key = (rk, si, frame, self._range_ident(it))
+        hit = self._chart_cache.get(key)
+        if hit is None:
+            n_pts = int((it["t_img"][1] - it["t_img"][0]) / PROFILE_STEP_MM) + 1 if it["x0"] is not None else 0
+            if prefetch and not self._chart_cache.make_room(key, 21 * n_pts + 512, self.frame, self.n_frames):
+                return None
+            snap = self.snapshots[si]
+            shown, self.frame = self.frame, frame             # (the chart data are of self.frame)
+            try:
+                c = self._chart_data(snap, [it])[0]
+            finally:
+                self.frame = shown
+            if "ya" in c:
+                f32 = lambda a: None if a is None else np.asarray(a, np.float32)  # noqa: E731
+                e = self._entry_by_name().get(self.profile_key)
+                hit = dict(ya=f32(c["ya"]), yb=f32(c["yb"]), curve=f32(c["curve"]), full=f32(c["full"]),
+                           ct=f32(c["ct"]), mname=c["mname"], mval=c["mval"], mode_txt=c["mode_txt"],
+                           in_mask=self._line_in_mask(e, it["other"], snap, c["pts"]))
+            else:
+                hit = {}                                       # no crossing
+            nbytes = sum(a.nbytes for a in hit.values() if isinstance(a, np.ndarray)) + 512
+            self._chart_cache.put(key, hit, nbytes, prefetch, self.frame, self.n_frames)
+        c = dict(it=it)
+        if "ya" in hit:
+            t = np.arange(it["t_img"][0], it["t_img"][1] + 1e-6, PROFILE_STEP_MM)
+            used = (t >= it["t_used"][0]) & (t <= it["t_used"][1]) if np.isfinite(it["t_used"]).all() \
+                else np.zeros(len(t), bool)
+            c.update(t=t, pts=it["x0"] + t[:, None] * it["d"], used=used,
+                     **{k: hit[k] for k in ("ya", "yb", "curve", "full", "ct", "mname", "mval", "mode_txt", "in_mask")})
+        return c
+
     def _metric_ranges(self, data: list[dict]) -> list:
         """Per shown chart: (min, max) of the full metric curve over every history snapshot, so the metric
         charts keep one y scale while scrubbing the history; None where an intersection never has a curve.
-        Cached per intersection, computed when it first comes into view, at the frame shown then -- slice, metric,
-        profile mode or manual offsets changed (~0.15 s per intersection for 50 snapshots) -- and only widened
-        afterwards when another frame's curve (`data`, the shown ones) leaves it, so stepping through the cine and
-        scrolling stay fast."""
-        key = (self.run_index, self.subject_index, self.profile_key, self.metric,
-               self.show_psf and self.config is not None,
-               tuple(sorted((k, tuple(np.round(v, 6))) for k, v in self.offsets.items())))
-        cache = getattr(self, "_range_cache", None)
-        if cache is None or cache[0] != key:
-            self._range_cache = cache = (key, {})
-        ranges = cache[1]
-
-        def ident(it):
-            return it["other"]["key"], bool(it.get("sa_sa"))
-
-        missing = {ident(c["it"]) for c in data} - set(ranges)
-        if missing:
-            acc = {k: [np.inf, -np.inf] for k in missing}
-            for snap in self.snapshots:
-                its = [it for it in self._profile_items(snap) if ident(it) in missing]
-                for c in self._chart_data(snap, its):
-                    cv = c.get("full")
-                    if cv is not None and np.isfinite(cv).any():
-                        r = acc[ident(c["it"])]
-                        r[0], r[1] = min(r[0], float(np.nanmin(cv))), max(r[1], float(np.nanmax(cv)))
-            ranges.update(acc)
+        One pass over the history costs ~0.2 s per intersection, so it runs in the background, in timer ticks
+        (_range_step; the shown charts first): until an intersection's pass is done its range is that of the curves
+        seen so far, and its chart is redrawn once the pass completes. Ranges are kept per slice, metric, profile
+        mode and manual offsets, computed at the frame shown at the time, and widened when another frame's curve
+        (`data`, the shown ones) leaves them. Without an event loop (off screen) the pass runs right away."""
+        key = self._range_key()
+        if self._range_cache is None or self._range_cache[0] != key:
+            self._range_cache = (key, {}, set())
+            self._rjob = None
+        _, ranges, complete = self._range_cache
+        missing = {self._range_ident(c["it"]) for c in data} - complete
+        if missing and self._offscreen():
+            for si in range(len(self.snapshots)):
+                self._range_accumulate(missing, si)
+            complete |= missing
+        elif missing:
+            self._start_range_job()
         out = []
         for c in data:
-            r = ranges.setdefault(ident(c["it"]), [np.inf, -np.inf])
+            r = ranges.setdefault(self._range_ident(c["it"]), [np.inf, -np.inf])
             cv = c.get("full")
             if cv is not None and np.isfinite(cv).any():
                 r[0], r[1] = min(r[0], float(np.nanmin(cv))), max(r[1], float(np.nanmax(cv)))
             out.append((float(r[0]), float(r[1])) if np.isfinite(r[0]) else None)
         return out
+
+    def _range_accumulate(self, idents: set, si: int):
+        """Widen the ranges of the given intersections by their full metric curves at snapshot si."""
+        ranges = self._range_cache[1]
+        its = [it for it in self._profile_items(self.snapshots[si]) if self._range_ident(it) in idents]
+        for c in (self._chart_entry(si, it) for it in its):            # (cached: the history at the shown frame)
+            cv = c.get("full")
+            if cv is not None and np.isfinite(cv).any():
+                r = ranges.setdefault(self._range_ident(c["it"]), [np.inf, -np.inf])
+                r[0], r[1] = min(r[0], float(np.nanmin(cv))), max(r[1], float(np.nanmax(cv)))
+
+    def _start_range_job(self):
+        """Queue the history pass of every intersection of the profiled slice whose range is not complete."""
+        key = self._range_key()
+        if self._rjob is not None and self._rjob["key"] == key:
+            self._ensure_timer()
+            return
+        complete = self._range_cache[2]
+        items = (self._pcache or {}).get("items") or []
+        todo = {}
+        for it in items:
+            idn = self._range_ident(it)
+            if idn not in complete and idn not in todo:
+                todo[idn] = list(range(len(self.snapshots)))[::-1]
+        self._rjob = {"key": key, "todo": todo}
+        self._ensure_timer()
+
+    def _range_step(self, shown_only: bool) -> tuple[bool, bool]:
+        """One background unit of the range pass: one intersection at one snapshot (an intersection of a shown chart
+        first, or with shown_only False any other). When an intersection completes, its shown charts are redrawn
+        with the full range. (did work, charts changed)"""
+        job = self._rjob
+        if job is None or self._range_cache is None or job["key"] != self._range_key() or not job["todo"]:
+            return False, False
+        shown = {self._range_ident(c["it"]) for i, c in (self._pcache or {}).get("data", {}).items()
+                 if any(slot["bound"] == i for slot in self._profile_charts)}
+        idn = next((k for k in job["todo"] if (k in shown) == shown_only), None)
+        if idn is None:
+            return False, False
+        self._range_accumulate({idn}, job["todo"][idn].pop())
+        if job["todo"][idn]:
+            return True, False
+        del job["todo"][idn]
+        _, ranges, complete = self._range_cache
+        complete.add(idn)
+        changed = False
+        r = ranges.get(idn)
+        new = (float(r[0]), float(r[1])) if r is not None and np.isfinite(r[0]) else None
+        for i, c in (self._pcache or {}).get("data", {}).items():
+            if self._range_ident(c["it"]) == idn and self.show_metric_profiles and c.get("range") != new:
+                c["range"] = new
+                for slot in self._profile_charts:
+                    if slot["bound"] == i:
+                        slot["bound"] = None             # refilled with the full range (_render_profiles)
+                        changed = True
+        return True, changed
+
+    # --- background work and the scroll animation (one repeating timer) -------------------
+    def _offscreen(self) -> bool:
+        return bool(pv.OFF_SCREEN or self.pl.off_screen)
+
+    def _ensure_timer(self):
+        """Run the timer (_tick) while there is background work or a scroll animation; before the window's event
+        loop runs, the first render starts it."""
+        if self._offscreen() or self._timer is not None:
+            return
+        iren = self.pl.iren.interactor if self.pl.iren is not None else None
+        if iren is None or not iren.GetInitialized():
+            self._timer_wanted = True
+            return
+        self._timer = iren.CreateRepeatingTimer(SCROLL_TIMER_MS) or None      # (0: not created; tried again later)
+        self._timer_wanted = self._timer is None
+
+    def _idle_work(self, t_end: float) -> tuple[bool, bool]:
+        """Background work until t_end, in priority order: the ranges of the shown metric charts (their chart data
+        at every step of the shown frame), the prefetch stream (_bg_stream: per frame, from the shown one on, the
+        slice colours and the shown charts' data at every step), the ranges of the other charts. (more left, charts
+        changed)"""
+        changed = False
+        while time.perf_counter() < t_end:
+            for step in (lambda: self._range_step(True), self._bg_step, lambda: self._range_step(False)):
+                did, ch = step()
+                if did:
+                    changed |= ch
+                    break
+            else:
+                return False, changed
+        return True, changed
+
+    def _tick(self):
+        """Timer tick: one frame of the scroll animation (SCROLL_EASE of the way to the target, ease-out), then
+        background work for the rest of the tick's budget; the timer stops when neither is left."""
+        if self._timer is None:
+            return
+        scrolling = self._profile_scroll != self._scroll_target
+        if scrolling:
+            d = self._scroll_target - self._profile_scroll
+            if abs(d) < 0.01:
+                self._profile_scroll = self._scroll_target
+            else:
+                self._profile_scroll += d * SCROLL_EASE if abs(d) * SCROLL_EASE > 0.01 else np.sign(d) * 0.01
+            self._hover = None
+        more, changed = self._idle_work(time.perf_counter() + (IDLE_BUDGET_SCROLL_S if scrolling else IDLE_BUDGET_S))
+        if scrolling or changed:
+            self._render_profiles()
+            self.pl.render()
+        if not more and self._profile_scroll == self._scroll_target:
+            self.pl.iren.interactor.DestroyTimer(self._timer)
+            self._timer = None
 
     def _update_profiles(self):
         """Recompute the intersection charts for the current state (slice, step, frame, toggles, offsets...): drop
@@ -2721,6 +3146,7 @@ class SliceViewer:
         for slot in getattr(self, "_profile_charts", []):
             slot["bound"] = None
         self._render_profiles()
+        self._ensure_timer()                             # (prefetch for the new state)
 
     def _render_profiles(self):
         """Draw the charts at the current scroll position: the intersections from base = floor(scroll) on fill the
@@ -2749,7 +3175,7 @@ class SliceViewer:
             if slot["bound"] == i:
                 continue
             if i not in cache:
-                c = self._chart_data(snap, [items[i]])[0]
+                c = self._chart_entry(self.snap_index, items[i])
                 c["range"] = self._metric_ranges([c])[0] if self.show_metric_profiles else None
                 cache[i] = c
             self._fill_slot(k, cache[i], snap)
@@ -2765,7 +3191,7 @@ class SliceViewer:
         slot["item"] = mslot["item"] = None
         it = c["it"]
         ch.visible, mslot["chart"].visible = self.show_profiles, self.show_metric_profiles
-        names = f"{label(e['name'])} \u00d7 {label(it['other']['name'])}" + \
+        names = f"{self._short_name(e, e)} \u00d7 {self._short_name(it['other'], e)}" + \
             ("  (not in loss)" if it.get("in_loss") is False else "")
         if it["x0"] is None:
             ch.title = f"{names}: no crossing"
@@ -2774,15 +3200,14 @@ class SliceViewer:
             self._fill_metric_chart(mslot, f"{names}: no crossing", None, None, None, None, None, None)
             return
         t, ya, yb, used, mname, mval = c["t"], c["ya"], c["yb"], c["used"], c["mname"], c["mval"]
+        in_mask = c.get("in_mask")
+        if in_mask is None:
+            in_mask = self._line_in_mask(e, it["other"], snap, c["pts"])
         ch.title = (f"{names}   {mname} {mval:.2f}{c['mode_txt']}" if mval is not None
                     else f"{names}   {mname} -{c['mode_txt']}")
         for side, y in (("a", ya), ("b", yb)):
             pl_[side + "_img"].update(t, y)
             pl_[side + "_used"].update(t, np.where(used, y, np.nan))
-        masks = [m for m in (self._in_mask(e, snap, c["pts"]), self._in_mask(it["other"], snap, c["pts"]),
-                             self._in_cylinder(e, it["other"], snap, c["pts"]))
-                 if m is not None]
-        in_mask = np.logical_or.reduce(masks) if masks else np.zeros(len(t), bool)
         pl_["mask"].update(t, np.where(in_mask, float(PROFILE_MASK_Y), np.nan))
         xr = [float(t[0]), float(t[-1]) if len(t) > 1 else float(t[0]) + 1.0]
         ch.x_range = xr
@@ -2857,11 +3282,14 @@ class SliceViewer:
                 continue
             pitch = (rh + gap) / V
             size_h = min(1.0, (pitch - gap) / rh)
+            shown = self.show_profiles if name == "profile" else self.show_metric_profiles
             for k, slot in enumerate(slots):
                 ch = slot["chart"]
                 if self._profile_charts[k]["bound"] is None:
                     continue
                 bottom = rh - (base + k - self._profile_scroll) * pitch - (pitch - gap)
+                # a chart wholly outside the rectangle (the spare slot, between scroll steps) is not drawn
+                ch.visible = shown and bottom < rh and bottom + size_h * rh > 0
                 ch.size = (1.0, size_h)
                 ch._loc = (0.0, float(np.clip(bottom / rh, 0.0, 1.0)))
                 ch._geometry = (0, int(round(bottom)), int(rw), int(size_h * rh))
@@ -2886,32 +3314,15 @@ class SliceViewer:
         if target == self._scroll_target and target == self._profile_scroll:
             return
         self._scroll_target = target
-        if pv.OFF_SCREEN or self.pl.off_screen:
+        if self._offscreen():
             self.set_scroll(target)
             return
-        if self._scroll_timer is None:
-            self._scroll_timer = self.pl.iren.interactor.CreateRepeatingTimer(SCROLL_TIMER_MS)
+        self._ensure_timer()
 
     def set_scroll(self, pos: float):
         """Show the charts at scroll position `pos` (charts from the top, fractional) without animating."""
         smax = float(max(0, self._n_profile_items - PROFILE_VISIBLE))
         self._profile_scroll = self._scroll_target = float(np.clip(pos, 0.0, smax))
-        self._hover = None
-        self._render_profiles()
-        self.pl.render()
-
-    def _scroll_tick(self):
-        """One animation frame: move the scroll position SCROLL_EASE of the way to the target (ease-out); stop the
-        timer once there."""
-        if self._scroll_timer is None:
-            return
-        d = self._scroll_target - self._profile_scroll
-        if abs(d) < 0.01:
-            self._profile_scroll = self._scroll_target
-            self.pl.iren.interactor.DestroyTimer(self._scroll_timer)
-            self._scroll_timer = None
-        else:
-            self._profile_scroll += d * SCROLL_EASE if abs(d) * SCROLL_EASE > 0.01 else np.sign(d) * 0.01
         self._hover = None
         self._render_profiles()
         self.pl.render()
@@ -3065,10 +3476,10 @@ class SliceViewer:
         snap = self.snapshots[self.snap_index]
         if abs(self._display_sigma() - self._colors_sigma) > 1e-6:
             self._recolor()
-        for e in self.entries:
-            A = self._affine_for(e, snap)
-            e["mesh"].points = voxel_to_world(A, e["grid"])
-            e["outline_mesh"].points = voxel_to_world(A, e["corners"])
+        for e in self.entries:                           # the slice and its outline: moved, not rebuilt
+            M = self._affine_for(e, snap) @ e["mesh_inv"]
+            e["actor"].user_matrix = M
+            e["outline"].user_matrix = M
         self._apply_overlays()
         self._apply_metric_values()
         self._update_knob_labels()
@@ -3213,7 +3624,8 @@ class SliceViewer:
         """Oblique view roughly in the SA plane so the stack is seen from the
         side and the long-axis planes are not hidden behind it."""
         snap = self.snapshots[self.snap_index]
-        sa = [e for e in self.entries if e["view"] == "SA"] or self.entries
+        sa = [e for e in self.entries if e["view"] == "SA"]
+        sa = [e for e in sa if e["image"] == sa[0]["image"]] or self.entries      # the first SA stack
         A = self._affine_for(sa[len(sa) // 2], snap)
         u, v, n = (A[:3, c] / np.linalg.norm(A[:3, c]) for c in range(3))
         self.pl.view_vector(0.45 * n + 1.0 * u + 0.8 * v, viewup=-n)
@@ -3225,20 +3637,126 @@ class SliceViewer:
             return 0.0
         return self._loss_state(self.snapshots[self.snap_index]["step"])[1]
 
-    def _colors(self, s: dict) -> np.ndarray:
-        sigma = self._display_sigma()
+    def _colors(self, s: dict, frame: int | None = None, sigma: float | None = None) -> np.ndarray:
+        """RGB per pixel (cell_colors) of slice dict s at `frame` (default: the shown one), blurred with sigma mm
+        (default: as at the shown step with the blur toggle on, else none)."""
+        frame = self.frame if frame is None else frame
+        sigma = self._display_sigma() if sigma is None else sigma
         if sigma > 1e-6:
-            raw = self._blurred({"name": s["name"], "slice": s}, sigma)
+            raw = self._blurred({"name": s["name"], "slice": s}, sigma, frame, keep=False)
             grey = (np.clip((raw - s["lo"]) / (s["hi"] - s["lo"]), 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8)
         else:
-            grey = s["grey"][:, :, self.frame]
-        seg = None if s["seg"] is None else s["seg"][:, :, self.frame]
+            grey = s["grey"][:, :, frame]
+        seg = None if s["seg"] is None else s["seg"][:, :, frame]
         return cell_colors(grey, seg, self.show_seg, self.seg_alpha)
 
+    def _color_key(self, s: dict, frame: int | None = None, sigma: float | None = None) -> tuple:
+        frame = self.frame if frame is None else frame
+        sigma = self._display_sigma() if sigma is None else sigma
+        return id(s["grey"]), frame, bool(self.show_seg), float(self.seg_alpha), round(sigma, 4)
+
+    def _slice_rgb(self, s: dict, frame: int | None = None, sigma: float | None = None,
+                   prefetch: bool = False) -> np.ndarray | None:
+        """_colors through the colour cache (FrameCache, COLOR_CACHE_MB): stepping back to a frame is free.
+        prefetch: for the cache only; None when it has no room (see FrameCache)."""
+        key = self._color_key(s, frame, sigma)
+        rgb = self._color_cache.get(key)
+        if rgb is not None:
+            return rgb
+        if prefetch and not self._color_cache.make_room(key, s["grey"][:, :, 0].size * 3, self.frame, self.n_frames):
+            return None
+        rgb = self._colors(s, frame, sigma)
+        self._color_cache.put(key, rgb, rgb.nbytes, prefetch, self.frame, self.n_frames)
+        return rgb
+
+    def _recolor_entry(self, e: dict):
+        """Bring a slice's texture to the shown frame and display settings (nothing to do if it is)."""
+        key = self._color_key(e["slice"])
+        if e["rgb_key"] == key:
+            return
+        e["tex_img"].point_data["rgb"][:] = self._slice_rgb(e["slice"])
+        e["tex_img"].Modified()
+        e["rgb_key"] = key
+
     def _recolor(self):
+        """Recolour the shown slices (hidden ones when they are shown again: _apply_visibility); the colours of the
+        coming frames follow in the background (_bg_step). Colours of other display settings (segmentation shown or
+        not, its opacity) are dropped."""
+        settings = (bool(self.show_seg), float(self.seg_alpha))
+        if settings != self._color_settings:
+            self._color_cache.clear()
+            self._color_settings = settings
         self._colors_sigma = self._display_sigma()
         for e in self.entries:
-            e["mesh"].cell_data["rgb"] = self._colors(e["slice"])
+            if e["visible"]:
+                self._recolor_entry(e)
+        self._ensure_timer()
+
+    def _bg_stream(self, idents: list):
+        """The background prefetch, frame by frame from the shown one on (the shown frame, the next, ...): the shown
+        slices' colours at every blur level of the history (one level, none, with the blur toggle off; levels of the
+        steps nearest the shown one first), then the chart data of the shown charts (`idents`) at every step (nearest
+        first). Units: ("rgb", entry, frame, sigma) or ("chart", snapshot index, intersection, frame)."""
+        steps = sorted(range(len(self.snapshots)), key=lambda si: abs(si - self.snap_index))
+        if self.show_blur and self.config is not None:
+            levels = list(dict.fromkeys(round(self._loss_state(self.snapshots[si]["step"])[1], 4) for si in steps))
+        else:
+            levels = [0.0]
+        shown = [e for e in self.entries if e["visible"]]
+        for df in range(self.n_frames):
+            f = (self.frame + df) % self.n_frames
+            for sg in levels:
+                for e in shown:
+                    yield "rgb", e, f, sg
+            for si in steps:
+                for idn in idents:
+                    yield "chart", si, idn, f
+
+    def _bg_step(self) -> tuple[bool, bool]:
+        """One unit of the background prefetch (_bg_stream), remade whenever the state it depends on changes (step,
+        frame, shown slices and charts, display settings). Units already cached are skipped; a part whose cache is
+        full stops. (did work, charts changed)"""
+        charts = self.show_profiles or self.show_metric_profiles
+        idents = [self._range_ident(c["it"]) for i, c in (self._pcache or {}).get("data", {}).items()
+                  if charts and any(slot["bound"] == i for slot in self._profile_charts)]
+        sig = (self._range_key(), self.frame, self.snap_index, tuple(idents), bool(self.show_seg),
+               float(self.seg_alpha), bool(self.show_blur), tuple(e["visible"] for e in self.entries), id(self.entries))
+        if sig != self._bg_sig:
+            self._bg, self._bg_sig, self._bg_full = self._bg_stream(idents), sig, set()
+        if self._bg is None:
+            return False, False
+        rk = self._range_key()
+        if rk != self._chart_state:                    # (a full cache of another chart state would stop the charts)
+            self._chart_cache.clear()
+            self._chart_state = rk
+        skipped = 0
+        for unit in self._bg:
+            skipped += 1
+            if skipped > 500:                          # (only cached units so far: back to the timer's time check,
+                self._bg = itertools.chain([unit], self._bg)          # this unit first next time)
+                return True, False
+            if unit[0] in self._bg_full:               # (its cache is full of nearer frames: the rest is further)
+                continue
+            if unit[0] == "rgb":
+                _, e, f, sg = unit
+                if self._color_key(e["slice"], f, sg) in self._color_cache:
+                    continue
+                if self._slice_rgb(e["slice"], f, sg, prefetch=True) is None:
+                    self._bg_full.add("rgb")
+                    continue
+                return True, False
+            _, si, idn, f = unit
+            if (rk, si, f, idn) in self._chart_cache:
+                continue
+            it = next((x for x in self._profile_items(self.snapshots[si]) if self._range_ident(x) == idn), None)
+            if it is None:
+                continue
+            if self._chart_entry(si, it, f, prefetch=True) is None:
+                self._bg_full.add("chart")
+                continue
+            return True, False
+        self._bg = None                                        # done, until the state changes
+        return False, False
 
     def _slider_title(self, title: str, x0: float, y: float):
         """Title of a bottom slider, right-aligned just left of its tube (x0, y normalised)."""
@@ -3294,14 +3812,17 @@ class SliceViewer:
         self.pl.render()
 
     def _apply_visibility(self):
+        self._ensure_timer()                             # (prefetch for the shown slices)
         for e in self.entries:
+            if e["visible"]:
+                self._recolor_entry(e)                   # (hidden slices are not recoloured)
             e["actor"].SetVisibility(e["visible"])
             e["outline"].SetVisibility(e["visible"] and self.show_outlines)
         for m in self._mask_items:                 # a contour follows its plane's visibility
             e = self._entry_by_key.get(m["key"])
             m["actor"].SetVisibility(self.show_mask and (e is None or e["visible"]))
-        self._apply_line_visibility()
-        self._apply_sa_line_visibility()
+        self._merge_burned(self._line_items, self.show_lines)   # burned-in lines: only the shown slices'
+        self._merge_burned(self._sa_line_items, self.show_sa_lines)
         self._apply_radius_visibility()
 
     def _log(self, msg: str):
@@ -3359,7 +3880,8 @@ class SliceViewer:
         for name, v in vals.items():
             self._paint_checkbox(name, v)
         for key, prefix in (("all_sa", "SA"), ("all_la", "LA")):
-            group = np.array([vals[e["name"]] for e in self.entries if e["view"].startswith(prefix)], dtype=float)
+            group = np.array([vals[e["name"]] for e in self._listed_entries() if e["view"].startswith(prefix)],
+                             dtype=float)
             group = group[np.isfinite(group)]
             self._paint_checkbox(key, float(group.mean()) if group.size else float("nan"))
 
@@ -3408,26 +3930,38 @@ class SliceViewer:
             self._blur_text = self._text("", position=(BLUR_TEXT_X, y + 4), font_size=8, color="#bbbbbb")
             add_row("Image blurring  [g]", self._on_blur_toggle, self.show_blur, "blur")
         y -= 8
+        if self._multi:                                  # modality tabs: the rows below are the active tab's
+            y = self._build_tabs(y)
         # every checkbox shows the actual state: on a run change the slices are kept with their visibility (load_index)
-        if "SA" in self.data:
+        # (with several modalities the group rows and the slice rows are those of the listed modality)
+        listed = self._listed_entries()
+        if any(e["view"] == "SA" for e in self.entries):
             add_row("All SA  [a]", lambda v: self._set_group("SA", v),
-                    all(e["visible"] for e in self.entries if e["view"] == "SA"), "all_sa")
-        if any(v != "SA" for v in self.data):                # (LA views and the aortic slice)
+                    all(e["visible"] for e in listed if e["view"] == "SA"), "all_sa")
+        if any(e["view"] != "SA" for e in self.entries):     # (LA views and the aortic slice)
             add_row("All LA  [l]", lambda v: self._set_group("LA", v),
-                    all(e["visible"] for e in self.entries if e["view"] != "SA"), "all_la")
+                    all(e["visible"] for e in listed if e["view"] != "SA"), "all_la")
         y -= 8
         # column headers above the slice rows: the outline metric (value column) and "profile"
         self._text("profile", position=(PROFILE_RADIO_X + 7, y + ROW_PITCH - 4), font_size=7,
                    color="#bbbbbb").GetTextProperty().SetJustificationToCentered()
         self._value_header = self._text("", position=(PANEL_X_VAL, y + ROW_PITCH - 4), font_size=7,
                                         color="#bbbbbb")
-        for e in self._menu_entries():
-            self._profile_radios[e["name"]] = pl.add_radio_button_widget(
-                lambda n=e["name"]: self.set_profile(n), "profile", value=(e["name"] == self.profile_key),
-                position=(PROFILE_RADIO_X, y + 3), size=14, border_size=3,
-                color_on="#ffa726", color_off="#555555", background_color="#303030")
-            self._row_value[e["name"]] = self._text("", position=(PANEL_X_VAL, y + 2), font_size=9, color="white")
-            add_row(self._row_label(e), self._make_slice_cb(e), e["visible"], e["name"])
+        # one block of rows per modality, all at the same place: only the listed one is shown (_apply_listing)
+        y_list = y_end = y
+        for mod in (self.modalities if self._multi else [None]):
+            y = y_list
+            for e in self._menu_entries(mod):
+                self._profile_radios[e["name"]] = pl.add_radio_button_widget(
+                    lambda n=e["name"]: self.set_profile(n), "profile", value=(e["name"] == self.profile_key),
+                    position=(PROFILE_RADIO_X, y + 3), size=14, border_size=3,
+                    color_on="#ffa726", color_off="#555555", background_color="#303030")
+                self._row_value[e["name"]] = self._text("", position=(PANEL_X_VAL, y + 2), font_size=9, color="white")
+                add_row(self._row_label(e), self._make_slice_cb(e), e["visible"], e["name"])
+            y_end = min(y_end, y)
+        y = y_end
+        if self._multi:
+            self._apply_listing()
 
         # Outline-colour metric (radio group: exactly one active); each row also shows the
         # subject-level value of its metric at the shown step (filled by _update_header)
@@ -3504,11 +4038,108 @@ class SliceViewer:
             self._add_range_sliders()
 
 
+    # --- modalities ------------------------------------------------------
+    def _build_tabs(self, y: int) -> int:
+        """Modality tabs at row y (subjects with several modalities): per modality a checkbox showing / hiding all of
+        its slices (key h: the active tab's) and a tab, a button whose click lists that modality's slices in the rows
+        below (keys v / V: next / previous tab). TABS_PER_ROW tabs per row, sharing the panel width; labels shortened
+        to fit. Returns the y of the next row."""
+        pl = self.pl
+        per_row = min(len(self.modalities), TABS_PER_ROW)
+        slot = (TAB_X1 - PANEL_X_BOX) // per_row
+        for i, mod in enumerate(self.modalities):
+            r, c = divmod(i, per_row)
+            x, ty = PANEL_X_BOX + c * slot, y - r * ROW_PITCH
+            mine = [e for e in self.entries if e["modality"] == mod]
+            self._widgets[f"mod_shown:{mod}"] = pl.add_checkbox_button_widget(
+                lambda state, m=mod: self._set_modality_visible(bool(state), m),
+                value=all(e["visible"] for e in mine), position=(x, ty + 1), size=18, border_size=1,
+                color_on="#4caf50", color_off="#555555", background_color="#303030")
+            tx0, tx1 = x + 21, x + slot - 4
+            tab = pl.add_checkbox_button_widget(lambda _state, m=mod: self._on_tab(m), value=(mod == self.listed_modality),
+                                                position=(tx0, ty), size=20)
+            textures = {on: tab_texture(tx1 - tx0, 20, fill, frame) for on, (fill, frame, _) in TAB_COLORS.items()}
+            tab_rep = tab.GetRepresentation()
+            tab_rep.SetButtonTexture(0, textures[False])
+            tab_rep.SetButtonTexture(1, textures[True])
+            tab_rep.PlaceWidget([tx0, tx1, ty, ty + 20, 0.0, 0.0])      # a rectangle instead of the square checkbox
+            chars = max(3, int((tx1 - tx0 - 10) // TAB_CHAR_PX))
+            name = mod if len(mod) <= chars else mod[:chars - 1] + "\u2026"
+            text = self._text(name, position=(tx0 + 6, ty + 4), font_size=7, color=TAB_COLORS[False][2])
+            self._widgets[f"tab:{mod}"] = tab
+            self._tabs[mod] = {"widget": tab, "text": text, "textures": textures}   # (textures: kept referenced)
+        self._sync_tabs()
+        return y - -(-len(self.modalities) // per_row) * ROW_PITCH
+
+    def _sync_tabs(self):
+        """The active tab (the listed modality) highlighted, the others not."""
+        for mod, t in self._tabs.items():
+            on = mod == self.listed_modality
+            t["widget"].GetRepresentation().SetState(int(on))
+            t["text"].GetTextProperty().SetColor(pv.Color(TAB_COLORS[on][2]).float_rgb)
+
+    def _on_tab(self, modality: str):
+        self.set_listed_modality(modality)
+        self._sync_tabs()                     # (a click on the active tab would otherwise switch its highlight off)
+        self.pl.render()
+
+    def _apply_listing(self):
+        """Show the slice rows of the listed modality, hide the others' (their widgets also stop reacting)."""
+        if not self._multi:
+            return
+        for e in self.entries:
+            show = e["modality"] == self.listed_modality
+            for wdg in (self._widgets.get(e["name"]), self._profile_radios.get(e["name"])):
+                if wdg is None:
+                    continue
+                if wdg.GetInteractor() is not None:
+                    wdg.SetEnabled(int(show))
+                wdg.GetRepresentation().SetVisibility(int(show))
+            for txt in (self._row_text.get(e["name"]), self._row_value.get(e["name"])):
+                if txt is not None:
+                    txt.SetVisibility(show)
+
+    def set_listed_modality(self, modality: str):
+        if not self._multi or modality == self.listed_modality or modality not in self.modalities:
+            return
+        self.listed_modality = modality
+        for e in self.entries:                           # row labels: the digit keys follow the listed SA slices
+            txt = self._row_text.get(e["name"])
+            if txt is not None:
+                txt.SetInput(self._row_label(e))
+        self._apply_listing()
+        self._sync_group_boxes()
+        self._update_toggle_colors()
+        self._sync_tabs()
+        self._log(f"listed modality: {modality}")
+        self.pl.render()
+
+    def step_modality(self, step: int):
+        if self._multi:
+            i = self.modalities.index(self.listed_modality)
+            self.set_listed_modality(self.modalities[(i + step) % len(self.modalities)])
+
+    def _set_modality_visible(self, value: bool, modality: str | None = None):
+        """Show / hide every slice of a modality (default: the listed one)."""
+        modality = self.listed_modality if modality is None else modality
+        for e in self.entries:
+            if e["modality"] != modality:
+                continue
+            e["visible"] = bool(value)
+            self._set_checkbox_state(e["name"], e["visible"])
+        self._sync_group_boxes()
+        self._apply_visibility()
+        self.pl.render()
+
     # --- callbacks -------------------------------------------------------
     def _sync_group_boxes(self):
-        """'All SA' / 'All LA' show ticked exactly when every slice of their group is shown."""
-        self._set_checkbox_state("all_sa", all(e["visible"] for e in self.entries if e["view"] == "SA"))
-        self._set_checkbox_state("all_la", all(e["visible"] for e in self.entries if e["view"] != "SA"))
+        """'All SA' / 'All LA' (of the listed modality) and each modality tab's checkbox show ticked exactly when
+        every slice of their group is shown."""
+        listed = self._listed_entries()
+        self._set_checkbox_state("all_sa", all(e["visible"] for e in listed if e["view"] == "SA"))
+        self._set_checkbox_state("all_la", all(e["visible"] for e in listed if e["view"] != "SA"))
+        for mod in self._tabs:
+            self._set_checkbox_state(f"mod_shown:{mod}", all(e["visible"] for e in self.entries if e["modality"] == mod))
 
     def _make_slice_cb(self, e: dict):
         def cb(value: bool):
@@ -3520,7 +4151,7 @@ class SliceViewer:
         return cb
 
     def _set_group(self, prefix: str, value: bool):
-        for e in self.entries:
+        for e in self._listed_entries():
             # "LA": every non-SA view, the aortic slice included (it is handled like a LA view)
             if e["view"].startswith(prefix) or (prefix == "LA" and e["view"] != "SA"):
                 e["visible"] = bool(value)
@@ -3540,21 +4171,25 @@ class SliceViewer:
 
     def _on_mask_toggle(self, value: bool):
         self.show_mask = bool(value)
+        self._apply_masks(self.snapshots[self.snap_index])        # (not kept up to date while hidden)
         self._apply_visibility()
         self.pl.render()
 
     def _on_radius_toggle(self, value: bool):
         self.show_radius = bool(value)
+        self._apply_radius(self.snapshots[self.snap_index])
         self._apply_radius_visibility()
         self.pl.render()
 
     def _on_sa_lines_toggle(self, value: bool):
         self.show_sa_lines = bool(value)
+        self._apply_sa_lines(self.snapshots[self.snap_index])
         self._apply_sa_line_visibility()
         self.pl.render()
 
     def _on_lines_toggle(self, value: bool):
         self.show_lines = bool(value)
+        self._apply_lines(self.snapshots[self.snap_index])
         self._apply_visibility()
         self.pl.render()
 
@@ -3678,16 +4313,6 @@ def history_from_images(data: dict) -> dict:
     return {"snapshots": [snap], "n_steps": 0, "best_index": None, "metric_range": {}, "available": False}
 
 
-def _first_instance(subject_dir: Path) -> int | None:
-    """The first Instance_<n> folder of a subject (runs made before the single-slice layout), None if there is none."""
-    for p in sorted(subject_dir.glob("Instance_*")):
-        try:
-            return int(p.name.split("_")[1])
-        except (IndexError, ValueError):
-            continue
-    return None
-
-
 def run_config_for(run_dir: Path, metrics_dir: Path, history: dict) -> dict | None:
     """The settings the subject was aligned with. A run directory aligned into again with other settings keeps one
     config per start (run_config.json, then run_config_<YYYYMMDD-HHMMSS>.json, see motion_gradient.write_run_config);
@@ -3726,12 +4351,11 @@ def run_config_for(run_dir: Path, metrics_dir: Path, history: dict) -> dict | No
 
 
 def load_subject_run(run_dir: Path, subject: str, instance: int | None = None, cache: dict | None = None) -> dict:
-    """Everything the viewer needs for one subject of a run. The images are read from <run>/<subject>/ (current
-    layout) or, for older runs, from <run>/<subject>/Instance_<n>/. `cache` (a dict kept by the caller) holds the
-    last subject's images: the same subject from another run then reads only the NIfTI headers (reuse_images)."""
+    """Everything the viewer needs for one subject of a run. The images are read from <run>/<subject>/ and its
+    modality folders (find_images; older runs: <run>/<subject>/Instance_<n>/, a single modality), only from
+    <run>/<subject>/Instance_<instance>/ with `instance`. `cache` (a dict kept by the caller) holds the last subject's
+    images: the same subject from another run then reads only the NIfTI headers (reuse_images)."""
     subject_dir = run_dir / subject
-    if instance is None:
-        instance = _first_instance(subject_dir)
     image_dir = subject_dir / f"Instance_{instance}" if instance is not None else subject_dir
     metrics_dir = subject_dir / METRICS_SUBDIR
 
@@ -3753,6 +4377,11 @@ def load_subject_run(run_dir: Path, subject: str, instance: int | None = None, c
     if (metrics_dir / HISTORY_CSV).exists():
         history = load_history(metrics_dir)
         describe_history(metrics_dir, history)
+        named = {k[0] for snap in history["snapshots"] for k in snap["affines"]}
+        if named and not named & set(data):
+            print(f"[warn] none of the images of {metrics_dir / HISTORY_CSV} ({', '.join(sorted(named))}) is one of "
+                  f"the subject's ({', '.join(data)}): its history is from another layout (e.g. a run of a single "
+                  f"modality); every slice is shown at its saved pose", file=sys.stderr)
     else:
         history = history_from_images(data)
         why = ("not optimized (no crossing views): showing the acquired pose" if not_optimized
@@ -3775,6 +4404,9 @@ def load_subject_run(run_dir: Path, subject: str, instance: int | None = None, c
                           f"(max |diff| {np.abs(A - s['affine']).max():.3f})", file=sys.stderr)
     config = run_config_for(run_dir, metrics_dir, history)
     title = f"UKBB {subject}" + (f" / Instance_{instance}" if instance is not None else "")
+    n_mod = len({v["modality"] for v in data.values()})
+    if n_mod > 1:
+        title += f"   ({n_mod} modalities)"
     if model in POSE_NOTES:
         title += f"   [{POSE_NOTES[model]}]"
     return {"data": data, "history": history, "overlays": overlays, "config": config, "title": title,
@@ -3806,7 +4438,8 @@ def parse_args(argv=None):
                          "one subject per line (first token; e.g. a list written by worst_cases.py, whose slice column "
                          "also picks the slice profiled first). Default: all subjects of the run")
     ap.add_argument("--instance", type=int, default=None,
-                    help="older runs only: imaging instance folder (default: the first Instance_<n> found, else none)")
+                    help="show only the images of <subject>/Instance_<n>/ (default: every image folder of the "
+                         "subject, one per modality)")
     ap.add_argument("--start", default="best",
                     help="initial snapshot: 'best', 'end', '0', or a snapshot index (default: %(default)s)")
     ap.add_argument("--frame", type=int, default=0, help="initial cardiac phase")
