@@ -156,14 +156,16 @@ def import_run(d: Path) -> tuple:
 # ------------------------------------------------------------------------------------------------ kept SAX slices
 
 def lv_pixels(subj_dir: Path) -> list[tuple[int, int]]:
-    """[(SAX slice index, LV blood-pool pixels at end-diastole)] of one subject, with the run's slice indices and
-    segmentation choice (moco_nifti.load_subject: seg_sa where it covers a slice, else the nnU-Net one). Reads only
-    the headers and frame 0 of the segmentations; slices without a segmentation are left out."""
+    """[(SAX slice index, LV blood-pool pixels at end-diastole)] of one subject's SAX stack (that of its first modality
+    with one), with the run's slice indices and segmentations (moco_nifti.load_subject: the SAX segmentations matched
+    by name, slice by slice). Reads only the headers and frame 0 of the segmentations; slices without a segmentation
+    are left out."""
     import nibabel as nib
     import moco_nifti as mn
-    found = mn.discover_subject(subj_dir)
-    preferred = [p for p in found["sax_seg"] if mn.PREFERRED_SAX_SEG.match(mn.nii_stem(p))]
-    seg_slices = mn.sax_slice_list(preferred) + mn.sax_slice_list([p for p in found["sax_seg"] if p not in preferred])
+    found = next((m for m in mn.discover_subject(subj_dir) if m["sax"]), None)
+    if found is None:
+        return []
+    seg_slices = mn.sax_slice_list(found["sax_seg"])
     frames = {}
     out = []
     for s in mn.sax_slice_list(found["sax"]):
@@ -172,8 +174,8 @@ def lv_pixels(subj_dir: Path) -> list[tuple[int, int]]:
         if g is None:
             continue
         if g["path"] not in frames:
-            obj = nib.load(str(g["path"])).dataobj
-            frames[g["path"]] = np.rint(np.asarray(obj[..., 0] if len(obj.shape) == 4 else obj)).astype(np.int16)
+            obj = nib.load(str(g["path"])).dataobj        # frame 0 of (X, Y, Z, T) / (X, Y, T); (X, Y): itself
+            frames[g["path"]] = np.rint(np.asarray(obj[..., 0] if len(obj.shape) >= 3 else obj)).astype(np.int16)
         seg = frames[g["path"]]
         seg = seg[:, :, g["z"]] if seg.ndim == 3 else seg
         out.append((s["index"], int((seg == LV_LABEL).sum())))
