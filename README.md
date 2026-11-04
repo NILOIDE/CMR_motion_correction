@@ -44,33 +44,43 @@ python slice_viewer_3d.py --run-dir <alignment_dir>/my_run
 
 ### UK Biobank NIfTI (`moco_nifti.py`)
 
-Point `--root` at a folder with one subfolder per subject. No preparation is needed: each subject folder is searched
-recursively, and files are classified by name.
+Point `--root` at a folder with one subfolder per subject. Inside a subject folder, every folder that holds images is
+one **modality** (an acquisition such as cine, T1 or LGE). The UK Biobank download works as is: its `Instance_2/` is
+the subject's only modality. Files are classified by name.
 
 ```
 <root>/
   <subject>/
-    Instance_2/                    # any folder structure
+    Instance_2/                    # a modality folder (any name; a subject may have several)
       SAX.nii.gz                   # SAX stack (X, Y, Z, T), and/or single-slice files SAX_slice<nn>.nii.gz
-      LAX_2Ch.nii.gz               # LAX views (X, Y, 1, T); any other NIfTI is a LAX image of its own
+      LAX_2Ch.nii.gz               # LAX views (X, Y, 1, T); any other NIfTI is an image of its own
       LAX_3Ch.nii.gz
       LAX_4Ch.nii.gz
       ao.nii.gz                    # optional aortic slice
-      nnUNet_segs/                 # optional; matched to their image by name (SAX slices by position)
+      nnUNet_segs/                 # optional segmentation folder; its name must contain "seg"
         SAX_nnUNetSeg.nii.gz
         LAX_2Ch_nnUNetSeg.nii.gz
         ...
+    <another modality>/            # e.g. t1/ with its own SAX stack, views and segmentation folder
 ```
 
+- **Modalities:** images (2D or 3D, with or without a time axis) and at most one segmentation folder per modality. Any
+  other subfolder fails the subject with an error, and the run goes on with the next one. Each modality can have its
+  own SAX stack and its own views. Slices of the same modality are compared with `--metric`, slices of different
+  modalities with `--cross-mod-metric` (NMI by default, since contrasts differ). With several modalities, the image
+  names (in the CSVs) and the output get a `<modality>/` prefix.
 - **Segmentations** are the nnU-Net ones of the [Ugurlu et al. pipeline](https://github.com/CEMRG-publications/Ugurlu_2025_PLoS_One) [1].
-  They define the heart masks and the Dice / Hausdorff metrics. For the SAX stack, `seg_sa.nii.gz` is preferred when
-  present. Missing images or segmentations are allowed.
+  They define the heart masks and the Dice / Hausdorff metrics. A segmentation belongs to the image whose file name
+  starts its own (e.g. `LAX_2Ch_nnUNetSeg` → `LAX_2Ch`; the longest such name, with a warning if several fit). Files
+  that match no image (such as UKBB's `seg_sa.nii.gz`) are ignored, and so are segmentations not stored as integers.
+  Missing images or segmentations are allowed.
 - **The aortic slice** (`ao.nii.gz`, an axial slice through the ascending aorta) is treated as one more LAX view.
   It has no segmentation, so its lines are masked by the partner image (details below). `--use-ao false` leaves it out.
 - **Slice thickness** is not stored in NIfTI headers (only the spacing), so it is set with `--sax-thickness` (8 mm)
   and `--lax-thickness` (6 mm).
 - **Output**, per subject: `SAX_slice<nn>.nii.gz`, `LAX_2Ch.nii.gz`, ... with the corrected affines, and the
-  segmentations in `nnUNet_segs/`. `--image-dtype uint8` saves about 30% of the disk space.
+  segmentations in `nnUNet_segs/` (with several modalities, one such folder per modality). `--image-dtype uint8`
+  saves about 30% of the disk space.
 
 ### DICOM (`moco_dicom.py`)
 
@@ -80,9 +90,13 @@ image, named after its folder; its slices are the distinct positions and its fra
 ```
 <root>/
   <subject>/
-    <series_1>/phase_01/*.dcm ... phase_25/*.dcm      # any folder layout
+    <series_1>/phase_01/*.dcm ... phase_25/*.dcm      # series directly in the subject folder: one modality
     <series_2>/...
+    <modality>/<series_3>/...                         # or grouped into modality folders
 ```
+
+A folder directly in the subject folder is a modality when it holds several series, or a series in a subfolder of its
+own. All other series together form one modality.
 
 DICOM data has no segmentations, so the lines are masked by a disc around the centre of each stack instead
 (`--center-mask-radius-mm`, 40 mm). The output rewrites every input file at the same relative path, with corrected
@@ -104,7 +118,14 @@ the idea, then walk through what happens during a run.
 Every slice gets a **rigid pose**: a 3D translation and a 3D rotation, both starting at zero (the acquired geometry).
 To score a set of poses, we pair every two slices whose orientations differ by at least 20°
 (`--min-pair-angle-deg`) and sample both images along their **intersection line**. If both slices are in the right
-place, the two intensity profiles along that line should look alike.
+place, the two intensity profiles along that line should look alike. This holds whatever the slices' views or
+modalities: every slice is compared with every other one.
+
+Slices closer to parallel than that have no reliable intersection line. They are treated like neighbouring SAX
+slices: the slices next to each other in a stack, and the nearest parallel slice of every other image, are recorded as
+parallel pairs, and their crossing can be penalized (`--sax-sax-weight`, off by default). Two slices that lie almost in
+the same plane, e.g. the same view acquired in two modalities, can also be compared over their whole overlap
+(`--coplanar-weight`, off by default).
 
 We measure the agreement with the **local normalized cross-correlation** (`--metric lncc`): the profiles are compared
 in 20 mm windows sliding along the line, so every stretch of the line has to match on its own. The score is averaged

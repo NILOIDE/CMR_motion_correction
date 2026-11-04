@@ -5,9 +5,16 @@ Input (--root): one folder per subject; every .dcm / .ima file below it is read 
   - An image is one series (the files sharing a SeriesInstanceUID), named after the deepest folder holding all its
     files (e.g. <subject>/<series>/phase_<nn>/*.dcm -> <series>; files directly in the subject folder:
     SeriesDescription_SeriesNumber).
+  - Modalities (acquisitions: cine, t1, lge, ...): a folder directly below the subject folder is a modality when it
+    holds several series, or a series in a folder of its own (<subject>/<modality>/<series>/...); all other series
+    (directly in the subject folder, or each the only series of its top-level folder, e.g. <subject>/<series>/...)
+    form one modality. Slices are compared with --metric within a modality and with --cross-mod-metric between
+    modalities; with several modalities the images are named <modality>/<series>.
   - Its slices are the distinct ImagePositionPatient / ImageOrientationPatient, ordered along the slice normal; its
     cardiac frames are the files at one slice, ordered by TriggerTime, then InstanceNumber, then path. The folder layout
-    of the files does not matter.
+    of the files does not matter. A slice with a single file is one frame, taken as end-diastole (frame 0):
+    motion_gradient.py compares it with the other slices at that frame only. The slices with several frames are cut to
+    the fewest frames among them (a warning when they differ).
   - Slice thickness: SliceThickness (--thickness if the header has none). RescaleSlope / Intercept are applied.
   - Complex data: REAL / IMAGINARY image pairs (ComplexImageComponent, or ImageType R / I) are combined into the
     magnitude; PHASE images are ignored; if a series has MAGNITUDE images, only those are used.
@@ -52,8 +59,13 @@ SAME_IOP = 1e-5
 
 @dataclass(frozen=True)
 class DicomSeries:
-    name: str                                           # image name: the series' folder (see dicom_series)
+    name: str                                           # the series' folder (see dicom_series)
     files: tuple                                        # its .dcm files (Paths)
+    modality: str = ""                                  # its modality folder ("" for none; see dicom_series)
+
+    def image(self, multi: bool) -> str:
+        """Its image name: <modality>/<name> when the subject has several modalities, else <name>."""
+        return f"{self.modality}/{self.name}" if multi and self.modality else self.name
 
 
 @dataclass
@@ -88,7 +100,8 @@ def dicom_component(ds) -> str:
 
 
 def dicom_series(subj_dir: Path) -> list[DicomSeries]:
-    """The subject's series (headers only), nearest to subj_dir first."""
+    """The subject's series (headers only), nearest to subj_dir first, with their modality: the top-level folder
+    holding a series when it holds several series or the series lies in a subfolder of it, else ""."""
     groups, meta = {}, {}
     for f in dicom_files(subj_dir):
         ds = pydicom.dcmread(str(f), stop_before_pixels=True,
@@ -96,7 +109,7 @@ def dicom_series(subj_dir: Path) -> list[DicomSeries]:
         uid = str(ds.get("SeriesInstanceUID", f.parent))
         groups.setdefault(uid, []).append(f)
         meta.setdefault(uid, ds)
-    out = []
+    out, parts = [], []
     for uid, fs in groups.items():
         common = Path(os.path.commonpath([str(f.parent) for f in fs]))
         if common == subj_dir:
@@ -105,16 +118,21 @@ def dicom_series(subj_dir: Path) -> list[DicomSeries]:
         else:
             name = common.name
         out.append(DicomSeries(name=name, files=tuple(sorted(fs))))
-    names = [s.name for s in out]
-    out = [DicomSeries(f"{s.name}_{i}" if names.count(s.name) > 1 else s.name, s.files) for i, s in enumerate(out)]
-    return sorted(out, key=lambda s: (len(s.files[0].relative_to(subj_dir).parts), s.name.lower()))
+        parts.append(common.relative_to(subj_dir).parts)
+    top = [q[0] if q else "" for q in parts]
+    modality = [t if t and (len(q) >= 2 or top.count(t) >= 2) else "" for t, q in zip(top, parts)]
+    keys = list(zip(modality, [s.name for s in out]))
+    out = [DicomSeries(f"{s.name}_{i}" if keys.count(k) > 1 else s.name, s.files, k[0])
+           for i, (s, k) in enumerate(zip(out, keys))]
+    return sorted(out, key=lambda s: (len(s.files[0].relative_to(subj_dir).parts), s.modality.lower(), s.name.lower()))
 
 
 def dicom_layout(series: DicomSeries) -> dict:
     """Geometry of a series from its headers: {affines (Z, 4, 4) RAS, one per slice with the origin at its first pixel,
     shape (X, Y), files [z][t] -> tuple of paths (one magnitude file, or a real/imaginary pair), thickness
     (SliceThickness, None if absent)}. Slices are the files sharing position and orientation (so slices that are not
-    parallel, e.g. of a previously aligned series, stay apart), ordered along the first file's normal."""
+    parallel, e.g. of a previously aligned series, stay apart), ordered along the first file's normal. A slice with a
+    single frame keeps it (end-diastole); the slices with several are cut to the fewest frames among them."""
     hdrs = [(f, pydicom.dcmread(str(f), stop_before_pixels=True)) for f in series.files]
     comps = {f: dicom_component(d) for f, d in hdrs}
     use = "M" if "M" in comps.values() else "RI"
@@ -142,15 +160,17 @@ def dicom_layout(series: DicomSeries) -> dict:
         else:                                            # pair the k-th real with the k-th imaginary image
             re_, im_ = [it[4] for it in items if it[3] == "R"], [it[4] for it in items if it[3] == "I"]
             files.append(list(zip(re_, im_)))
-    nt = min(len(f) for f in files)
-    if any(len(f) != nt for f in files):
+    # single-frame slices stay single (one frame, taken as end-diastole); the multi-frame ones share one frame count
+    multi = [len(f) for f in files if len(f) > 1]
+    nt = min(multi) if multi else 1
+    if any(n != nt for n in multi):
         print(f"WARNING {series.name}: slices have different frame counts, keeping the first {nt}")
     affines = np.stack(affines)
     if len(affines) > 1:                                 # slice axis column: each slice's normal x the mean spacing
         spacing = abs(float(np.diff(affines[:, :3, 3] @ (LPS[:3, :3] @ n0)).mean()))
         affines[:, :3, 2] *= spacing if spacing > 1e-6 else 1.0
     th = d0.get("SliceThickness")
-    return dict(affines=affines, shape=(int(d0.Columns), int(d0.Rows)), files=[f[:nt] for f in files],
+    return dict(affines=affines, shape=(int(d0.Columns), int(d0.Rows)), files=[f if len(f) == 1 else f[:nt] for f in files],
                 thickness=float(th) if th not in (None, "") else None)
 
 
@@ -163,9 +183,12 @@ def read_pixels(path: Path) -> np.ndarray:
 
 def load_subject(subj_dir: Path, args) -> mg.Subject:
     """One subject folder -> motion_gradient.Subject: one SliceImage (full (X, Y, T) cine, own affine) per slice of
-    every series; `source` is the slice's DicomSlice (its files, for save())."""
+    every series (its view: the series name; its modality: see dicom_series); `source` is the slice's DicomSlice (its
+    files, for save())."""
     slices = []
-    for series in dicom_series(subj_dir):
+    all_series = dicom_series(subj_dir)
+    multi = len({s.modality for s in all_series}) > 1
+    for series in all_series:
         lay = dicom_layout(series)
         X, Y = lay["shape"]
         thickness = lay["thickness"] or args.thickness
@@ -175,8 +198,9 @@ def load_subject(subj_dir: Path, args) -> mg.Subject:
             data = np.zeros((X, Y, len(frames)), np.float32)
             for t, fs in enumerate(frames):
                 data[:, :, t] = read_pixels(fs[0]) if len(fs) == 1 else np.hypot(read_pixels(fs[0]), read_pixels(fs[1]))
-            slices.append(mg.SliceImage(image=series.name, index=z, data=data, affine=lay["affines"][z],
-                                        thickness=thickness, source=DicomSlice(files=frames, subj_dir=subj_dir)))
+            slices.append(mg.SliceImage(image=series.image(multi), index=z, data=data, affine=lay["affines"][z],
+                                        thickness=thickness, view=series.name, modality=series.modality,
+                                        source=DicomSlice(files=frames, subj_dir=subj_dir)))
     return mg.Subject(subject_id=subj_dir.name, slices=slices, status="ok" if slices else "no_images")
 
 
