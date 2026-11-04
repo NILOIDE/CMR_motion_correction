@@ -357,8 +357,7 @@ What the alignment can do for a subject depends on the images it has:
 | SAX stack and at least two long-axis views | 48,047 | full 6-DOF (29,528 of them with an aortic slice) |
 | long-axis views, no SAX stack | 4,909 | translation + in-plane rotation |
 | no long-axis view | 4,724 | not optimised, written unaligned |
-| no readable images | 43 | none |
-| failed to load (file error) | 1 | none |
+| no readable images | 44 | none |
 
 The SAX statistics in the figures below come from the 48,047 subjects aligned in 6-DOF.
 
