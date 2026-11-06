@@ -216,6 +216,22 @@ across the intersection line, not along it.
 
 ![Slice profile (PSF)](media/psf.png)
 
+#### Late edge term (optional)
+
+Local NCC normalizes every 20 mm window by its own contrast. A window that varies only slightly, e.g. a stretch of
+blood pool with some flow artefact or coil shading, therefore pulls about as hard as a window across the myocardial
+wall. Only windows that vary by less than `--lncc-min-std` (0.1 of the line's standard deviation) are faded out.
+
+`--edge-weight w` (off by default) blends an edge term into the score of every line toward the end of the run:
+(1 - w) x LNCC + w x edge similarity. The weight ramps from 0 to `w` between 80% and 90% of the run
+(`--edge-start-frac`, `--edge-ramp-frac`), after the blur and the mask have reached their final values. The edge term
+compares the **signed derivatives of both profiles along their shared line**, which is the same 3D directional
+derivative in both views. It does not use the in-plane gradient magnitude, which differs between two views even when
+they are aligned and cannot tell a rising edge from a falling one (e.g. the endocardial from the epicardial border).
+`--edge-metric ncc_grad` (default) correlates the derivatives, so strong edges dominate; `ngf` counts every edge above
+`--grad-eps` about equally. An edge metric only finds the optimum once the slices are already close (within about
+the blur width), which is why it comes late. Lines between modalities keep `--cross-mod-metric`.
+
 #### Choosing the final pose
 
 The saved pose is not simply the last one. Scores computed with a wide mask or a strong blur cannot be compared with
@@ -223,8 +239,8 @@ scores at the end of the run, so the optimizer only starts tracking the **best p
 from step 900 by default. From there, the full score (all lines) is computed every 10 steps (`--eval-every`) and for
 the final pose, and the best of these is saved.
 
-> **Note:** a schedule that lasts the whole run (`--mask-anneal-frac`, `--blur-frac` or `--psf-anneal-frac` set to 1)
-> leaves no tracking window, and the final pose is used.
+> **Note:** a schedule that lasts the whole run (`--mask-anneal-frac`, `--blur-frac` or `--psf-anneal-frac` set to 1,
+> or the edge ramp ending at 1) leaves no tracking window, and the final pose is used.
 
 #### Keeping slices close to their acquired pose:
 
@@ -251,6 +267,29 @@ blur, so the steps are comparable.
 After a quick jump in the first 20 steps, the metrics keep improving steadily while the mask, blur and slice
 profile tighten: Dice levels off around step 600, while NCC keeps rising until the end. For this subject, NCC
 rises from 0.72 to 0.86, Dice from 0.61 to 0.77, and the mean Hausdorff distance drops from 30 mm to 18 mm.
+
+#### Recorded metrics (`--logging`)
+
+Every metric is recorded at the acquired pose (`_zero`) and at the saved pose. The values are written per
+intersection line (`motion_summary_pairs.csv`), per slice or view (`motion_summary_slices.csv`, the mean over its
+lines) and per subject (`motion_summary.csv`).
+
+- **Intensity:** NCC, LNCC (the optimized metric), NMI, and `edge` (the `--edge-metric` similarity, recorded even when
+  `--edge-weight` is 0).
+- **Segmentation:** Dice and Hausdorff distance of the labels along each line.
+- **Long-axis only (`lax_dice`):** the Dice of a view over its LAX-LAX lines only. The long-axis segmentations are
+  more reliable than the basal and apical SAX ones, so this is the cleaner signal for whether the views agree.
+- **Apex:** on the lines between two of the 2Ch / 3Ch / 4Ch views, which run along the LV long axis, each view's apex
+  is the most apical point of the line that its segmentation labels as LV.
+  - `apex_mm`: the distance between the two views' epicardial apices (myocardium or blood pool) along the line.
+  - `apex_endo_mm`: the same for the endocardial apices (blood pool only); per line only.
+  - `apex_dice`: the Dice of the two views' myocardium within 30 mm of the apex.
+
+  The distances have the resolution of the line points (`--line-step-mm`, averaged over the cardiac phases). When only
+  one view's line reaches the label, the distance is `--hd-miss-mm`, as for the Hausdorff distance.
+
+The pose history (`history.csv`, `history_summary.csv`) also records `lax_dice` and `apex_mm` at every snapshot. A
+view whose long-axis agreement peaks and then falls during the run is being misaligned by the optimizer.
 
 
 ## Running on a SLURM cluster
