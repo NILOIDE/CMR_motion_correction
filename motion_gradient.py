@@ -68,8 +68,14 @@ translation and the rotation about the plane's own normal are optimized (summary
 any crossing pair (SAX only, a single LAX view, ...) nothing is optimized (status not_optimized). Every image present
 is written to the output either way, unaligned ones with their acquired affine.
 
+Optionally (--edge-weight) an edge term is blended into every line's similarity late in the run: the agreement of
+the signed derivatives of both profiles along the line (--edge-metric), which favours narrow, high-contrast edges
+over long stretches of slight variation (see LineSampler.similarity_lines).
+
 With --logging, segmentation consistency (Dice between the two views' labels along the same lines) is
-reported before and after alignment as an independent check; it is not optimized.
+reported before and after alignment as an independent check; it is not optimized. Also over the long-axis
+segmentations only: per view the Dice over its LAX-LAX lines (lax_dice), and on the LAX-LAX lines along the LV long
+axis how far apart the two views' apices are and how well their apical myocardium overlaps (LineSampler.apex_lines).
 
 Outputs go to <out-root>/<run-name>/ (default run name: the start time, then the settings given on the command line,
 so a rerun never writes into an earlier run). Always written:
@@ -85,7 +91,8 @@ Only with --logging (otherwise nothing else is computed or written, which is the
   overall_metrics/
     motion_summary.csv       one row per subject (append-only, latest row per subject wins)
     motion_summary_slices.csv one row per SAX slice / LAX view
-    motion_summary_pairs.csv  one row per intersection-line pair (NCC, NMI, Dice, Hausdorff before/after; with
+    motion_summary_pairs.csv  one row per intersection-line pair (NCC, LNCC, NMI, edge, Dice, Hausdorff and the
+                              apex metrics before/after; with
                               --sax-sax-weight also SAX-SAX rows: NCC -- between modalities --cross-mod-metric --,
                               counting points and axis distance at the end)
     motion_*.png              dataset-level figures (written at the end of a run)
@@ -94,7 +101,8 @@ Only with --logging (otherwise nothing else is computed or written, which is the
       summary.csv, slices.csv, pairs.csv  this subject's rows
       history.csv             pose snapshots every 2% of the run (step 0 = acquired geometry, and the
                               saved "best" pose with is_best=1): per plane the full 3x4 affine (a00..a23, same
-                              convention as the saved images), the pose and NCC/LNCC/NMI/Dice/Hausdorff
+                              convention as the saved images), the pose and NCC/LNCC/NMI/Dice/Hausdorff, the
+                              LAX-LAX-only Dice and the apex distance
       history_summary.csv     the same snapshots, one row per step with the objective and subject-level metrics
       lines.csv               every intersection line entering the loss (acquired geometry): the two planes, the
                               anchor point x0 and unit direction d (world, mm) and the parameter ranges along the
@@ -180,9 +188,14 @@ SUMMARY_COLUMNS = [
     "sax_dz_rms_mm", "sax_rot_inplane_rms_deg", "sax_tilt_rms_deg",
     "lax_shift_mean_mm", "lax_shift_max_mm",
     "ncc_zero_mean", "ncc_mean", "ncc_gain_mean",
+    "lncc_zero_mean", "lncc_mean", "lncc_gain_mean",
     "nmi_zero_mean", "nmi_mean", "nmi_gain_mean",
+    "edge_zero_mean", "edge_mean",
     "seg_dice_zero_mean", "seg_dice_mean",
     "hd_zero_mean_mm", "hd_mean_mm", "hd_zero_max_mm", "hd_max_mm",
+    "lax_dice_zero_mean", "lax_dice_mean",
+    "apex_zero_mean_mm", "apex_mean_mm", "apex_zero_max_mm", "apex_max_mm",
+    "apex_dice_zero_mean", "apex_dice_mean",
     "sax_cross_pairs", "sax_gap_min_mm", "sax_rel_tilt_max_deg", "sax_cross_dissim_max",
     "coplanar_pairs", "coplanar_sim_zero", "coplanar_sim",
     "n_line_pairs", "steps", "seconds", "timestamp",
@@ -190,13 +203,21 @@ SUMMARY_COLUMNS = [
 DETAIL_COLUMNS = [
     "subject_id", "image", "view", "modality", "slice", "n_pairs", "n_points",
     "dx_mm", "dy_mm", "dz_mm", "shift_inplane_mm", "shift_mm", "rot_inplane_deg", "rot_tilt_deg",
-    "ncc_zero", "ncc", "nmi_zero", "nmi", "seg_dice_zero", "seg_dice", "hd_zero_mm", "hd_mm",
+    "ncc_zero", "ncc", "lncc_zero", "lncc", "nmi_zero", "nmi", "seg_dice_zero", "seg_dice", "hd_zero_mm", "hd_mm",
+    "lax_dice_zero", "lax_dice", "apex_zero_mm", "apex_mm", "apex_dice_zero", "apex_dice",
 ]
 PAIR_COLUMNS = [
     "subject_id", "image_a", "slice_a", "image_b", "slice_b", "view_a", "view_b", "kind", "n_points",
-    "ncc_zero", "ncc", "nmi_zero", "nmi", "seg_dice_zero", "seg_dice", "hd_zero_mm", "hd_mm", "axis_dist_mm",
-    "gap_min_mm", "rel_tilt_deg",
+    "ncc_zero", "ncc", "lncc_zero", "lncc", "nmi_zero", "nmi", "edge_zero", "edge",
+    "seg_dice_zero", "seg_dice", "hd_zero_mm", "hd_mm",
+    "apex_zero_mm", "apex_mm", "apex_endo_zero_mm", "apex_endo_mm", "apex_dice_zero", "apex_dice",
+    "axis_dist_mm", "gap_min_mm", "rel_tilt_deg",
 ]
+# LAX-LAX apex metrics (LineSampler.apex_lines): on the lines between two long-axis views that run along the LV long
+# axis, where each view's segmentation ends toward the apex, and how well the apical myocardium overlaps
+APEX_LV_LABEL, APEX_MYO_LABEL = 1, 2     # LV blood pool, LV myocardium (the UKBB LAX labels; atria 4 / 5, see apex_direction)
+APEX_MIN_COS = 0.5        # an apex line runs within 60 deg of the base -> apex direction (the 2Ch / 3Ch / 4Ch lines)
+APEX_WINDOW_MM = 30.0     # apex_dice: the stretch of the line within this distance of the more apical of the two apices
 
 
 @dataclass
@@ -223,6 +244,8 @@ class Plane:
                                          # (end-diastole) only frame 0, its image copied into the others
     view: str = ""                   # the slice's view (SliceImage.view): "SAX", "LAX_4Ch", "ao", ...
     modality: str = ""               # the acquisition it belongs to (SliceImage.modality)
+    apex_dir: np.ndarray | None = None   # the subject's base -> apex unit vector (world; prepare_subject), for the
+                                         # LAX-LAX apex metrics; None if unknown
 
     @property
     def rot_centre(self) -> np.ndarray:
@@ -339,6 +362,15 @@ def apex_direction(sax: list[tuple[np.ndarray, tuple, np.ndarray | None]],
         return None
     d = d / np.linalg.norm(d)
     vote = 0.0
+    for v in lv_atria_vectors(lax):
+        vote += float(v @ d)
+    return -d if vote < 0 else d
+
+
+def lv_atria_vectors(lax: list[tuple[np.ndarray, np.ndarray | None]]) -> list[np.ndarray]:
+    """Per LAX view (affine, segmentation (X, Y, ...) or None) whose segmentation has both: the LV blood pool (label 1)
+    centroid minus the atria (labels 4, 5) centroid (world mm), a vector from the base toward the apex."""
+    out = []
     for A, g in lax:
         if g is None:
             continue
@@ -349,8 +381,23 @@ def apex_direction(sax: list[tuple[np.ndarray, tuple, np.ndarray | None]],
             ij = np.argwhere(m)
             cs.append(None if len(ij) < 20 else (np.asarray(A, float) @ np.r_[ij.mean(0), 0.0, 1.0])[:3])
         if cs[0] is not None and cs[1] is not None:
-            vote += float((cs[0] - cs[1]) @ d)
-    return -d if vote < 0 else d
+            out.append(cs[0] - cs[1])
+    return out
+
+
+def subject_apex_direction(sax: list[tuple[np.ndarray, tuple, np.ndarray | None]],
+                           lax: list[tuple[np.ndarray, np.ndarray | None]] = ()) -> np.ndarray | None:
+    """The base -> apex unit vector (world) for the LAX-LAX apex metrics: the SAX stack axis oriented by anatomy
+    (apex_direction), or without a SAX stack the mean LV-minus-atria vector of the LAX segmentations (lv_atria_vectors;
+    within a few tens of degrees of the long axis, enough to tell which end of a long-axis line is apical). None if
+    neither is available."""
+    d = apex_direction(sax, lax)
+    if d is not None:
+        return d
+    vecs = lv_atria_vectors(lax)
+    v = np.sum(vecs, 0) if vecs else np.zeros(3)
+    n = float(np.linalg.norm(v))
+    return v / n if n > 1e-6 else None
 
 
 def _shift2d(a: np.ndarray, di: int, dj: int) -> np.ndarray:
@@ -439,8 +486,10 @@ def prepare_subject(subject: Subject, args) -> dict:
     extend = getattr(args, "apex_extend_mm", 0.0)
     sax_images = [e["image"] for e in out["sax"]]
     main_sax = max(dict.fromkeys(sax_images), key=sax_images.count) if sax_images else None   # the largest SAX stack
-    apex = (apex_direction([(e["affine"], e["arr"].shape[:2], e["seg"]) for e in out["sax"] if e["image"] == main_sax],
-                           [(s.affine, s.seg) for s in subject.slices if s.view != "SAX"]) if extend > 0 else None)
+    sax_axis = [(e["affine"], e["arr"].shape[:2], e["seg"]) for e in out["sax"] if e["image"] == main_sax]
+    lax_segs = [(s.affine, s.seg) for s in subject.slices if s.view != "SAX"]
+    apex = apex_direction(sax_axis, lax_segs) if extend > 0 else None      # the apical sweep (needs a SAX stack)
+    out["apex_dir"] = subject_apex_direction(sax_axis, lax_segs)          # the LAX-LAX apex metrics
     for image in out["order"]:
         sl = sorted((s for s in subject.slices if s.image == image), key=lambda s: s.index)
         if sl[0].view == "SAX":
@@ -512,6 +561,8 @@ def build_planes(data: dict, args, device, with_seg: bool = True) -> tuple[list[
                                   modality=d.get("modality", ""))
     # programmatic callers without the option (older runs' configs) keep the image-centre rotation they were made with
     set_rotation_pivots(sax_planes, lax_planes, getattr(args, "rotation_pivot", "image-centre"))
+    for p in sax_planes + lax_planes:
+        p.apex_dir = data.get("apex_dir")
     return sax_planes, lax_planes
 
 
@@ -853,6 +904,24 @@ def cross_mod_metric(args) -> str:
     return getattr(args, "cross_mod_metric", None) or args.metric
 
 
+def apex_line_sign(a: Plane, b: Plane) -> float:
+    """Whether the a/b intersection line gets the LAX-LAX apex metrics (LineSampler.apex_lines), and which way it runs:
+    +1 / -1 if both are long-axis views (neither SAX nor aortic), the subject's base -> apex direction is known
+    (Plane.apex_dir) and the line runs within 60 deg of it (APEX_MIN_COS) -- the 2Ch / 3Ch / 4Ch lines, which contain
+    the LV long axis -- with its direction (cross(n_a, n_b), along which the line positions T grow) pointing toward
+    (+1) or away from (-1) the apex; 0 otherwise. From the acquired geometry (the poses rotate the line by a few
+    degrees at most)."""
+    ap = getattr(a, "apex_dir", None)
+    if ap is None or "SAX" in (a.view, b.view) or is_aorta(a.view) or is_aorta(b.view):
+        return 0.0
+    d = np.cross(a.normal, b.normal)
+    n = float(np.linalg.norm(d))
+    if n < 1e-3:
+        return 0.0
+    c = float(d @ ap) / n
+    return math.copysign(1.0, c) if abs(c) >= APEX_MIN_COS else 0.0
+
+
 class ImageVolume:
     """All planes' images in one zero-padded volume (1, F, D, Hmax, Wmax), plane p at depth p, stored once per subject
     in the sampling precision (--sample-dtype) and shared by its samplers.
@@ -993,6 +1062,9 @@ class LineSampler:
                       if self.K > 1 else torch.zeros(1, device=device))
         self.u_seg, self.w_seg = torch.zeros(1, device=device), torch.ones(1, device=device)
         self.psf_scale = torch.ones((), device=device)
+        # weight of the late edge term in the optimized similarity (--edge-weight; set every step by align, a device
+        # scalar so CUDA graphs see updates; 0 = the --metric alone)
+        self.edge_alpha = torch.zeros((), device=device)
 
         Lmax = max(l.t.numel() for _, _, l in lines)
         self.Lmax = Lmax
@@ -1009,6 +1081,7 @@ class LineSampler:
         self.IB = torch.tensor([ib for _, ib, _ in lines], device=device)
         self.npts = torch.tensor([l.n_points for _, _, l in lines], device=device)
         self.lax_lax = torch.tensor([planes[ia].view != "SAX" and planes[ib].view != "SAX" for ia, ib, _ in lines], device=device)
+        self.apex_sign = torch.tensor([apex_line_sign(planes[ia], planes[ib]) for ia, ib, _ in lines], device=device)
         # lines between slices of different modalities: scored with --cross-mod-metric (similarity_lines)
         self.cross_mod = torch.tensor([planes[ia].modality != planes[ib].modality for ia, ib, _ in lines], device=device)
         self.any_cross = bool(self.cross_mod.any())
@@ -1090,6 +1163,10 @@ class LineSampler:
     def set_psf_scale(self, scale: float) -> None:
         """Width of the PSF band relative to the nominal slice profile (1 = physical)."""
         self.psf_scale.fill_(scale)
+
+    def set_edge_weight(self, alpha: float) -> None:
+        """Weight of the edge term (--edge-metric) in the optimized similarity of every line (see similarity_lines)."""
+        self.edge_alpha.fill_(alpha)
 
     def band_weights(self) -> torch.Tensor:
         """PSF weights of the band samples at the current scale (sum to 1)."""
@@ -1195,7 +1272,9 @@ class LineSampler:
     def similarity_lines(self, theta_deg, t, args, prof=None, W=None, sel=None) -> torch.Tensor:
         """The optimized similarity per line (--metric), with the loss weights W_loss (points outside the mask
         down-weighted by --outside-mask-weight) or the given W (e.g. self.W: the mask points only) -> (M,).
-        sel: only the lines with these indices are sampled and scored -> (len(sel),)."""
+        sel: only the lines with these indices are sampled and scored -> (len(sel),).
+        With --edge-weight > 0 the similarity of lines within a modality is (1 - a) x --metric + a x --edge-metric, a =
+        edge_alpha (ramped up late in the run by align); lines between modalities keep --cross-mod-metric."""
         W = self.W_loss if W is None else W
         fw = self.fw(sel)                                                  # the frames both slices of a line have
         if sel is not None:
@@ -1204,6 +1283,9 @@ class LineSampler:
         a, b = prof if prof is not None else self.profiles(theta_deg, t, "img")
         step = args.line_step_mm * self.point_stride                      # (coarse samplers: sparser points)
         out = metric_rows(args.metric, a, b, W, args, fw, step)
+        if getattr(args, "edge_weight", 0.0) > 0:                        # late edge term: blended in by edge_alpha
+            edge = metric_rows(args.edge_metric, a, b, W, args, fw, step)
+            out = out + self.edge_alpha * (edge - out)
         cross = cross_mod_metric(args)
         if self.any_cross and cross != args.metric:                       # lines between modalities: --cross-mod-metric
             cm = self.cross_mod if sel is None else self.cross_mod[sel]
@@ -1256,6 +1338,61 @@ class LineSampler:
         out = (worst.clamp_min(0) * ok).sum(1) / ok.sum(1).clamp_min(1)
         return torch.where(ok.any(1), out, torch.full_like(out, float("nan")))
 
+    def apex_lines(self, theta_deg, t, miss_mm: float = 100.0, prof=None) -> dict:
+        """The LAX-LAX apex metrics of every line -> {name: (M,)}; NaN on the lines that are not apex lines
+        (apex_line_sign 0: SAX-LAX lines, aortic slices, LAX-LAX lines across the long axis) and where nothing is
+        counted. Along an apex line, a view's apex is its most apical line point (in the mask) that its segmentation
+        labels as LV:
+          apex       LV myocardium or blood pool (APEX_MYO_LABEL / APEX_LV_LABEL): the epicardial apex
+          apex_endo  LV blood pool only: the endocardial apex
+        Each: |apex of view a - apex of view b| along the line (mm), per frame; a frame counts when both
+        segmentations contain the labels in it and at least one profile hits them (miss_mm when only one does, as for
+        the Hausdorff distance); mean over the counted frames.
+          apex_dice  Dice of the two views' LV myocardium over the line points within APEX_WINDOW_MM of the more
+                     apical of the two (epicardial) apices -- the apical cap; a frame counts when both segmentations
+                     contain myocardium in it and either profile has some in the window; mean over the counted frames.
+        """
+        a, b = prof if prof is not None else self.profiles(theta_deg, t, "seg")
+        line_ok = (self.apex_sign != 0)[:, None]                               # (M, 1)
+        valid_pt = (self.W > 0)[:, None, :]                                    # (M, 1, L)
+        pos = (self.apex_sign[:, None] * self.T)[:, None, :]                   # (M, 1, L) mm toward the apex
+        pres_a, pres_b = self.label_present[self.IA], self.label_present[self.IB]      # (M, F, K)
+        neg_inf = torch.tensor(-float("inf"), device=self.device)
+
+        def present(pres, labs):                       # (M, F): the segmentation contains any of labs in that frame
+            labs = [lab for lab in labs if lab < pres.shape[-1]]
+            if not labs:
+                return torch.zeros(pres.shape[:2], dtype=torch.bool, device=self.device)
+            return pres[..., labs].any(-1)
+
+        def tip(seg, labs):                            # (M, F) x 2: the most apical hit, and whether there is one
+            hit = torch.zeros_like(seg, dtype=torch.bool)
+            for lab in labs:
+                hit |= seg == lab
+            hit &= valid_pt
+            return torch.where(hit, pos, neg_inf).amax(-1), hit.any(-1)
+
+        def counted_mean(v, counted):                  # (M, F) -> (M,): mean over the counted frames, NaN if none
+            n = counted.sum(1)
+            out = torch.where(counted, v, torch.zeros_like(v)).sum(1) / n.clamp_min(1)
+            return torch.where(n > 0, out, torch.full_like(out, float("nan")))
+
+        out, tips = {}, {}
+        for name, labs in (("apex", (APEX_LV_LABEL, APEX_MYO_LABEL)), ("apex_endo", (APEX_LV_LABEL,))):
+            (ta, ha), (tb, hb) = tip(a, labs), tip(b, labs)
+            tips[name] = (ta, tb)
+            counted = line_ok & present(pres_a, labs) & present(pres_b, labs) & (ha | hb)
+            dist = torch.where(ha & hb, (ta - tb).abs(), torch.full_like(ta, miss_mm))
+            out[name] = counted_mean(dist, counted)
+        top = torch.maximum(*tips["apex"])                                     # (M, F); -inf where neither hits
+        win = valid_pt & (pos >= (top - APEX_WINDOW_MM)[..., None])           # (M, F, L)
+        ma, mb = (a == APEX_MYO_LABEL) & win, (b == APEX_MYO_LABEL) & win
+        counted = (line_ok & present(pres_a, (APEX_MYO_LABEL,)) & present(pres_b, (APEX_MYO_LABEL,))
+                   & (ma.any(-1) | mb.any(-1)))
+        dice = 2 * (ma & mb).sum(-1).float() / (ma.sum(-1) + mb.sum(-1)).clamp_min(1).float()
+        out["apex_dice"] = counted_mean(dice, counted)
+        return out
+
     def per_plane(self, values: torch.Tensor) -> list[float]:
         """Line values (M,) -> npts-weighted mean per plane, ignoring NaN (one host transfer). Summed on the host in
         float64: a GPU index_add rounds differently from run to run (the reported metrics would vary in the last
@@ -1269,6 +1406,16 @@ class LineSampler:
         num = torch.bincount(ia, v, self.N) + torch.bincount(ib, v, self.N)
         den = torch.bincount(ia, w, self.N) + torch.bincount(ib, w, self.N)
         return torch.where(den > 0, num / den.clamp_min(1e-12), torch.full_like(num, float("nan"))).tolist()
+
+    def plane_values(self, lm: dict) -> dict:
+        """Per-plane values (lists of N) of the per-line metrics lm (evaluate): the npts-weighted mean over each
+        plane's lines (per_plane), for the Hausdorff distance the worst line (per_plane_max); lax_dice: the Dice over
+        the plane's LAX-LAX lines only (the long-axis segmentations are more reliable than the basal / apical SAX ones;
+        NaN for a SAX slice); apex / apex_dice: over the plane's apex lines (apex_lines; NaN elsewhere)."""
+        out = {k: self.per_plane(lm[k]) for k in ("ncc", "lncc", "nmi", "dice", "apex", "apex_dice")}
+        out["hd"] = self.per_plane_max(lm["hd"])
+        out["lax_dice"] = self.per_plane(torch.where(self.lax_lax, lm["dice"], torch.full_like(lm["dice"], float("nan"))))
+        return out
 
     def per_plane_max(self, values: torch.Tensor) -> list[float]:
         """Line values (M,) -> worst (largest) value per plane, ignoring NaN (one host transfer)."""
@@ -1288,11 +1435,15 @@ class LineSampler:
         seg = self.profiles(theta_deg, t, "seg") if has_seg else None
         k_lncc = max(3, int(round(getattr(args, "lncc_window_mm", 20.0) / args.line_step_mm)))
         fw = self.fw()
+        miss = getattr(args, "hd_miss_mm", 100.0)
         out = dict(ncc=self.ncc_lines(theta_deg, t, args.metric == "ncc_grad", img, fw=fw),
                    lncc=lncc_similarity(img[0], img[1], self.W, k_lncc, getattr(args, "lncc_min_std", 0.25), fw),
                    nmi=self.nmi_lines(theta_deg, t, args.nmi_bins, args.nmi_sigma, img, fw=fw),
+                   edge=metric_rows(getattr(args, "edge_metric", "ncc_grad"), img[0], img[1], self.W, args, fw),
                    dice=self.dice_lines(theta_deg, t, labels, labels_sax, seg) if has_seg else nan,
-                   hd=self.hd_lines(theta_deg, t, labels, labels_sax, getattr(args, "hd_miss_mm", 100.0), seg) if has_seg else nan)
+                   hd=self.hd_lines(theta_deg, t, labels, labels_sax, miss, seg) if has_seg else nan)
+        out.update(self.apex_lines(theta_deg, t, miss, seg) if has_seg
+                   else dict(apex=nan, apex_endo=nan, apex_dice=nan))
         return {k: v.float() for k, v in out.items()}
 
 
@@ -2324,9 +2475,21 @@ def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]
     blur_quantum = 0.2                                     # mm; the blur is only recomputed when sigma moves this much
     psf_s0 = getattr(args, "psf_scale_start", 1.0)
     psf_steps = int(round(getattr(args, "psf_anneal_frac", 0.6) * args.steps)) if psf_s0 > 1.0 else 0
+    # late edge term (--edge-weight): its weight in the per-line similarity ramps linearly from 0 at --edge-start-frac
+    # to --edge-weight over --edge-ramp-frac of the run (LineSampler.similarity_lines), then stays
+    edge_w = getattr(args, "edge_weight", 0.0)
+    edge_start = int(round(getattr(args, "edge_start_frac", 0.8) * args.steps))
+    edge_ramp = int(round(getattr(args, "edge_ramp_frac", 0.1) * args.steps))
+    edge_steps = edge_start + edge_ramp if edge_w > 0 else 0             # the edge weight is final from here on
+
+    def edge_at(step):
+        if edge_w <= 0 or step < edge_start:
+            return 0.0
+        return edge_w * min(1.0, (step - edge_start + 1) / edge_ramp) if edge_ramp > 0 else edge_w
+
     # from here on a subject's objective is the nominal one (its own mask annealing may end earlier, or not exist)
     ends = list(anneal_ends) if batched and anneal_ends is not None else [anneal_end] * G
-    track_from = [max(e, blur_steps, psf_steps, coarse_steps) for e in ends]
+    track_from = [max(e, blur_steps, psf_steps, coarse_steps, edge_steps) for e in ends]
 
     # device-side bookkeeping: best pose so far, per subject (no host sync per step)
     best_obj = torch.full((G,), -float("inf"), **f32)
@@ -2481,6 +2644,7 @@ def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]
     every = getattr(args, "history_every", 0.0)
     snap_steps = sorted({int(round(k * every * args.steps)) for k in range(int(round(1 / every)) + 1)}) if every > 0 else []
     snapshots = []
+    edge_cur = None                                      # the edge weight the samplers hold (set on the first step)
     with torch.enable_grad(), step_progress_bar(args) as bar:
         for step in range(args.steps):
             if step in snap_steps:
@@ -2491,6 +2655,10 @@ def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]
                      else blur_end)
             smp.set_blur(math.ceil(sigma / blur_quantum) * blur_quantum if sigma > 0 else 0.0)
             smp.set_psf_scale(psf_s0 + (1.0 - psf_s0) * step / psf_steps if step < psf_steps else 1.0)
+            if edge_at(step) != edge_cur:            # on every sampler: the best pose is scored on final_sampler
+                edge_cur = edge_at(step)
+                for s in all_samplers:
+                    s.set_edge_weight(edge_cur)
             lr_t.fill_(lr_at(step, args.lr, LR_END_FRACTION * args.lr if args.lr_end is None else args.lr_end))
             lr_r.fill_(lr_at(step, args.rot_lr,
                              LR_END_FRACTION * args.rot_lr if args.rot_lr_end is None else args.rot_lr_end))
@@ -2524,6 +2692,7 @@ def align(final_sampler: LineSampler, args, stages: list[tuple[int, LineSampler]
     for smp in all_samplers:
         smp.set_blur(0.0)
         smp.set_psf_scale(1.0)
+        smp.set_edge_weight(0.0)                 # the reported similarity is --metric alone (the edge term: 'edge')
     skipped = [int(x) for x in n_skipped.tolist()]
     steps_found = [int(x) for x in best_step.tolist()]
     if not batched:
@@ -2552,10 +2721,11 @@ def base_affine(data: dict, plane: Plane) -> np.ndarray:
 AFFINE_COLUMNS = [f"a{r}{c}" for r in range(3) for c in range(4)]
 HISTORY_COLUMNS = (["subject_id", "step", "fraction", "is_best", "image", "slice"] + AFFINE_COLUMNS
                    + ["dx_mm", "dy_mm", "dz_mm", "rot_x_deg", "rot_y_deg", "rot_z_deg", "rot_inplane_deg", "rot_tilt_deg",
-                      "ncc", "lncc", "nmi", "seg_dice", "hd_mm"])
+                      "ncc", "lncc", "nmi", "seg_dice", "hd_mm", "lax_dice", "apex_mm"])
 HISTORY_STEP_COLUMNS = ["subject_id", "step", "fraction", "is_best", "objective", "ncc_mean", "lncc_mean", "nmi_mean",
                         "seg_dice_mean",
-                        "hd_mean_mm", "hd_max_mm", "sax_shift_rms_mm", "sax_shift_jitter_mm", "sax_dz_rms_mm", "sax_tilt_rms_deg"]
+                        "hd_mean_mm", "hd_max_mm", "lax_dice_mean", "apex_mean_mm",
+                        "sax_shift_rms_mm", "sax_shift_jitter_mm", "sax_dz_rms_mm", "sax_tilt_rms_deg"]
 SAX_LINE_COLUMNS = ["subject_id", "step", "fraction", "is_best", "image_a", "slice_a", "image_b", "slice_b", "kind",
                     "crossing", "n_points", "supervised", "axis_dist_mm", "ncc", "dissim", "gap_min_mm", "rel_tilt_deg",
                     "crossing_in_heart", "x0_x", "x0_y", "x0_z", "d_x", "d_y", "d_z",
@@ -2599,8 +2769,7 @@ def build_history(sid, data, planes, n_pairs, sampler, snapshots, best_step, lax
                    else lm["nmi"] if args.metric == "nmi" else lm["ncc"] if args.metric == "ncc"
                    else lm["lncc"] if args.metric == "lncc" else sampler.similarity_lines(th, tt, args, W=sampler.W))
             objective = float(similarity_objective(sampler, th, tt, args, sim=sim))
-        per = {k: (sampler.per_plane_max if k == "hd" else sampler.per_plane)(lm[k])
-               for k in ("ncc", "lncc", "nmi", "dice", "hd")}
+        per = sampler.plane_values(lm)
         theta = th.detach().cpu().numpy().astype(np.float64)
         t_rel = relative_translation(tt, lax_rows)
         Rs = rotation_matrices(theta)
@@ -2619,16 +2788,22 @@ def build_history(sid, data, planes, n_pairs, sampler, snapshots, best_step, lax
                                    rot_z_deg=float(theta[i, 2]), rot_inplane_deg=inplane, rot_tilt_deg=tilt,
                                    ncc=per["ncc"][i] if n_pairs[i] else nan, lncc=per["lncc"][i] if n_pairs[i] else nan,
                                    nmi=per["nmi"][i] if n_pairs[i] else nan,
-                                   seg_dice=per["dice"][i] if n_pairs[i] else nan, hd_mm=per["hd"][i] if n_pairs[i] else nan))
+                                   seg_dice=per["dice"][i] if n_pairs[i] else nan, hd_mm=per["hd"][i] if n_pairs[i] else nan,
+                                   lax_dice=per["lax_dice"][i] if n_pairs[i] else nan,
+                                   apex_mm=per["apex"][i] if n_pairs[i] else nan))
         vec = np.array(sax_vec).reshape(-1, 2)
         ok = lambda x: np.asarray(x, dtype=float)[np.isfinite(np.asarray(x, dtype=float))]  # noqa: E731
         hd_lines = ok(lm["hd"].cpu().numpy())
+        lax_dice_lines = ok(lm["dice"][sampler.lax_lax].cpu().numpy())
+        apex_lines = ok(lm["apex"].cpu().numpy())
         step_rows.append(dict(
             subject_id=sid, step=step_no, fraction=step_no / args.steps, is_best=int(is_best), objective=objective,
             ncc_mean=float(np.nanmean(per["ncc"])), lncc_mean=float(np.nanmean(per["lncc"])),
             nmi_mean=float(np.nanmean(per["nmi"])),
             seg_dice_mean=float(np.nanmean(per["dice"])) if np.isfinite(per["dice"]).any() else nan,
             hd_mean_mm=float(hd_lines.mean()) if hd_lines.size else nan, hd_max_mm=float(hd_lines.max()) if hd_lines.size else nan,
+            lax_dice_mean=float(lax_dice_lines.mean()) if lax_dice_lines.size else nan,
+            apex_mean_mm=float(apex_lines.mean()) if apex_lines.size else nan,
             sax_shift_rms_mm=float(np.sqrt((vec ** 2).sum(1).mean())) if len(vec) else nan,
             sax_shift_jitter_mm=float(np.sqrt(((vec - vec.mean(0)) ** 2).sum(1).mean())) if len(vec) else nan,
             sax_dz_rms_mm=float(np.sqrt(np.mean(np.square(sax_dz)))) if sax_dz else nan,
@@ -2856,7 +3031,7 @@ def finish_alignment(ctx: dict, result: dict | None, args, device) -> tuple:
                         n_pairs=n_pairs[i]) for i, p in enumerate(planes)]
         return None, details, [], [(p, Rs[i], t_rel[i]) for i, p in enumerate(planes)], None
 
-    metric_names = ("ncc", "nmi", "dice", "hd")
+    metric_names = ("ncc", "lncc", "nmi", "dice", "hd", "lax_dice", "apex", "apex_dice")     # (LineSampler.plane_values)
     plane_m = {f"{k}_{s}": [nan] * N for k in metric_names for s in ("zero", "final")}
     pairs = []
     sax_qc = dict(sax_cross_pairs=nan, sax_gap_min_mm=nan, sax_rel_tilt_max_deg=nan, sax_cross_dissim_max=nan)
@@ -2875,9 +3050,9 @@ def finish_alignment(ctx: dict, result: dict | None, args, device) -> tuple:
         line_final = (lmet["final"] if lmet
                       else sampler.evaluate(result["theta_deg"], result["t"], args, labels, labels_sax, has_seg))
         for stage, lm in (("zero", line_zero), ("final", line_final)):
+            pv = sampler.plane_values(lm)
             for k in metric_names:
-                agg = sampler.per_plane_max if k == "hd" else sampler.per_plane      # Hausdorff: worst line per plane
-                plane_m[f"{k}_{stage}"] = agg(lm[k])
+                plane_m[f"{k}_{stage}"] = pv[k]
         lz = {k: v.cpu().numpy() for k, v in line_zero.items()}
         lf = {k: v.cpu().numpy() for k, v in line_final.items()}
         for m, (ia, ib, line) in enumerate(lines):
@@ -2885,10 +3060,15 @@ def finish_alignment(ctx: dict, result: dict | None, args, device) -> tuple:
             pairs.append(dict(subject_id=sid, image_a=pa.image, slice_a=pa.slice_idx, image_b=pb.image, slice_b=pb.slice_idx,
                               view_a=pa.view, view_b=pb.view,
                               kind="LAX-LAX" if pa.view != "SAX" and pb.view != "SAX" else "SAX-LAX", n_points=int(line.n_points),
-                              ncc_zero=float(lz["ncc"][m]), ncc=float(lf["ncc"][m]), nmi_zero=float(lz["nmi"][m]), nmi=float(lf["nmi"][m]),
+                              ncc_zero=float(lz["ncc"][m]), ncc=float(lf["ncc"][m]), lncc_zero=float(lz["lncc"][m]),
+                              lncc=float(lf["lncc"][m]), nmi_zero=float(lz["nmi"][m]), nmi=float(lf["nmi"][m]),
+                              edge_zero=float(lz["edge"][m]), edge=float(lf["edge"][m]),
                               seg_dice_zero=float(lz["dice"][m]), seg_dice=float(lf["dice"][m]),
-                              hd_zero_mm=float(lz["hd"][m]), hd_mm=float(lf["hd"][m]), axis_dist_mm=nan,
-                              gap_min_mm=nan, rel_tilt_deg=nan))
+                              hd_zero_mm=float(lz["hd"][m]), hd_mm=float(lf["hd"][m]),
+                              apex_zero_mm=float(lz["apex"][m]), apex_mm=float(lf["apex"][m]),
+                              apex_endo_zero_mm=float(lz["apex_endo"][m]), apex_endo_mm=float(lf["apex_endo"][m]),
+                              apex_dice_zero=float(lz["apex_dice"][m]), apex_dice=float(lf["apex_dice"][m]),
+                              axis_dist_mm=nan, gap_min_mm=nan, rel_tilt_deg=nan))
         if sampler.sax_pairs is not None:                  # neighbouring SAX slices: crossing line, gap, relative tilt
             sp = sampler.sax_pairs
             with torch.no_grad():
@@ -2904,7 +3084,9 @@ def finish_alignment(ctx: dict, result: dict | None, args, device) -> tuple:
                                   kind=sp.kinds[k], n_points=round(float(nf[k]), 2), ncc_zero=float(cz[k]) if nz[k] > 1e-3 else nan,
                                   ncc=float(cf[k]) if nf[k] > 1e-3 else nan, nmi_zero=nan, nmi=nan, seg_dice_zero=nan, seg_dice=nan,
                                   hd_zero_mm=nan, hd_mm=nan, axis_dist_mm=float(df[k]),
-                                  gap_min_mm=float(gap_min[k]), rel_tilt_deg=float(tilt[k])))
+                                  gap_min_mm=float(gap_min[k]), rel_tilt_deg=float(tilt[k]),
+                                  **dict.fromkeys(("lncc_zero", "lncc", "edge_zero", "edge", "apex_zero_mm", "apex_mm",
+                                                   "apex_endo_zero_mm", "apex_endo_mm", "apex_dice_zero", "apex_dice"), nan)))
             crossing = gap_min < 0
             dissim = 1.0 - cf[crossing & (nf > 1e-3) & ~sp.cross.cpu().numpy()]     # NCC: within a modality
             sax_qc = dict(sax_cross_pairs=int(crossing.sum()), sax_gap_min_mm=float(gap_min.min()) if gap_min.size else nan,
@@ -2931,8 +3113,9 @@ def finish_alignment(ctx: dict, result: dict | None, args, device) -> tuple:
         row = dict(subject_id=sid, image=p.image, view=p.view, modality=p.modality, slice=p.slice_idx,
                    n_pairs=n_pairs[i], n_points=int(n_points[i]),
                    dx_mm=nan, dy_mm=nan, dz_mm=nan, shift_inplane_mm=nan, shift_mm=nan, rot_inplane_deg=nan,
-                   rot_tilt_deg=nan, ncc_zero=nan, ncc=nan, nmi_zero=nan, nmi=nan, seg_dice_zero=nan, seg_dice=nan,
-                   hd_zero_mm=nan, hd_mm=nan)
+                   rot_tilt_deg=nan, ncc_zero=nan, ncc=nan, lncc_zero=nan, lncc=nan, nmi_zero=nan, nmi=nan,
+                   seg_dice_zero=nan, seg_dice=nan, hd_zero_mm=nan, hd_mm=nan, lax_dice_zero=nan, lax_dice=nan,
+                   apex_zero_mm=nan, apex_mm=nan, apex_dice_zero=nan, apex_dice=nan)
         if n_pairs[i] > 0:
             tv, th = t_rel[i], theta[i]
             dx, dy, dz = float(tv @ p.u_hat), float(tv @ p.v_hat), float(tv @ p.normal)
@@ -2940,9 +3123,13 @@ def finish_alignment(ctx: dict, result: dict | None, args, device) -> tuple:
             row.update(dx_mm=dx, dy_mm=dy, dz_mm=dz, shift_inplane_mm=math.hypot(dx, dy), shift_mm=float(np.linalg.norm(tv)),
                        rot_inplane_deg=inplane, rot_tilt_deg=float(np.linalg.norm(th - inplane * p.normal)),
                        ncc_zero=plane_m["ncc_zero"][i], ncc=plane_m["ncc_final"][i],
+                       lncc_zero=plane_m["lncc_zero"][i], lncc=plane_m["lncc_final"][i],
                        nmi_zero=plane_m["nmi_zero"][i], nmi=plane_m["nmi_final"][i],
                        seg_dice_zero=plane_m["dice_zero"][i], seg_dice=plane_m["dice_final"][i],
-                       hd_zero_mm=plane_m["hd_zero"][i], hd_mm=plane_m["hd_final"][i])
+                       hd_zero_mm=plane_m["hd_zero"][i], hd_mm=plane_m["hd_final"][i],
+                       lax_dice_zero=plane_m["lax_dice_zero"][i], lax_dice=plane_m["lax_dice_final"][i],
+                       apex_zero_mm=plane_m["apex_zero"][i], apex_mm=plane_m["apex_final"][i],
+                       apex_dice_zero=plane_m["apex_dice_zero"][i], apex_dice=plane_m["apex_dice_final"][i])
         details.append(row)
 
     def arr(rows, fn):
@@ -2962,7 +3149,10 @@ def finish_alignment(ctx: dict, result: dict | None, args, device) -> tuple:
     mag = np.hypot(vec[:, 0], vec[:, 1])
     jit = np.hypot(*(vec - vec.mean(0)).T) if len(vec) else np.array([])
     nz, nf_ = arr(ok_rows, lambda d: d["ncc_zero"]), arr(ok_rows, lambda d: d["ncc"])
+    lz_, lf_ = arr(ok_rows, lambda d: d["lncc_zero"]), arr(ok_rows, lambda d: d["lncc"])
     mz, mf = arr(ok_rows, lambda d: d["nmi_zero"]), arr(ok_rows, lambda d: d["nmi"])
+    line_rows = [d for d in pairs if d["kind"] not in NEIGHBOUR_KINDS]       # the SAX-LAX / LAX-LAX lines
+    laxlax = [d for d in line_rows if d["kind"] == "LAX-LAX"]
 
     summary = dict(
         subject_id=sid, status="ok" if lines else "not_optimized", pose_model=model,
@@ -2975,12 +3165,24 @@ def finish_alignment(ctx: dict, result: dict | None, args, device) -> tuple:
         lax_shift_mean_mm=stat(np.mean, arr(lax_rows, lambda d: d["shift_inplane_mm"])),
         lax_shift_max_mm=stat(np.max, arr(lax_rows, lambda d: d["shift_inplane_mm"])),
         ncc_zero_mean=stat(np.mean, nz), ncc_mean=stat(np.mean, nf_), ncc_gain_mean=stat(np.mean, nf_ - nz),
+        lncc_zero_mean=stat(np.mean, lz_), lncc_mean=stat(np.mean, lf_), lncc_gain_mean=stat(np.mean, lf_ - lz_),
         nmi_zero_mean=stat(np.mean, mz), nmi_mean=stat(np.mean, mf), nmi_gain_mean=stat(np.mean, mf - mz),
+        edge_zero_mean=stat(np.mean, arr(line_rows, lambda d: d["edge_zero"])),          # (mean over the lines)
+        edge_mean=stat(np.mean, arr(line_rows, lambda d: d["edge"])),
         seg_dice_zero_mean=stat(np.mean, arr(ok_rows, lambda d: d["seg_dice_zero"])),
         seg_dice_mean=stat(np.mean, arr(ok_rows, lambda d: d["seg_dice"])),
         hd_zero_mean_mm=stat(np.mean, arr(pairs, lambda d: d["hd_zero_mm"])), hd_mean_mm=stat(np.mean, arr(pairs, lambda d: d["hd_mm"])),
         hd_zero_max_mm=stat(np.max, arr(pairs, lambda d: d["hd_zero_mm"])), hd_max_mm=stat(np.max, arr(pairs, lambda d: d["hd_mm"])),
-        **sax_qc, **cop_qc, n_line_pairs=sum(d["kind"] not in NEIGHBOUR_KINDS for d in pairs),
+        # the long-axis segmentations only: Dice over the LAX-LAX lines, apex metrics over the apex lines
+        lax_dice_zero_mean=stat(np.mean, arr(laxlax, lambda d: d["seg_dice_zero"])),
+        lax_dice_mean=stat(np.mean, arr(laxlax, lambda d: d["seg_dice"])),
+        apex_zero_mean_mm=stat(np.mean, arr(line_rows, lambda d: d["apex_zero_mm"])),
+        apex_mean_mm=stat(np.mean, arr(line_rows, lambda d: d["apex_mm"])),
+        apex_zero_max_mm=stat(np.max, arr(line_rows, lambda d: d["apex_zero_mm"])),
+        apex_max_mm=stat(np.max, arr(line_rows, lambda d: d["apex_mm"])),
+        apex_dice_zero_mean=stat(np.mean, arr(line_rows, lambda d: d["apex_dice_zero"])),
+        apex_dice_mean=stat(np.mean, arr(line_rows, lambda d: d["apex_dice"])),
+        **sax_qc, **cop_qc, n_line_pairs=len(line_rows),
         steps=args.steps if lines else 0,
     )
     return summary, details, pairs, poses, history
@@ -4056,6 +4258,26 @@ def build_parser(description: str) -> argparse.ArgumentParser:
     ap.add_argument("--grad-eps", type=float, default=0.5,
                     help="--metric ngf: edge threshold, in standard deviations of the profile's gradient along the line; "
                          "gradients well above it count as full edges, those below it fade out. Default: %(default)s")
+    ap.add_argument("--edge-weight", type=float, default=0.0,
+                    help="Late edge term (0 = off): toward the end of the run, the similarity of each line within a "
+                         "modality becomes (1 - w) x --metric + w x --edge-metric, w ramping from 0 to this value (0-1) "
+                         "over --edge-ramp-frac of the run from --edge-start-frac. The edge metrics compare the signed "
+                         "derivatives of both profiles along their shared line (the same 3D directional derivative in "
+                         "both views), so narrow, high-contrast edges such as the myocardial borders count more than "
+                         "long stretches with slight variation, which --metric lncc weighs about equally. Their capture "
+                         "range is about the blur width, hence late. Lines between modalities keep --cross-mod-metric. "
+                         "The best pose is tracked once the ramp is over. Default: %(default)s")
+    ap.add_argument("--edge-metric", choices=["ncc_grad", "ngf"], default="ncc_grad",
+                    help="The edge term of --edge-weight (also reported as 'edge' with --logging). ncc_grad: NCC of the "
+                         "profiles' 1D gradients along the line, weighted by edge strength (strong edges dominate). ngf: "
+                         "normalized gradient agreement (every edge above --grad-eps counts about equally). "
+                         "Default: %(default)s")
+    ap.add_argument("--edge-start-frac", type=float, default=0.8,
+                    help="--edge-weight: fraction of the run at which the edge term starts ramping up (by default when "
+                         "the blur and the mask dilation have reached their final values). Default: %(default)s")
+    ap.add_argument("--edge-ramp-frac", type=float, default=0.1,
+                    help="--edge-weight: fraction of the run over which its weight ramps up linearly (0 = at once). "
+                         "Default: %(default)s")
     ap.add_argument("--nmi-bins", type=int, default=24, help="Histogram bins for mutual information")
     ap.add_argument("--nmi-sigma", type=float, default=1.0, help="Parzen window width for mutual information, in bins")
 
@@ -4345,6 +4567,11 @@ def run(ap: argparse.ArgumentParser, args, load, save, is_complete) -> tuple[Pat
     """
     if args.no_psf:                          # one band sample at offset 0 with weight 1 = the raw line intensities
         args.n_band, args.psf_scale_start = 1, 1.0
+    if not 0.0 <= args.edge_weight <= 1.0:
+        sys.exit(f"--edge-weight must lie in [0, 1] (got {args.edge_weight})")
+    if args.edge_weight > 0 and (args.edge_ramp_frac < 0 or args.edge_start_frac + args.edge_ramp_frac > 1.0 + 1e-9):
+        sys.exit("--edge-start-frac + --edge-ramp-frac must not exceed 1 (the edge term must reach its weight within "
+                 "the run, or no pose is tracked after it)")
     lr0, rot_lr0 = DEFAULT_LR[args.optimizer]
     args.lr = lr0 if args.lr is None else args.lr
     args.rot_lr = rot_lr0 if args.rot_lr is None else args.rot_lr
