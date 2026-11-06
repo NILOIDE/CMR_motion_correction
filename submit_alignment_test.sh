@@ -5,7 +5,7 @@
 #SBATCH --mem=48G
 #SBATCH --gres=gpu:1,gpumem:24G
 #SBATCH --cpus-per-task=40   # Number of processor cores
-#SBATCH --time=04:00:00     # 1000 subjects take ~20-75 min (1.3-4.4 s each on an A40); a timed-out run resumes
+#SBATCH --time=04:00:00     # 1000 subjects take ~20-75 min (1.3-4.4 s each on an A40); resubmit to resume a timed-out run
 
 # Test runs on a subset: the first N_SUBJECTS subject folders (sorted by name), the same ones in every run, so settings
 # can be compared subject by subject. Each run gets its own directory, $OUT_ROOT/aligned_subjects_v4_test_<suffix>/.
