@@ -5,7 +5,7 @@
 #SBATCH --mem=48G
 #SBATCH --gres=gpu:1,gpumem:24G
 #SBATCH --cpus-per-task=40   # Number of processor cores
-#SBATCH --time=4-00:00:00
+#SBATCH --time=04:00:00     # 1000 subjects take ~20-75 min (1.3-4.4 s each on an A40); a timed-out run resumes
 
 # Test runs on a subset: the first N_SUBJECTS subject folders (sorted by name), the same ones in every run, so settings
 # can be compared subject by subject. Each run gets its own directory, $OUT_ROOT/aligned_subjects_v4_test_<suffix>/.
@@ -15,6 +15,9 @@
 #   sbatch -J ALIGN_lncc      submit_alignment_test.sh lncc      --metric lncc
 #   sbatch -J ALIGN_ncc_edge  submit_alignment_test.sh ncc_edge  --metric ncc  --edge-weight 0.5
 #   sbatch -J ALIGN_lncc_edge submit_alignment_test.sh lncc_edge --metric lncc --edge-weight 0.5
+#   (edge term at full weight from the first step instead of late:)
+#   sbatch -J ALIGN_ncc_edge_from0 submit_alignment_test.sh ncc_edge_from0 --metric ncc --edge-weight 0.5 \
+#          --edge-start-frac 0 --edge-ramp-frac 0
 # --skip-processed is set, so resubmitting with the same suffix resumes an interrupted run. Extra arguments come last
 # and override the defaults below (e.g. --end-index 2000 for more subjects).
 
