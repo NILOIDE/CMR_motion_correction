@@ -95,10 +95,13 @@ Only with --logging (otherwise nothing else is computed or written, which is the
                               apex metrics before/after; with
                               --sax-sax-weight also SAX-SAX rows: NCC -- between modalities --cross-mod-metric --,
                               counting points and axis distance at the end)
+    motion_summary_regions.csv one row per subject and combination of slice types (LAX-LAX, each pair of long-axis
+                              views, each long-axis view x SAX region; region_rows): NCC, LNCC and the LV-only Dice
+                              before/after
     motion_*.png              dataset-level figures (written at the end of a run)
   <subject>/
     metrics/
-      summary.csv, slices.csv, pairs.csv  this subject's rows
+      summary.csv, slices.csv, pairs.csv, regions.csv  this subject's rows
       history.csv             pose snapshots every 2% of the run (step 0 = acquired geometry, and the
                               saved "best" pose with is_best=1): per plane the full 3x4 affine (a00..a23, same
                               convention as the saved images), the pose and NCC/LNCC/NMI/Dice/Hausdorff, the
@@ -201,7 +204,7 @@ SUMMARY_COLUMNS = [
     "n_line_pairs", "steps", "seconds", "timestamp",
 ]
 DETAIL_COLUMNS = [
-    "subject_id", "image", "view", "modality", "slice", "n_pairs", "n_points",
+    "subject_id", "image", "view", "modality", "slice", "sax_region", "n_pairs", "n_points",
     "dx_mm", "dy_mm", "dz_mm", "shift_inplane_mm", "shift_mm", "rot_inplane_deg", "rot_tilt_deg",
     "ncc_zero", "ncc", "lncc_zero", "lncc", "nmi_zero", "nmi", "seg_dice_zero", "seg_dice", "hd_zero_mm", "hd_mm",
     "lax_dice_zero", "lax_dice", "apex_zero_mm", "apex_mm", "apex_dice_zero", "apex_dice",
@@ -218,6 +221,13 @@ PAIR_COLUMNS = [
 APEX_LV_LABEL, APEX_MYO_LABEL = 1, 2     # LV blood pool, LV myocardium (the UKBB LAX labels; atria 4 / 5, see apex_direction)
 APEX_MIN_COS = 0.5        # an apex line runs within 60 deg of the base -> apex direction (the 2Ch / 3Ch / 4Ch lines)
 APEX_WINDOW_MM = 30.0     # apex_dice: the stretch of the line within this distance of the more apical of the two apices
+# Metrics per combination of slice types (region_rows): the LV labels, the same in every UKBB view (the others are not:
+# label 3 is the LA in the 2Ch view but the RV in 3Ch / 4Ch / SAX; 5 is the RA in 4Ch, probably the aorta in 3Ch),
+# and the SAX regions along the LV long axis (assign_sax_regions), from base to apex
+LV_LABELS = (APEX_LV_LABEL, APEX_MYO_LABEL)
+SAX_REGIONS = ("pre_basal", "basal", "mid", "apical", "post_apical")
+REGION_COLUMNS = ["subject_id", "combination", "image_a", "image_b", "sax_region", "n_lines", "n_points",
+                  "ncc_zero", "ncc", "lncc_zero", "lncc", "dice_zero", "dice"]
 
 
 @dataclass
@@ -246,6 +256,8 @@ class Plane:
     modality: str = ""               # the acquisition it belongs to (SliceImage.modality)
     apex_dir: np.ndarray | None = None   # the subject's base -> apex unit vector (world; prepare_subject), for the
                                          # LAX-LAX apex metrics; None if unknown
+    region: str = ""                 # a SAX slice's region along the LV long axis (assign_sax_regions; SAX_REGIONS),
+                                     # "" for other planes or when unknown
 
     @property
     def rot_centre(self) -> np.ndarray:
@@ -563,7 +575,63 @@ def build_planes(data: dict, args, device, with_seg: bool = True) -> tuple[list[
     set_rotation_pivots(sax_planes, lax_planes, getattr(args, "rotation_pivot", "image-centre"))
     for p in sax_planes + lax_planes:
         p.apex_dir = data.get("apex_dir")
+    assign_sax_regions(data, sax_planes, lax_planes)
     return sax_planes, lax_planes
+
+
+def assign_sax_regions(data: dict, sax_planes: list[Plane], lax_planes: list[Plane]) -> None:
+    """Set Plane.region of every SAX slice (SAX_REGIONS) from the long-axis segmentations, which are more reliable than
+    the SAX ones at the base and the apex; at the acquired geometry and at end-diastole (frame 0: the base moves ~1 cm
+    toward the apex in systole), so a slice keeps its region whatever the alignment does.
+
+    Along the LV long axis (heart_axis, oriented base -> apex by data['apex_dir']), every segmented long-axis view (not
+    aortic) gives the LV's extent: its most basal and most apical LV pixel (LV_LABELS); the LV spans the median of the
+    views' ends. A SAX slice is placed where the axis crosses it: before the LV's basal end pre_basal (the long-axis
+    views show atria there, no LV), past its apical end post_apical (whatever its own segmentation shows: SAX slices
+    beyond the apex often carry spurious labels), and in between basal / mid / apical by thirds of the LV's length.
+    At the base the slice's own segmentation counts too: a slice in the basal third is basal only once it shows LV
+    itself (at least 20 LV pixels at end-diastole), else pre_basal -- the slice through the tilted mitral annulus,
+    where the long-axis views show LV and atria and the SAX segmentation nothing. Left "" without a SAX stack, a base
+    -> apex direction or a segmented long-axis view."""
+    for p in sax_planes:
+        p.region = ""
+    sax_seg = {(e.get("image", "SAX"), e["index"]): e.get("seg") for e in data.get("sax", [])}   # (X, Y, 1, F)
+    apex_dir = data.get("apex_dir")
+    axis = heart_axis(sax_planes, lax_planes) if sax_planes and apex_dir is not None else None
+    if axis is None:
+        return
+    L0, ell = np.asarray(axis[0], float), np.asarray(axis[1], float) / np.linalg.norm(axis[1])
+    if float(ell @ apex_dir) < 0:
+        ell = -ell
+    ends = []                                                # per long-axis view: (basal end, apical end) along ell
+    for image, d in data.get("lax", {}).items():
+        seg = d.get("seg")
+        if seg is None or is_aorta(d.get("view", image)):
+            continue
+        pos = []
+        for z in range(seg.shape[2]):
+            ij = np.argwhere(np.isin(seg[:, :, z, 0], LV_LABELS))
+            if len(ij) < 20:
+                continue
+            A = np.asarray(d["affine"][z], float)
+            pos.append((ij @ A[:3, :2].T + A[:3, 3] - L0) @ ell)
+        if pos:
+            pos = np.concatenate(pos)
+            ends.append((float(pos.min()), float(pos.max())))
+    if not ends:
+        return
+    base, apex = float(np.median([e[0] for e in ends])), float(np.median([e[1] for e in ends]))
+    if apex - base < 20.0:                                   # (no plausible LV length)
+        return
+    for p in sax_planes:
+        cos = float(ell @ p.normal)
+        s = float((p.center - L0) @ p.normal) / cos if abs(cos) > 0.2 else float((p.center - L0) @ ell)
+        f = (s - base) / (apex - base)
+        p.region = SAX_REGIONS[0 if f < 0 else 4 if f > 1 else 1 if f < 1 / 3 else 2 if f < 2 / 3 else 3]
+        if p.region == "basal":
+            g = sax_seg.get((p.image, p.slice_idx))
+            if g is not None and int(np.isin(g[:, :, 0, 0], LV_LABELS).sum()) < 20:
+                p.region = "pre_basal"
 
 
 def set_rotation_pivots(sax_planes: list[Plane], lax_planes: list[Plane], mode: str) -> None:
@@ -1441,6 +1509,8 @@ class LineSampler:
                    nmi=self.nmi_lines(theta_deg, t, args.nmi_bins, args.nmi_sigma, img, fw=fw),
                    edge=metric_rows(getattr(args, "edge_metric", "ncc_grad"), img[0], img[1], self.W, args, fw),
                    dice=self.dice_lines(theta_deg, t, labels, labels_sax, seg) if has_seg else nan,
+                   # LV labels only on every line (their IDs agree between all views; region_rows)
+                   dice_lv=self.dice_lines(theta_deg, t, list(LV_LABELS), list(LV_LABELS), seg) if has_seg else nan,
                    hd=self.hd_lines(theta_deg, t, labels, labels_sax, miss, seg) if has_seg else nan)
         out.update(self.apex_lines(theta_deg, t, miss, seg) if has_seg
                    else dict(apex=nan, apex_endo=nan, apex_dice=nan))
@@ -3015,7 +3085,8 @@ def batch_metrics(result: dict, args) -> dict | None:
 
 def finish_alignment(ctx: dict, result: dict | None, args, device) -> tuple:
     """process_subject's second half: metrics, history and rows of a prepared subject (prepare_alignment) aligned to
-    `result` (align(); None when it has no lines)."""
+    `result` (align(); None when it has no lines) -> (summary row, per-plane rows, per-line rows, poses, history,
+    per-combination rows (region_rows))."""
     data, sid, log = ctx["data"], ctx["sid"], ctx["log"]
     planes, lines, n_pairs, model = ctx["planes"], ctx["lines"], ctx["n_pairs"], ctx["model"]
     sax_planes, lax_planes = ctx["sax_planes"], ctx["lax_planes"]
@@ -3029,7 +3100,7 @@ def finish_alignment(ctx: dict, result: dict | None, args, device) -> tuple:
         Rs = rotation_matrices(theta)
         details = [dict(subject_id=sid, image=p.image, view=p.view, modality=p.modality, slice=p.slice_idx,
                         n_pairs=n_pairs[i]) for i, p in enumerate(planes)]
-        return None, details, [], [(p, Rs[i], t_rel[i]) for i, p in enumerate(planes)], None
+        return None, details, [], [(p, Rs[i], t_rel[i]) for i, p in enumerate(planes)], None, []
 
     metric_names = ("ncc", "lncc", "nmi", "dice", "hd", "lax_dice", "apex", "apex_dice")     # (LineSampler.plane_values)
     plane_m = {f"{k}_{s}": [nan] * N for k in metric_names for s in ("zero", "final")}
@@ -3037,6 +3108,7 @@ def finish_alignment(ctx: dict, result: dict | None, args, device) -> tuple:
     sax_qc = dict(sax_cross_pairs=nan, sax_gap_min_mm=nan, sax_rel_tilt_max_deg=nan, sax_cross_dissim_max=nan)
     cop_qc = dict(coplanar_pairs=0, coplanar_sim_zero=nan, coplanar_sim=nan)
     history = dict(planes=[], steps=[])
+    regions = []
     n_points = [0.0] * N
     t_rel = np.zeros((N, 3))
     theta = np.zeros((N, 3))
@@ -3055,6 +3127,7 @@ def finish_alignment(ctx: dict, result: dict | None, args, device) -> tuple:
                 plane_m[f"{k}_{stage}"] = pv[k]
         lz = {k: v.cpu().numpy() for k, v in line_zero.items()}
         lf = {k: v.cpu().numpy() for k, v in line_final.items()}
+        regions = region_rows(sid, planes, lines, lz, lf)
         for m, (ia, ib, line) in enumerate(lines):
             pa, pb = planes[ia], planes[ib]
             pairs.append(dict(subject_id=sid, image_a=pa.image, slice_a=pa.slice_idx, image_b=pb.image, slice_b=pb.slice_idx,
@@ -3111,7 +3184,7 @@ def finish_alignment(ctx: dict, result: dict | None, args, device) -> tuple:
     details = []
     for i, p in enumerate(planes):
         row = dict(subject_id=sid, image=p.image, view=p.view, modality=p.modality, slice=p.slice_idx,
-                   n_pairs=n_pairs[i], n_points=int(n_points[i]),
+                   sax_region=p.region, n_pairs=n_pairs[i], n_points=int(n_points[i]),
                    dx_mm=nan, dy_mm=nan, dz_mm=nan, shift_inplane_mm=nan, shift_mm=nan, rot_inplane_deg=nan,
                    rot_tilt_deg=nan, ncc_zero=nan, ncc=nan, lncc_zero=nan, lncc=nan, nmi_zero=nan, nmi=nan,
                    seg_dice_zero=nan, seg_dice=nan, hd_zero_mm=nan, hd_mm=nan, lax_dice_zero=nan, lax_dice=nan,
@@ -3185,13 +3258,56 @@ def finish_alignment(ctx: dict, result: dict | None, args, device) -> tuple:
         **sax_qc, **cop_qc, n_line_pairs=len(line_rows),
         steps=args.steps if lines else 0,
     )
-    return summary, details, pairs, poses, history
+    return summary, details, pairs, poses, history, regions
+
+
+def region_rows(sid: str, planes: list[Plane], lines: list, lz: dict, lf: dict) -> list[dict]:
+    """The metrics of every combination of slice types (REGION_COLUMNS rows): NCC, LNCC and the LV-only Dice
+    (evaluate's dice_lv: labels LV_LABELS on both sides) at the acquired pose (lz) and the saved pose (lf), each the
+    point-weighted mean over the combination's lines (n_points weights; lines whose value is NaN are left out).
+    Combinations: all LAX-LAX lines together ('LAX-LAX'), every pair of long-axis images (e.g. 'LAX_2Ch-LAX_3Ch',
+    names in sorted order), and every long-axis image against the SAX slices of each region (assign_sax_regions; e.g.
+    'LAX_2Ch-SAX_basal'). Lines with an aortic slice are left out, as are SAX slices without a region."""
+    groups = {}
+    for m, (ia, ib, _) in enumerate(lines):
+        pa, pb = planes[ia], planes[ib]
+        if is_aorta(pa.view) or is_aorta(pb.view):
+            continue
+        if pa.view != "SAX" and pb.view != "SAX":
+            a, b = sorted((pa.image, pb.image))
+            groups.setdefault(("LAX-LAX", "LAX", "LAX", ""), []).append(m)
+            groups.setdefault((f"{a}-{b}", a, b, ""), []).append(m)
+        elif (pa.view == "SAX") != (pb.view == "SAX"):
+            sax, lax = (pa, pb) if pa.view == "SAX" else (pb, pa)
+            if sax.region:
+                groups.setdefault((f"{lax.image}-{sax.image}_{sax.region}", lax.image, sax.image, sax.region),
+                                  []).append(m)
+
+    def order(item):                                     # LAX-LAX, the long-axis pairs, then each view base -> apex
+        (combo, a, b, region), _ = item
+        return (0,) if combo == "LAX-LAX" else (1, combo) if not region else (2, a, b, SAX_REGIONS.index(region))
+
+    rows = []
+    for (combo, a, b, region), idx in sorted(groups.items(), key=order):
+        w = np.array([lines[m][2].n_points for m in idx], dtype=float)
+
+        def wmean(values):
+            x = np.asarray(values, dtype=float)[idx]
+            ok = np.isfinite(x) & (w > 0)
+            return float((x[ok] * w[ok]).sum() / w[ok].sum()) if ok.any() else float("nan")
+
+        rows.append(dict(subject_id=sid, combination=combo, image_a=a, image_b=b, sax_region=region, n_lines=len(idx),
+                         n_points=int(w.sum()), ncc_zero=wmean(lz["ncc"]), ncc=wmean(lf["ncc"]),
+                         lncc_zero=wmean(lz["lncc"]), lncc=wmean(lf["lncc"]),
+                         dice_zero=wmean(lz["dice_lv"]), dice=wmean(lf["dice_lv"])))
+    return rows
 
 
 def process_subject(subject: Subject, args, device, on_lines=None) -> tuple:
     """Align one subject (its slices as handed over by a loader, see SliceImage). Returns the summary row, the
-    per-plane rows, the per-line-pair rows, the per-plane poses (plane, R, t; see corrected_affines) and the
-    pose/metric history (dict with 'planes' and 'steps' row lists, empty unless args.history_every > 0, i.e. with --logging).
+    per-plane rows, the per-line-pair rows, the per-plane poses (plane, R, t; see corrected_affines), the
+    pose/metric history (dict with 'planes' and 'steps' row lists, empty unless args.history_every > 0, i.e. with --logging)
+    and the per-combination rows (region_rows; empty without --logging).
 
     `on_lines(planes, lines)` is called once the intersection lines are known, before alignment.
     Without args.logging only the poses are computed: no metrics are evaluated, the segmentations stay off the GPU and
@@ -3888,8 +4004,9 @@ def save_mask_plot(viz: dict, subject_id: str, dilation_mm: float, path: Path, e
 
 
 def save_subject_metrics(summary: dict, details: list[dict], pairs: list[dict], metrics_dir: Path, plots: bool,
-                         history: dict | None = None, st=PLOT_STYLE) -> None:
-    """Per-subject CSVs (summary row, per-plane rows, per-line-pair rows, pose/metric history) and figures."""
+                         history: dict | None = None, st=PLOT_STYLE, regions: list[dict] | None = None) -> None:
+    """Per-subject CSVs (summary row, per-plane rows, per-line-pair rows, per-combination rows (region_rows),
+    pose/metric history) and figures."""
     metrics_dir.mkdir(parents=True, exist_ok=True)
     if history and history["planes"]:
         pd.DataFrame([fmt_row(r) for r in history["planes"]], columns=HISTORY_COLUMNS).to_csv(metrics_dir / "history.csv", index=False)
@@ -3904,6 +4021,8 @@ def save_subject_metrics(summary: dict, details: list[dict], pairs: list[dict], 
     pd.DataFrame([fmt_row(summary)], columns=SUMMARY_COLUMNS).to_csv(metrics_dir / "summary.csv", index=False)
     pd.DataFrame([fmt_row(r) for r in details], columns=DETAIL_COLUMNS).to_csv(metrics_dir / "slices.csv", index=False)
     pd.DataFrame([fmt_row(r) for r in pairs], columns=PAIR_COLUMNS).to_csv(metrics_dir / "pairs.csv", index=False)
+    if regions is not None:
+        pd.DataFrame([fmt_row(r) for r in regions], columns=REGION_COLUMNS).to_csv(metrics_dir / "regions.csv", index=False)
     det = pd.DataFrame(details, columns=DETAIL_COLUMNS)
     det = det[det["n_pairs"] > 0]
     pdf = pd.DataFrame(pairs, columns=PAIR_COLUMNS)
@@ -4588,6 +4707,7 @@ def run(ap: argparse.ArgumentParser, args, load, save, is_complete) -> tuple[Pat
     summary_path = overall_dir / "motion_summary.csv"
     detail_path = overall_dir / "motion_summary_slices.csv"
     pairs_path = overall_dir / "motion_summary_pairs.csv"
+    regions_path = overall_dir / "motion_summary_regions.csv"
 
     device = torch.device(args.device)
     seen: set[str] = set()
@@ -4631,7 +4751,8 @@ def run(ap: argparse.ArgumentParser, args, load, save, is_complete) -> tuple[Pat
 
     writers = None
     if args.logging:
-        writers = [open_csv(summary_path, SUMMARY_COLUMNS), open_csv(detail_path, DETAIL_COLUMNS), open_csv(pairs_path, PAIR_COLUMNS)]
+        writers = [open_csv(summary_path, SUMMARY_COLUMNS), open_csv(detail_path, DETAIL_COLUMNS), open_csv(pairs_path, PAIR_COLUMNS),
+                   open_csv(regions_path, REGION_COLUMNS)]
     save_jobs = deque()                                   # (subject, description, future) for background writes
     failed, unaligned = [], []
     try:
@@ -4725,13 +4846,13 @@ def run(ap: argparse.ArgumentParser, args, load, save, is_complete) -> tuple[Pat
                 """Write the rows, outputs and progress of a batch's subjects (complete)."""
                 for e in entries:
                     subj, subject, status, metrics_dir = e["subj"], e["subject"], e["status"], e["metrics_dir"]
-                    summary, details, pairs, history = None, [], [], None
+                    summary, details, pairs, history, regions = None, [], [], None, []
                     try:
                         poses = []
                         if status == "ok":
                             if isinstance(e["out"], Exception):
                                 raise e["out"]
-                            summary, details, pairs, poses, history = e["out"]
+                            summary, details, pairs, poses, history, regions = e["out"]
                             if not any(d["n_pairs"] > 0 for d in details):
                                 status = "not_optimized"                 # no crossing planes: written unaligned
                             for row in sax_relative_motion(subj.name, poses, [d["n_pairs"] for d in details]):
@@ -4757,13 +4878,15 @@ def run(ap: argparse.ArgumentParser, args, load, save, is_complete) -> tuple[Pat
                         if details:
                             save_jobs.append((subj.name, "subject metrics", ex.submit(save_subject_metrics, dict(summary),
                                                                                      details, pairs, metrics_dir, True,
-                                                                                     history)))
-                        (sf, swriter), (df_, dwriter), (pf, pwriter) = writers
+                                                                                     history, regions=regions)))
+                        (sf, swriter), (df_, dwriter), (pf, pwriter), (rf, rwriter) = writers
                         swriter.writerow(fmt_row(summary))
                         for row in details:
                             dwriter.writerow(fmt_row(row))
                         for row in pairs:
                             pwriter.writerow(fmt_row(row))
+                        for row in regions:
+                            rwriter.writerow(fmt_row(row))
                         for f, _ in writers:
                             f.flush()
                     while len(save_jobs) > 3 * args.workers:
@@ -4889,7 +5012,8 @@ def run(ap: argparse.ArgumentParser, args, load, save, is_complete) -> tuple[Pat
     if failed:
         print(f"\n{len(failed)} subject(s) failed: " + ", ".join(f"{s} ({st})" for s, st in failed))
     if args.logging:
-        print(f"\nSummary written to {summary_path}\nPer-slice results written to {detail_path}\nPer-pair results written to {pairs_path}")
+        print(f"\nSummary written to {summary_path}\nPer-slice results written to {detail_path}\nPer-pair results written to {pairs_path}"
+              f"\nPer-combination results written to {regions_path}")
         try:
             n = len(plot_results(summary_path, detail_path, overall_dir, pairs_path))
             print(f"{n} overall figures written to {overall_dir}")

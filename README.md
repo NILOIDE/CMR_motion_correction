@@ -287,6 +287,26 @@ lines) and per subject (`motion_summary.csv`).
 
   The distances have the resolution of the line points (`--line-step-mm`, averaged over the cardiac phases). When only
   one view's line reaches the label, the distance is `--hd-miss-mm`, as for the Hausdorff distance.
+- **Per combination of slice types** (`motion_summary_regions.csv`, and `regions.csv` in each subject's `metrics/`):
+  one row per subject and combination, with its number of lines and the NCC, LNCC and LV-only Dice before and after
+  alignment (means over its lines, weighted by their points). The combinations:
+  - all LAX-LAX lines together;
+  - each pair of long-axis views (2Ch-3Ch, 2Ch-4Ch, 3Ch-4Ch);
+  - each long-axis view against the SAX slices of each region (e.g. `LAX_2Ch-SAX_basal`).
+
+  The aortic slice is left out. The Dice uses the LV labels only (blood pool 1, myocardium 2). These are the only
+  labels with the same number in every view: label 3 is the LA in the 2Ch view but the RV in the 3Ch, 4Ch and SAX
+  segmentations, and label 5 is the RA in the 4Ch view. So the all-label Dice and Hausdorff of LAX-LAX lines above
+  compare different structures for those labels.
+- **SAX regions** (`sax_region` in the per-slice CSV): pre-basal, basal, mid, apical or post-apical. They come from
+  the long-axis segmentations at end-diastole, at the acquired geometry. The LV spans from its most basal to its most
+  apical pixel in the long-axis views (median over the views). A SAX slice is placed where the long axis crosses it:
+  - before the LV: pre-basal;
+  - past the apex: post-apical, whatever the SAX segmentation shows (it often has spurious labels there);
+  - in between: basal, mid or apical, by thirds of the LV length.
+
+  A slice in the basal third counts as basal only if its own segmentation shows LV. Otherwise it is pre-basal: the
+  slice through the tilted mitral annulus, where the long-axis views show both LV and atria.
 
 The pose history (`history.csv`, `history_summary.csv`) also records `lax_dice` and `apex_mm` at every snapshot. A
 view whose long-axis agreement peaks and then falls during the run is being misaligned by the optimizer.
