@@ -11,3 +11,6 @@
 __pycache__/
 *.pyc
 .idea/
+
+# Draft README GIFs (participant images; only media/optimization.gif is tracked)
+media/gifs/
