@@ -1,0 +1,16 @@
+# Participant data must never enter the repository (UK Biobank: approved infrastructure only)
+*.nii
+*.nii.gz
+*.NII
+*.NII.GZ
+*.dcm
+*.DCM
+*.dicom
+
+# Python / editor
+__pycache__/
+*.pyc
+.idea/
+
+# Draft README GIFs (participant images; only media/optimization.gif is tracked)
+media/gifs/

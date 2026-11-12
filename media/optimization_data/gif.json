@@ -1,0 +1,10 @@
+{
+  "slice": "SA[09]",
+  "opt_frames": 77,
+  "phase_step": 2,
+  "hold_seconds": 2.0,
+  "width": 1000,
+  "zoom": 1.2,
+  "shift": 0.05,
+  "label": "default settings"
+}

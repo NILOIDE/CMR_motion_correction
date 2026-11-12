@@ -50,10 +50,8 @@ REGION_LABEL = "region (the kept range in thirds)"                         # (--
 NAMED_COLORS = {"acquired poses": ACQ_L, "aligned": ALI_L, "all slices": EXTRA[3], "in the alignment run": "#8a8984",
                 KEPT_NAME: EXTRA[0]}
 VIEW_ORDER = (("4ch", "LAX_4Ch"), ("2ch", "LAX_2Ch"), ("3ch", "LAX_3Ch"))   # the long-axis view of the examples
-EXAMPLE_SUBJECTS = ("<subject-id>", "<subject-id>", "<subject-id>")   # the README's examples (default --examples), in the order
-                                                        # of EXAMPLE_ROLES / EXAMPLE_TITLES
-EXAMPLE_SUBJECT = EXAMPLE_SUBJECTS[1]       # --examples auto, second example: a large motion of a mid-ventricular
-                                            # slice; the most typical kept subject when it is not available
+EXAMPLE_SUBJECT = None      # --examples auto, second example: a subject with a large motion of a mid-ventricular
+                            # slice (never commit a subject ID: pass --examples instead); else the most typical subject
 EXAMPLE_WHY = "a mid-ventricular slice moved"
 EXAMPLE_ROLES = ("largest kept-slice motion", EXAMPLE_WHY, "lowest kept-slice NCC")   # --examples, in this order
 EXAMPLE_TITLES = ("Subject with large apical misalignment",                     # the titles of the --examples figures
@@ -654,9 +652,9 @@ def main():
     ap.add_argument("--survey", type=Path, default=None,
                     help="a survey output directory of UKBB_implicit_baselines (survey.csv, slices.csv): the kept "
                          "slices, the verdict and the LV regions from there instead of the segmentations")
-    ap.add_argument("--examples", default=",".join(EXAMPLE_SUBJECTS),
+    ap.add_argument("--examples", default="auto",
                     help="comma-separated subjects for the example figures, in the order: " + ", ".join(EXAMPLE_ROLES)
-                         + "; 'auto': chosen by those roles. Default: the README's examples, %(default)s")
+                         + "; 'auto': chosen by those roles. Default: %(default)s")
     ap.add_argument("--titles", default=None,
                     help="'|'-separated titles of the --examples figures. Default: " + " | ".join(EXAMPLE_TITLES))
     ap.add_argument("--out", type=Path, default=Path(__file__).resolve().parent, help="Default: %(default)s")
